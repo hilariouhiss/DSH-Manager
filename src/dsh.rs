@@ -4,6 +4,12 @@ use std::collections::BTreeMap;
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
+use std::io::{BufRead, BufReader, Read};
+use std::process::{Command, Stdio};
+use std::sync::mpsc::Sender;
+use std::thread::{self, JoinHandle};
+use std::time::Instant;
+
 use crate::model::*;
 use crate::pm;
 
@@ -181,7 +187,8 @@ pub fn port_in_use(port: u16) -> bool {
 ///
 /// 三个必须处理的细节：
 /// 1. 必须用 LISTENING 过滤 —— TIME_WAIT 行也含该端口，但其 PID 列是 0
-/// 2. 必须按 ':' 切分比较端口末段 —— 否则 ":3080" 会匹配 ":13080"
+/// 2. 必须按 ':' 切到末段后**整体**比较 —— 否则 "3080" 会命中 ":13080" 的端口数字后缀
+///    （注意：带 ':' 锚点的 contains(":3080") 并不会误匹配 —— 真正的危险是无锚的末段匹配）
 /// 3. 本地地址可能是 `127.0.0.1:3080` 或 `[::]:3080`，都按末段处理
 pub fn parse_netstat_pid(text: &str, port: u16) -> Option<u32> {
     let target = port.to_string();
@@ -226,6 +233,149 @@ pub fn is_node(pid: u32) -> bool {
         Ok(out) => out.stdout.to_ascii_lowercase().contains("node.exe"),
         Err(_) => false,
     }
+}
+
+/// 读一个管道到 EOF，逐行投递为 `UiMsg::Log`。
+///
+/// 泛型化是因为 `ChildStdout` 与 `ChildStderr` 是两个不同的类型 —— 它们都
+/// 实现了 `Read + Send + 'static`。
+fn spawn_reader<R: Read + Send + 'static>(
+    src: Option<R>,
+    tx: Sender<UiMsg>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let Some(src) = src else { return };
+        for line in BufReader::new(src).lines().map_while(Result::ok) {
+            if tx.send(UiMsg::Log(line)).is_err() {
+                break; // UI 侧已关闭
+            }
+        }
+    })
+}
+
+/// FR-16：启动 `dsh web`。
+///
+/// 返回 pid。`Child` 句柄被 move 进内部的 waiter 线程，**不跨线程共享** ——
+/// 因此没有任何锁。停止只依赖 pid（见 `stop_by_pid`）。
+///
+/// 按 `SHIM_NAMES` 顺序尝试 shim 全名（GC-7）：npm / pnpm / yarn 生成 `dsh.cmd`，
+/// 而 **bun 生成 `dsh.exe`** —— 写死 `.cmd` 会让 bun 用户的 FR-16 直接失败。
+/// 顺序与 `pm::find_dsh_on_path` 一致（也是 PATHEXT 的顺序）；失败的 `spawn`
+/// 无副作用（进程根本没起来）。
+///
+/// **不传 `--no-open`**：让 `dsh web` 自己打开浏览器，本项目零代码实现 FR-20
+/// 的自动打开。
+pub fn spawn_web(port: u16, tx: Sender<UiMsg>) -> Result<u32, String> {
+    #[cfg(windows)]
+    use std::os::windows::process::CommandExt;
+
+    let port_arg = port.to_string();
+    let mut child = None;
+    let mut last_err = String::new();
+    for name in SHIM_NAMES {
+        let mut cmd = Command::new(name); // GC-7：必须是 shim 全名
+        cmd.args(["web", "--port", &port_arg])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(windows)]
+        cmd.creation_flags(pm::CREATE_NO_WINDOW); // GC-8
+        match cmd.spawn() {
+            Ok(c) => {
+                child = Some(c);
+                break;
+            }
+            Err(e) => last_err = format!("{name}: {e}"),
+        }
+    }
+    let mut child = child.ok_or_else(|| {
+        format!("无法启动 dsh web —— 已尝试 {}：{last_err}", SHIM_NAMES.join(" / "))
+    })?;
+    let pid = child.id();
+
+    let out = child.stdout.take();
+    let err = child.stderr.take();
+
+    // 必须两个独立线程读：管道缓冲区满时写端会阻塞，单线程串行读另一个
+    // 管道会被写满，导致子进程卡死 —— 经典死锁。
+    let h_out = spawn_reader(out, tx.clone());
+    let h_err = spawn_reader(err, tx.clone());
+
+    // waiter 先 join 两个 reader 再 wait()：保证子进程退出时输出已被完整读取，
+    // 否则日志会截尾。
+    thread::spawn(move || {
+        let _ = h_out.join();
+        let _ = h_err.join();
+        let code = child.wait().ok().and_then(|s| s.code());
+        let _ = tx.send(UiMsg::WebExited { code });
+    });
+
+    Ok(pid)
+}
+
+/// FR-16：等待端口就绪。
+///
+/// 用 TCP 探测而不解析 `dsh web` 的 stdout —— 后者依赖 dsh 的输出格式
+/// （SRS AS-3 已将其列为假设），而"端口最终会监听"是稳定事实。
+pub fn wait_port_ready(
+    port: u16,
+    alive: impl Fn() -> bool,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if port_in_use(port) {
+            return true;
+        }
+        if !alive() {
+            return false; // 进程已退出，不会再就绪
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    false
+}
+
+/// FR-19 / FR-21：统一停止入口。
+///
+/// 自己启动的与外部启动的走**同一条路径** —— 区别仅在于 pid 从
+/// `child.id()` 来还是从 `find_listener_pid()` 来。
+///
+/// 用 `taskkill /T` 而非 `Child::kill()`：后者底层是 `TerminateProcess`，
+/// 只杀单个进程；`/T` 终止整棵进程树，避免残留子进程继续占着端口。
+pub fn stop_by_pid(pid: u32) -> Result<(), String> {
+    let args = vec![
+        "/PID".to_string(),
+        pid.to_string(),
+        "/T".to_string(),
+        "/F".to_string(),
+    ];
+    let out = pm::run_cmd("taskkill.exe", &args)?;
+    if out.code == 0 {
+        return Ok(());
+    }
+    // 进程已不存在视为成功（幂等）
+    let msg = format!("{}{}", out.stdout, out.stderr);
+    if msg.contains("not found") || msg.contains("没有找到") || msg.contains("找不到") {
+        return Ok(());
+    }
+    Err(format!("taskkill 退出码 {}: {}", out.code, msg.trim()))
+}
+
+/// FR-20：在默认浏览器打开 URL。
+/// `start` 的第一个参数是窗口标题占位符，缺了它带引号的 URL 会被当成标题。
+pub fn open_url(url: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    use std::os::windows::process::CommandExt;
+
+    let mut cmd = Command::new("cmd.exe");
+    cmd.args(["/c", "start", "", url])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    cmd.creation_flags(pm::CREATE_NO_WINDOW);
+    cmd.spawn().map_err(|e| format!("打开浏览器失败: {e}"))?;
+    Ok(())
 }
 
 #[cfg(test)]
