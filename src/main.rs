@@ -22,6 +22,7 @@
 #![allow(dead_code)]
 
 mod config;
+mod dsh;
 mod model;
 mod pm;
 mod txn;
