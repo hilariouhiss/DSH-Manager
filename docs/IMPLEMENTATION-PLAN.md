@@ -3203,15 +3203,16 @@ export component MainWindow inherits Window {
             background: #1e1e1e;
             border-radius: 6px;
             min-height: 120px;
-            ScrollView {
-                ListView {
-                    for line in root.log-lines : Text {
-                        text: line;
-                        color: #d4d4d4;
-                        font-family: "Consolas";
-                        font-size: 11px;
-                        wrap: no-wrap;
-                    }
+            // ⚠ 【不要】用 ScrollView 包 ListView。ListView 自己就会滚动；
+            // 套一层 ScrollView 会让它按内容全高布局，从而破坏虚拟化 ——
+            // 日志上限 2000 行（GC-12），那就等于一次渲染 2000 个 Text。
+            ListView {
+                for line in root.log-lines : Text {
+                    text: line;
+                    color: #d4d4d4;
+                    font-family: "Consolas";
+                    font-size: 11px;
+                    wrap: no-wrap;
                 }
             }
         }
