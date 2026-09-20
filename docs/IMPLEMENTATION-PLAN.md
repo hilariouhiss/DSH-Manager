@@ -2439,6 +2439,7 @@ packument —— 只需 versions 键集合与 dist-tags。"
 - Produces:
   - `strip_html(&str) -> String` —— 纯函数
   - `heading_body(&str) -> Option<&str>` —— 纯函数
+  - `is_html_heading(&str) -> bool` —— 纯函数（必须单独识别 `<h1>`~`<h6>`：DSH 的 notes **同时**用 `<h3>` 与 `###` 两种写法，只认一种会导致标题渲染不一致）
   - `preprocess_notes(&str) -> String` —— 纯函数
   - `parse_release_body(&str) -> Result<String, NotesError>` —— 纯函数
   - `fetch_notes(&Version) -> Result<String, NotesError>`
@@ -2557,17 +2558,44 @@ fn heading_body(s: &str) -> Option<&str> {
 /// 只做两件事：剥离 HTML 标签、ATX 标题降级为粗体。
 /// 其余语法（粗体 / 斜体 / 行内代码 / **链接** / 列表）由 StyledText 原生支持，
 /// **不做干预** —— 尤其不要破坏链接。
+/// 这一行是否是 HTML 标题（`<h1>` ~ `<h6>`）？
+///
+/// 必须单独识别：DSH 的 release notes **同时**使用两种标题写法 ——
+/// 语言段用 `<h3 id="cn-...">新增功能</h3>`，小节用 `### 体验优化`。
+/// 若只处理 ATX 一种，HTML 那批（恰恰是层级最高的段标题）会以纯文本出现，
+/// 与小节标题的粗体**视觉不一致** —— 那正是 FR-27 要消除的"垃圾文本"问题。
+fn is_html_heading(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    (1..=6).any(|n| lower.contains(&format!("<h{n}")))
+}
+
+/// FR-27 的强制预处理。
+///
+/// Slint 的 `StyledText` 官方 Currently Unsupported 列表包含 **Headings** 与
+/// **Other HTML tags**。而 DSH 的 release notes 通篇是 `### 新增功能` 这类 ATX
+/// 标题，且混有 `<h3 id="...">` 裸 HTML。不预处理就会原样显示成垃圾文本。
+///
+/// 只做两件事：剥离 HTML 标签、标题降级为粗体。
+/// 其余语法（粗体 / 斜体 / 行内代码 / **链接** / 列表）由 StyledText 原生支持，
+/// **不做干预** —— 尤其不要破坏链接。
 pub fn preprocess_notes(md: &str) -> String {
     let mut out = String::with_capacity(md.len() + 32);
     for line in md.lines() {
         let stripped = strip_html(line);
-        match heading_body(stripped.trim_start()) {
-            Some(rest) => {
+        // 两种标题来源都要认：ATX（`### x`）与 HTML（`<h3>x</h3>`）。
+        // 先判 HTML —— 它在 strip_html 之后就认不出来了。
+        let heading = if is_html_heading(line) {
+            Some(stripped.trim())
+        } else {
+            heading_body(stripped.trim_start()).map(|r| r.trim())
+        };
+        match heading {
+            Some(text) if !text.is_empty() => {
                 out.push_str("**");
-                out.push_str(rest.trim());
+                out.push_str(text);
                 out.push_str("**\n");
             }
-            None => {
+            _ => {
                 out.push_str(&stripped);
                 out.push('\n');
             }
