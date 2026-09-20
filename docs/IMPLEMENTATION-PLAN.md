@@ -1408,12 +1408,20 @@ read_dsh_version_on_path 仅用于 S4 最终验证。"
 //! 原子性契约（SRS §4.1）：要么成功，要么回到操作前状态；若连补偿都失败，
 //! 明确报告降级状态并给出可复制的手动命令。绝不静默停在半成品状态。
 
-use std::cell::RefCell;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::model::*;
-use crate::pm::{self, CmdOut};
+use crate::pm::CmdOut;
+
+// ⚠ 下面三个只被 `#[cfg(test)]` 的 FakeBackend 使用。不加 gate 的话，
+// `cargo build`（非 test 构建）会因它们未被引用而报 unused_imports ——
+// 那是独立 lint，`allow(dead_code)` 不覆盖它。
+#[cfg(test)]
+use std::cell::RefCell;
+#[cfg(test)]
+use std::collections::HashMap;
+#[cfg(test)]
+use crate::pm;
 
 pub trait Backend {
     fn run(&self, pm: Pm, args: &[String]) -> Result<CmdOut, String>;
@@ -2114,7 +2122,6 @@ git commit -m "feat(txn): 事务主流程与补偿（SRS §4 完整实现）
 //! 版本拉取、更新说明与 `dsh web` 进程监督。
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::model::*;
