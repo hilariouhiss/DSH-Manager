@@ -50,12 +50,62 @@ pub fn state_path() -> Option<PathBuf> {
     Some(PathBuf::from(base).join("dsh-manager").join("state.json"))
 }
 
-pub fn save(_s: &StateFile) -> Result<(), String> {
-    todo!()
+pub fn save(s: &StateFile) -> Result<(), String> {
+    match state_path() {
+        Some(p) => save_to(&p, s),
+        None => Err("APPDATA 不可用".into()),
+    }
 }
 
-pub fn update(_f: impl FnOnce(&mut StateFile)) -> Result<(), String> {
-    todo!()
+/// 原子写入的测试缝。
+///
+/// **必须**走"写 .tmp → rename"，不得直接截断目标文件。
+/// 依据：FR-31 要应对的核心场景是管理器被强杀，而直接截断写入时进程若在
+/// 写入中途终止，state.json 会变成半截 JSON。也就是说 —— 最需要持久化生效
+/// 的场景，恰恰是朴素写入最容易毁掉数据的场景。文件一坏，下次启动回落缺省
+/// 端口，孤儿就失联了。
+///
+/// fs::rename 的覆盖语义已核实：Rust 文档明确 "replacing the original file
+/// if `to` already exists"，Windows 上通过 MoveFileExW 实现。
+pub fn save_to(path: &Path, s: &StateFile) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("创建目录失败: {e}"))?;
+    }
+    let json = serde_json::json!({
+        "preferred_port": s.preferred_port,
+        "running_port": s.running_port,
+    });
+    let text = serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?;
+
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, text).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("写临时文件失败: {e}")
+    })?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("替换失败: {e}")
+    })
+}
+
+pub fn update(f: impl FnOnce(&mut StateFile)) -> Result<(), String> {
+    let mut s = match load() {
+        Loaded::Ok(s) => s,
+        // FR-32：损坏或缺失都不应让写入路径失败，从缺省值开始
+        _ => StateFile::default(),
+    };
+    f(&mut s);
+    save(&s)
+}
+
+/// 读—改—写的测试缝。
+pub fn update_at(path: &Path, f: impl FnOnce(&mut StateFile)) -> Result<(), String> {
+    let mut s = match load_from(Some(path)) {
+        Loaded::Ok(s) => s,
+        _ => StateFile::default(),
+    };
+    f(&mut s);
+    save_to(path, &s)
 }
 
 #[cfg(test)]
@@ -116,5 +166,64 @@ mod tests {
     #[test]
     fn no_location_when_path_unavailable() {
         assert!(matches!(load_from(None), Loaded::NoLocation));
+    }
+
+    #[test]
+    fn save_then_load_roundtrip() {
+        let p = tmp("roundtrip.json");
+        let s = StateFile { preferred_port: Some(8080), running_port: Some(9090) };
+        save_to(&p, &s).unwrap();
+        match load_from(Some(&p)) {
+            Loaded::Ok(got) => assert_eq!(got, s),
+            other => panic!("期望 Ok，得到 {other:?}"),
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn save_creates_parent_directory() {
+        let dir = tmp("mkdir");
+        let p = dir.join("nested").join("state.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        save_to(&p, &StateFile::default()).unwrap();
+        assert!(p.is_file(), "应自动创建父目录");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_leaves_no_tmp_file_behind() {
+        let p = tmp("notmp.json");
+        save_to(&p, &StateFile { preferred_port: Some(1), running_port: None }).unwrap();
+        let leftover = p.with_extension("json.tmp");
+        assert!(!leftover.exists(), "原子写入不得残留 .tmp 文件");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn update_preserves_other_field() {
+        let p = tmp("update.json");
+        save_to(&p, &StateFile { preferred_port: Some(3080), running_port: None }).unwrap();
+        update_at(&p, |s| s.running_port = Some(8080)).unwrap();
+        match load_from(Some(&p)) {
+            Loaded::Ok(s) => {
+                assert_eq!(s.preferred_port, Some(3080), "改 running 不得丢失 preferred");
+                assert_eq!(s.running_port, Some(8080));
+            }
+            other => panic!("期望 Ok，得到 {other:?}"),
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn update_on_corrupt_file_starts_from_default() {
+        // FR-32：损坏文件不应让写入路径也失败
+        let p = tmp("update-corrupt.json");
+        std::fs::write(&p, "garbage").unwrap();
+        update_at(&p, |s| s.preferred_port = Some(3080)).unwrap();
+        match load_from(Some(&p)) {
+            Loaded::Ok(s) => assert_eq!(s.preferred_port, Some(3080)),
+            other => panic!("期望 Ok，得到 {other:?}"),
+        }
+        let _ = std::fs::remove_file(&p);
     }
 }
