@@ -66,6 +66,17 @@ struct AppState {
     /// "请先选择一个目标版本"）只写 `status` 就 `return` —— 稳态下没有任何消息
     /// 可排空，于是提示永远停在状态里，**界面上看不到**，按钮点起来像坏的。
     dirty: bool,
+    /// 是否已经接受了启动请求、但 worker 还没回报任何 `WebState`/`Failed`。
+    ///
+    /// ⚠ 光看 `WebState` 挡不住重复启动（评审轮 4）：从点击到 `Starting` 落地之间
+    /// 状态仍是 `Stopped` —— 端口预检本身就要 300ms 连接 + 一次 netstat，
+    /// worker 积压时这段窗口可达十几秒。窗口内的第二次点击会被接受并排在第一个
+    /// `StartWeb` 之后；届时第一份已占住端口，第二次的预检便把**我们自己的**实例
+    /// 判成"外部 dsh web" → `web_pid` 被清空 → 退出不再停止我们自己启动的子进程
+    /// （FR-21），且该进程死掉时状态会卡在 `External`。这个标志把窗口关掉：
+    /// 接受时置真，`drain` 每见到一条 `WebState`/`Failed`（worker 每次启动必有其一）
+    /// 就清掉。
+    start_pending: bool,
     catalog: Option<Catalog>,
     notes: NotesState,
     web: WebState,
@@ -99,6 +110,7 @@ impl AppState {
             probed: false,
             worker_dead: false,
             dirty: false,
+            start_pending: false,
             catalog: None,
             notes: NotesState::default(),
             web: WebState::Stopped,
@@ -401,18 +413,21 @@ fn drain(rx: &Receiver<UiMsg>, state: &Rc<RefCell<AppState>>) -> bool {
                             }
                             _ => None,
                         };
+                        // worker 对每次启动都必回一条 WebState —— 收到它就说明
+                        // `start_pending` 这一段已经走完，守卫恢复看状态。
+                        s.start_pending = false;
                         s.web = ws;
                     }
                     UiMsg::WebExited { pid, code } => {
-                        push_log(&s, format!("dsh web（pid {pid}）已退出，退出码 {code:?}"));
-                        // ⚠ 只有它**确实是当前实例**时才改状态。worker 虽串行，但旧实例的
-                        // 退出通知可能迟到到新实例已经开始之后；无条件采信就会清掉新实例的
-                        // `web_pid`（退出路径随即拿不到 pid → 孤儿），或者把新实例的
-                        // "运行中"改成"已停止"。pid 就是这里唯一的身份凭证。
-                        //
-                        // 日志行**不**受此限制：退出事件本身始终值得记录，
-                        // 只是它不改变状态（正常停止路径下状态早已由 Job::StopWeb 置好）。
-                        if s.web_pid == Some(pid) {
+                        if s.web_pid.is_some_and(|cur| cur != pid) {
+                            // ⚠ 只有在"当前在册的是**另一个** pid"时才忽略 —— 那是上一代
+                            // 实例迟到的重复通知，不能让它踩掉新一代的状态。
+                            // 反过来，`web_pid` 为 None 时必须**接受**：退出是权威事实，
+                            // 忽略它会让状态永远卡在 Running/External —— 启动被禁用、
+                            // 停止又定位不到，用户只能重启程序（评审轮 1 引入的回归）。
+                            push_log(&s, format!("忽略旧实例（pid {pid}）的退出通知"));
+                        } else {
+                            push_log(&s, format!("dsh web（pid {pid}）已退出，退出码 {code:?}"));
                             s.web = WebState::Stopped;
                             s.web_pid = None;
                             let _ = config::update(|f| f.running_port = None);
@@ -425,6 +440,8 @@ fn drain(rx: &Receiver<UiMsg>, state: &Rc<RefCell<AppState>>) -> bool {
                         if context == "环境探测" {
                             s.probed = true;
                         }
+                        // 启动失败也是 worker 对一次启动的回报，窗口到此结束。
+                        s.start_pending = false;
                         s.busy = false;
                         s.busy_label.clear();
                         s.status = format!("{context}失败");
@@ -797,7 +814,16 @@ fn start_web(port: u16, tx: &Sender<UiMsg>) {
                     message: "启动超时：端口未在 20 秒内就绪".into(),
                 });
                 send(UiMsg::WebState(WebState::Failed { reason: "启动超时".into() }));
-                let _ = dsh::stop_by_pid(pid);
+                // ⚠ 半启动的子进程若**杀不掉**，而 `running_port` 又只在就绪后才写，
+                // 这个进程就成了谁都找不回的孤儿 —— 下次启动的孤儿探测没有记录可查
+                // （FR-22/FR-31 同时失效）。所以失败时补记端口：探测按端口进行，
+                // 有记录就还有机会认领它（评审轮 4）。
+                if let Err(e) = dsh::stop_by_pid(pid) {
+                    let _ = config::update(|f| f.running_port = Some(port));
+                    send(UiMsg::Log(format!(
+                        "启动超时且未能停止子进程（pid {pid}）：{e}；已记录端口 {port} 以便下次启动恢复"
+                    )));
+                }
             }
         }
         Err(e) => {
@@ -903,6 +929,10 @@ fn wire_callbacks(
                 // 版本标签，看起来同样权威。配合 drain 里"只认当前选择"的过滤，
                 // 面板要么是 Loading，要么就是当前版本的内容。
                 s.notes = NotesState::default();
+                // ⚠ 这个重置本身**没有消息**可排空（FetchNotes 的回复要等网络，
+                // 最长十几秒），不置 dirty 就投影不出来 —— 面板会一直停在旧版本的
+                // 正文上直到回复到达，等于重置没做（评审轮 4）。
+                s.dirty = true;
                 picked
             };
             if let Some(v) = picked {
@@ -927,17 +957,23 @@ fn wire_callbacks(
         let send = send.clone();
         let state = state.clone();
         win.on_start_web(move || {
-            let s = state.borrow();
-            // ⚠ 已在启动/运行中时拒绝重复启动。`is_running()` 只认 Running/External，
-            // 所以 Starting 期间 web-running 仍是 false；而这里也不设 busy —— 于是
-            // "启动"按钮在整个就绪窗口（正常约 2 秒，超时路径最长 20 秒）里都可点。
-            // 第二次点击会再派一个 StartWeb，而 start_web 的端口探测在第一份还没
-            // 绑定时会判为"空闲" → 起第二个子进程，落选的那个就没人认领了
-            // （FR-21/FR-22 要防的孤儿）。
-            if !matches!(s.web, WebState::Stopped | WebState::Failed { .. }) {
+            let mut s = state.borrow_mut();
+            // ⚠ 两道守卫缺一不可（评审轮 4）：
+            //  - `start_pending`：点击到 `Starting` 落地之间 WebState 仍是 `Stopped`
+            //    （端口预检 = 300ms 连接 + 一次 netstat，worker 积压时可达十几秒），
+            //    只看状态就会放进第二次点击 —— 它排在第一个 StartWeb 之后执行，届时
+            //    第一份已占住端口，于是**我们自己的实例**被误判成"外部 dsh web"，
+            //    `web_pid` 清空 → 退出不再停止自己启动的子进程（FR-21）。
+            //  - 状态检查：已在启动/运行中时拒绝。`is_running()` 只认 Running/External，
+            //    所以 Starting 期间 web-running 仍是 false，而这里也不设 busy ——
+            //    "启动"按钮在整个就绪窗口（正常约 2 秒，超时路径最长 20 秒）里都可点。
+            if s.start_pending || !matches!(s.web, WebState::Stopped | WebState::Failed { .. }) {
+                s.status = "已在启动或运行中，忽略重复的启动请求".into();
+                s.dirty = true; // 状态栏也要看得见，不能只进日志
                 push_log(&s, "dsh web 已在启动或运行中，忽略重复的启动请求");
                 return;
             }
+            s.start_pending = true;
             let port = s.preferred_port;
             drop(s);
             send(Job::StartWeb { port });
@@ -1017,14 +1053,18 @@ fn wire_callbacks(
         let send = send.clone();
         let state = state.clone();
         tray.on_start_web(move || {
-            let s = state.borrow();
+            let mut s = state.borrow_mut();
             // ⚠ 与窗口"启动"同一道守卫：托盘菜单项在 Starting 期间**仍是可用的**
             // （菜单的 enabled 绑定只看 web-running/busy，二者此时都为假），
             // 所以这里同样必须挡住重复启动，否则绕开窗口按钮就能造出第二个子进程。
-            if !matches!(s.web, WebState::Stopped | WebState::Failed { .. }) {
+            // `start_pending` 的理由见 `on_start_web`。
+            if s.start_pending || !matches!(s.web, WebState::Stopped | WebState::Failed { .. }) {
+                s.status = "已在启动或运行中，忽略重复的启动请求".into();
+                s.dirty = true;
                 push_log(&s, "dsh web 已在启动或运行中，忽略重复的启动请求");
                 return;
             }
+            s.start_pending = true;
             let port = s.preferred_port;
             drop(s);
             send(Job::StartWeb { port });
