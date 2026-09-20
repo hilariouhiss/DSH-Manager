@@ -458,7 +458,20 @@ fn describe_outcome_log(o: &TxOutcome) -> Vec<String> {
 
 /// `txn::Backend` 的真实实现。单元测试用 `txn::FakeBackend`，
 /// 生产用这个 —— 这是全项目唯一使用 trait 的地方，理由见 ARCHITECTURE §4.2.2。
-struct SystemBackend;
+struct SystemBackend {
+    /// 事务引擎内的日志（FR-28 明确要求的"执行的命令"）经此进入日志面板。
+    ///
+    /// trait 方法取 `&self`，所以后端可以持有 Sender —— `txn` 本身仍然
+    /// 完全不依赖 UI（ARCHITECTURE §4.2.2）。这里原本是空实现，
+    /// 于是 `txn.rs` 里那些 `$ npm.cmd install -g …` 行全部被丢掉了。
+    tx: Sender<UiMsg>,
+}
+
+impl SystemBackend {
+    fn new(tx: Sender<UiMsg>) -> Self {
+        Self { tx }
+    }
+}
 
 impl txn::Backend for SystemBackend {
     fn run(&self, pm_kind: Pm, args: &[String]) -> Result<pm::CmdOut, String> {
@@ -479,10 +492,9 @@ impl txn::Backend for SystemBackend {
     fn dsh_version_on_path(&self) -> Option<(Pm, Version)> {
         pm::read_dsh_version_on_path()
     }
+    /// FR-28：把事务引擎执行的命令原样送进日志面板。
     fn log(&self, line: &str) {
-        // 事务引擎内的日志通过 UiMsg 走，这里不直接持有 Sender，
-        // 故由 execute() 在调用前后补充关键日志。
-        let _ = line;
+        let _ = self.tx.send(UiMsg::Log(line.to_string()));
     }
 }
 
@@ -491,7 +503,28 @@ impl txn::Backend for SystemBackend {
 fn spawn_worker(rx: Receiver<Job>, tx: Sender<UiMsg>) {
     std::thread::spawn(move || {
         while let Ok(job) = rx.recv() {
-            execute(job, &tx);
+            // ⚠ 单个 worker 线程意味着**一次 panic 就会让此后所有 Job 石沉大海** ——
+            // 队列还在收，却再也没人取。而 §5.2 的 Disconnected 兜底接不住这种情形：
+            // `dsh::spawn_web` 的两个 reader 线程和一个等待线程各自持有
+            // `Sender<UiMsg>` 克隆（dsh.rs），只要 dsh web 子进程还活着，通道就
+            // 不会断开，于是既没有兜底提示、也没有任何日志。
+            //
+            // 本进程是 windows_subsystem="windows"（GC-8）：没有 stderr，panic 的
+            // 默认输出去了空处，用户看到的是一个"界面正常但按什么都没反应"的程序。
+            // 所以必须在这里兜住并把失败**变成可见的消息**。
+            // ⚠ 评审给的片段是 `|| execute(job, tx)` —— 那不能编译：`execute` 的
+            // 第二个参数是 `&Sender<UiMsg>`，而自由函数的实参不做自动借用，闭包会
+            // 按「移动」捕获 `tx`（于是循环第二轮就用不了了）。最小修正：显式写
+            // `&tx`，闭包改为按共享引用捕获。
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| execute(job, &tx)));
+            if result.is_err() {
+                let _ = tx.send(UiMsg::Log("任务执行时发生 panic，已跳过该任务".into()));
+                let _ = tx.send(UiMsg::Failed {
+                    context: "任务执行",
+                    message: "内部错误，请查看日志".into(),
+                });
+            }
         }
     });
 }
@@ -570,7 +603,8 @@ fn execute(job: Job, tx: &Sender<UiMsg>) {
             }
 
             send(UiMsg::TxProgress(TxStep::S1Install));
-            let outcome = txn::run(&SystemBackend, origin, target);
+            // 后端持有 Sender 克隆，事务引擎执行的每条命令（FR-28）因此能进日志面板。
+            let outcome = txn::run(&SystemBackend::new(tx.clone()), origin, target);
             send(UiMsg::TxDone(outcome));
 
             // TR-7：事务后重新探测（owner PM 可能已改变）
@@ -718,7 +752,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = job_tx.send(Job::FetchCatalog);
 
     // FR-31：若上次有未清除的运行态端口，探测它 —— 这正是 FR-22 的
-    // 孤儿恢复机制入口。若无占用则视为过期，静默清除。
+    // 孤儿恢复机制入口。无法确认时**保留**记录，只有确知端口空闲才清除。
     //
     // ⚠ **不要**加 "仅当 rp != preferred_port 才探测" 之类的守卫。
     // 那个方向是反的：用户通常**不会**改端口，所以孤儿最常出现在
@@ -731,17 +765,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let tx = msg_tx.clone();
             std::thread::spawn(move || {
                 if dsh::port_in_use(rp) {
-                    if let Ok(pid) = dsh::find_listener_pid(rp) {
-                        if dsh::is_node(pid) {
+                    match dsh::find_listener_pid(rp) {
+                        Ok(pid) if dsh::is_node(pid) => {
                             let _ = tx.send(UiMsg::Log(
                                 format!("检测到外部 dsh web 运行在端口 {rp}（pid {pid}）"),
                             ));
                             let _ = tx.send(UiMsg::WebState(WebState::External { port: rp }));
                             return;
                         }
+                        // ⚠ 端口被占用，但持有者不是 node.exe —— **不能清除记录**。
+                        // 这条兜底覆盖好几种情况，而它们都无法确认"这不是 dsh web"：
+                        //   - bun 托管的 dsh web：`is_node` 判据是"进程名含 node.exe"，
+                        //     而 bun 生成的是 bun.exe，于是它会被读成"非 node"；
+                        //   - `is_node` 内部 tasklist 执行失败时返回 false。
+                        // 清除 running_port 等于把这个孤儿**永久遗忘** —— 正是
+                        // FR-22 / FR-31 存在的理由（静默失联）。反过来，留下一条
+                        // 陈旧但被占用的记录只多花一次廉价探测。
+                        Ok(pid) => {
+                            let _ = tx.send(UiMsg::Log(format!(
+                                "上次的运行端口 {rp} 被非 node 进程占用（pid {pid}），无法确认是否为 dsh web，保留记录"
+                            )));
+                            return;
+                        }
+                        // 已确知端口被占用，却定位不到持有者（netstat 解析失败、
+                        // tasklist/netstat 本身跑不起来…）—— 同样不能清除。
+                        Err(_) => {
+                            let _ = tx.send(UiMsg::Log(format!(
+                                "上次的运行端口 {rp} 仍被占用但无法定位进程，保留记录"
+                            )));
+                            return;
+                        }
                     }
                 }
-                // 过期：清除并回落到偏好端口
+                // 确知空闲：视为过期，清除并回落到偏好端口（FR-32）
                 let _ = config::update(|f| f.running_port = None);
                 let _ = tx.send(UiMsg::Log("上次的运行端口已空闲，状态已清除".into()));
             });

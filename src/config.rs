@@ -88,7 +88,20 @@ pub fn save_to(path: &Path, s: &StateFile) -> Result<(), String> {
     })
 }
 
+/// 串行化 `update` 的"读—改—写"。进程内全局锁，够用 —— 只有本程序写这个文件。
+static UPDATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn update(f: impl FnOnce(&mut StateFile)) -> Result<(), String> {
+    // ⚠ 三个线程都会调 update（UI 线程、worker、启动时的孤儿探测线程），而它是
+    // 「读—改—写」：先 `load()` 出快照，改完再整体 `save()`。不加锁时交错的两个
+    // 写入方会各自基于自己读到的**旧快照**写回，后写的一方于是抹掉前一方刚写入的
+    // 字段 —— 例如别的线程刚写好的 `running_port`。那正是 FR-31 要防的静默失联：
+    // 运行态端口丢了，下次启动就再也认不出孤儿进程。
+    //
+    // 中毒不能把程序带下去：这把锁保护的是文件 I/O，而不是某个必须成立的不变量，
+    // 前一个持锁者 panic 之后文件本身仍然是完整的（save 走临时文件 + rename）。
+    // 所以中毒时取回内部值继续用，而不是 unwrap。
+    let _guard = UPDATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut s = match load() {
         Loaded::Ok(s) => s,
         // FR-32：损坏或缺失都不应让写入路径失败，从缺省值开始
