@@ -235,10 +235,12 @@ pub fn run<B: Backend>(b: &B, origin: Origin, target: Target) -> TxOutcome {
         Ok(d) => d,
         Err(e) => return compensate(b, origin, target, TxStep::S2Verify, e),
     };
-    if b.dsh_version_at(&target_dir).as_ref() != Some(&target.version) {
-        let got = b.dsh_version_at(&target_dir);
-        // ⚠ brief 原样把 format! 直接写在实参位置，会 E0382：`target` 在它之前
-        // 已被移动进 compensate（实参从左到右求值）。仅把求值提前，字符串逐字不变。
+    // ⚠ 只读一次：第二次读数会再执行一遍 shim，且两者若不一致，
+    // detail 里报的"实际"就不是触发本次失败的那个值。
+    let got = b.dsh_version_at(&target_dir);
+    if got.as_ref() != Some(&target.version) {
+        // ⚠ format! 也不能直接写在实参位置：实参从左到右求值，`target` 会先被
+        // 移动进 compensate（E0382），而这里还要读它的 version。故先求值再传。
         let detail = format!("新安装的版本不符：期望 {}，实际 {got:?}", target.version);
         return compensate(b, origin, target, TxStep::S2Verify, detail);
     }
@@ -265,16 +267,21 @@ pub fn run<B: Backend>(b: &B, origin: Origin, target: Target) -> TxOutcome {
     }
 }
 
-/// 手动恢复命令。FR-32 要求降级报告给出**可直接复制执行**的命令。
+/// 手动恢复命令。SRS §4.1 / §4.2.3 C3 要求降级报告给出**可直接复制执行**的命令。
+///
+/// ⚠ 同 PM（`origin.pm == target.pm`）时**只给重装那一条**。此时两条命令作用于
+/// 同一个包：照做会先把 origin 版本装回去、再把它删掉，结果是"一份都没有" ——
+/// 正是 TR-5 / TR-6 存在的意义所在。
 pub fn manual_commands(origin: &Origin, target: &Target) -> Vec<String> {
-    vec![
-        format!(
-            "{} {}",
-            origin.pm.exe(),
-            origin.pm.install_args(&origin.version.to_string()).join(" ")
-        ),
-        format!("{} {}", target.pm.exe(), target.pm.uninstall_args().join(" ")),
-    ]
+    let mut cmds = vec![format!(
+        "{} {}",
+        origin.pm.exe(),
+        origin.pm.install_args(&origin.version.to_string()).join(" ")
+    )];
+    if target.pm != origin.pm {
+        cmds.push(format!("{} {}", target.pm.exe(), target.pm.uninstall_args().join(" ")));
+    }
+    cmds
 }
 
 /// SRS §4.2.3 补偿流程。
@@ -300,9 +307,11 @@ fn compensate<B: Backend>(
     // ═══ C2b origin 损坏 → 先修复 origin ═══
     if !origin_ok {
         b.log("补偿：origin 已损坏，尝试重装");
-        if install(b, origin.pm, &origin.version).is_err() {
-            b.log("补偿：重装 origin 失败，进入降级");
-            return degraded(&origin, &target, failed, detail);
+        // ⚠ 不能只 `is_err()`：`install` 的 Err 里带着退出码与 stderr，
+        // 那是"为什么降级"唯一的诊断信息。丢掉它，用户只会看到主流程的原因。
+        if let Err(e) = install(b, origin.pm, &origin.version) {
+            b.log(&format!("补偿：重装 origin 失败（{e}），进入降级"));
+            return degraded(&origin, &target, failed, format!("{detail}；补偿失败：{e}"));
         }
     }
 
@@ -318,9 +327,10 @@ fn compensate<B: Backend>(
             .is_some();
         if present {
             b.log("补偿：清理 target 残留");
-            if uninstall(b, target.pm).is_err() {
-                b.log("补偿：清理失败，进入降级");
-                return degraded(&origin, &target, failed, detail);
+            // 同上：清理失败的原因（退出码 + stderr）必须带进降级报告。
+            if let Err(e) = uninstall(b, target.pm) {
+                b.log(&format!("补偿：清理失败（{e}），进入降级"));
+                return degraded(&origin, &target, failed, format!("{detail}；补偿失败：{e}"));
             }
         } else {
             b.log("补偿：target 上无残留，跳过卸载");
@@ -577,8 +587,12 @@ mod tests {
             }
             other => panic!("期望 RolledBack，得到 {other:?}"),
         }
-        // 补偿必须清掉 pnpm 上的残留
-        assert!(b.called("Pnpm") && b.called("remove"), "应清理 pnpm 残留");
+        // 补偿必须清掉 pnpm 上的残留。
+        // ⚠ 必须在**同一条记录**里同时出现 "Pnpm" 与 "remove"：分开断言的话
+        // `called("Pnpm")` 会被 precheck 的 "Pnpm --version" 恒真满足，等于没断言。
+        let calls = b.calls.borrow().clone();
+        let pnpm_uninstall = calls.iter().any(|c| c.contains("Pnpm") && c.contains("remove"));
+        assert!(pnpm_uninstall, "应清理 pnpm 残留，实际调用 {calls:?}");
     }
 
     /// ★ SRS V-21：origin 已损坏时【不得】盲目卸载 target —— 否则两边都没了
@@ -638,6 +652,53 @@ mod tests {
         assert!(cmds[0].contains("npm.cmd") && cmds[0].contains("install"));
         assert!(cmds[0].contains("@deepseek-ai/dsh@0.1.6-alpha.2"));
         assert!(cmds[1].contains("pnpm.cmd") && cmds[1].contains("remove"));
+    }
+
+    /// ★ 同 PM 时手动命令**绝不能**包含删包 —— 否则照做就是自毁。
+    ///
+    /// 场景可达：同 PM 换版本时 S1 "成功"但把 shim 弄坏了 → S2 失败 →
+    /// C1 探测的是**同一个目录**（所以必然也是坏的）→ C2b 重装失败 → Degraded。
+    /// 此时若给出"装回 V0 + 卸载 target 包"两条命令，用户照着执行会先把 dsh
+    /// 装回来、再把它删干净 —— 正是 TR-5 / TR-6 要避免的"一份都没有"。
+    #[test]
+    fn manual_commands_same_pm_never_removes_the_only_copy() {
+        let origin = Origin { pm: Pm::Npm, version: v("0.1.6-alpha.2") };
+        let target = Target { pm: Pm::Npm, version: v("0.1.6-alpha.2") };
+        let cmds = manual_commands(&origin, &target);
+        assert_eq!(cmds.len(), 1, "同 PM 时只该给重装那一条，实际 {cmds:?}");
+        assert!(cmds[0].contains("npm.cmd") && cmds[0].contains("install"));
+        assert!(cmds[0].contains("@deepseek-ai/dsh@0.1.6-alpha.2"));
+        assert!(!cmds[0].contains("remove"), "同 PM 时不得给出删包命令，实际 {cmds:?}");
+    }
+
+    /// ★ SRS §4.2.3 C3：恢复确认必须**真的探测**，不能假定"补偿动作跑完 = 已恢复"。
+    ///
+    /// 此前把 C3 换成 `let restored = true;` 全量 49 个测试**照样全绿** ——
+    /// 一个未恢复的环境会被报成 `RolledBack`（"已恢复"），而契约要求明确降级。
+    ///
+    /// 构造：origin(npm) 上没有 dsh，且对 npm 的"重装"返回成功但什么也没装上
+    /// （`install_noop`）—— 于是重装这一步**看起来成功了**，只有 C3 的探测
+    /// 能发现 origin 依然是空的，从而必须降级。
+    #[test]
+    fn c3_detects_incomplete_recovery_and_degrades() {
+        let b = FakeBackend::new();
+        {
+            let mut inst = b.installed.borrow_mut();
+            inst.insert(Pm::Npm, None);
+            inst.insert(Pm::Pnpm, Some(v("0.1.6-alpha.2")));
+        }
+        // 重装 origin "成功"但什么也没装上 —— 这正是 C3 存在的理由
+        b.install_noop.borrow_mut().push(Pm::Npm);
+        // 主流程在卸载旧的 npm 时失败，从而进入补偿
+        b.fail_uninstall.borrow_mut().push(Pm::Npm);
+
+        let origin = Origin { pm: Pm::Npm, version: v("0.1.6-alpha.2") };
+        let target = Target { pm: Pm::Pnpm, version: v("0.1.6-alpha.2") };
+        let out = run(&b, origin, target);
+        assert!(
+            matches!(out, TxOutcome::Degraded { failed: TxStep::S3Uninstall, .. }),
+            "C3 必须发现自己并未恢复（重装是 no-op）并明确降级，得到 {out:?}"
+        );
     }
 
     #[test]
