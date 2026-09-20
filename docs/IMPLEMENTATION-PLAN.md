@@ -3462,6 +3462,36 @@ reader：管道缓冲在写端关闭后仍可读，故不会截尾日志；反�
 - Consumes: 无
 - Produces: `MainWindow` 组件及其完整属性/回调契约（见下方 markup）
 
+> ### ⚠ 实施后修订（Task 15 已交付，以下 6 处与下方 Step 1 的原始 markup **不同**）
+>
+> 下方 markup 是**派发时的原始版本**，实际交付的是提交 `a5e2743` + 修复轮 `5eadced`。
+> 6 处改动全部由评审裁决（Ruling 68~71），原因是**原始 markup 本身有缺陷**：
+>
+> 1. **两处 Slint API 错误**（原始 markup 编译不过）：web 状态小圆点 `Rectangle` 上的
+>    `vertical-alignment: center;` 删除（Rectangle 无此属性）；`StyledText` 的 `font-size: 12px;`
+>    改为 `default-font-size: 12px;`（该内建元素只有后者）。
+> 2. **强制浅色配色（Ruling 68）**：`std-widgets` 导入补 `Palette`，并在组件体属性之后加
+>    `init => { Palette.color-scheme = ColorScheme.light; }`。
+>    理由：本窗口是刻意的浅色设计（卡片底色硬编码），而 Slint 默认跟随系统主题 ——
+>    Windows 暗色模式下 `Palette.foreground` 是白色，导致**所有未显式上色的文字白底白字**，
+>    含 FR-9 的版本读数、FR-27 的说明正文与 `AboutSlint` 内部文字；而 `Button` 标签色是
+>    `private`、`AboutSlint` 内部不可达，**逐处补色无法穷尽**，故只能钉死配色方案。
+>    注意：在组件体里直接写 `Palette.color-scheme: …;` 是语法错误，必须放 `init` 内。
+> 3. **FR-29 补齐（Ruling 70）**：新增四个只读属性
+>    `in property <string> app-version / dsh-path / owner-pm / current-port: "";`
+>    并在"关于"卡片内渲染四行标签/值 —— SRS FR-29 要求含程序版本、`dsh` 安装路径、owner PM、当前端口。
+>    **Task 17 的 `project()` 负责推这四个值**（已同步写入 Task 17 的代码块）。
+> 4. **控件改双向绑定（Ruling 71）**：`pm-index` / `version-index` / `port-text` 三个根属性由
+>    `in` 改为 `in-out`，且 `ComboBox.current-index` 与 `LineEdit.text` 改用 `<=>`。
+>    理由：单向绑定会被控件**自身的赋值**解除（Slint 语义），此后 Task 17 的 `set_*` 推不动控件显示。
+> 5. **两处 `cross-axis-alignment: center`（Ruling 69）**：关于卡片的容器布局、以及 web 状态行
+>    （否则卡片贴左、8px 小圆点跑到行首 —— `alignment` 只管主轴）。
+> 6. **遮罩补 `TouchArea { }`** 作为首个子元素，否则点击会穿透到被遮住的按钮。
+>
+> 另有一项**当时未修、随 Task 16 处理**：说明区的 `StyledText` 在 `ScrollView` 里
+> **水平居中**（Slint 对"隐式尺寸的非布局子元素"做 `maybe_center_in_parent`），
+> 长正文还会因不换行而两侧被裁 —— 需显式定宽/定 x 后**实测**确认。
+
 - [ ] **Step 1: 写 `ui/app.slint`**
 
 ```slint
@@ -4153,6 +4183,24 @@ fn project(state: &AppState, win: &MainWindow, tray: &AppTray) {
     win.set_busy(state.busy);
     win.set_busy_label(state.busy_label.clone().into());
     win.set_status_text(state.status.clone().into());
+
+    // ── 关于对话框的四项（FR-29）──
+    // Task 15 的修复轮补上了这四个只读属性：FR-29 要求对话框含
+    // 程序版本 / dsh 安装路径 / owner PM / 当前端口，缺一即不合规。
+    win.set_app_version(env!("CARGO_PKG_VERSION").into());
+    win.set_dsh_path(
+        state
+            .env
+            .dsh_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default()
+            .into(),
+    );
+    win.set_owner_pm(state.env.owner.map(|pm| pm.label().to_string()).unwrap_or_default().into());
+    // ⚠ 必须是【实际在运行】的端口，不是用户在输入框里敲的 port-text ——
+    // 后者只是偏好值。否则"关于"会与 FR-30 的持久化状态互相矛盾。
+    win.set_current_port(state.web.port().unwrap_or(state.preferred_port).to_string().into());
 
     // ── 推给托盘（独立实例，必须再推一次）──
     tray.set_web_running(state.web.is_running());
