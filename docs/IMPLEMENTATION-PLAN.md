@@ -1329,12 +1329,21 @@ pnpm\\bin 排在 npm 之前，所以这个顺序是真有影响的。
     /// ★ TR-4 的**判别性**测试（上面那条对 TR-4 没有牙齿）。
     ///
     /// `read_dsh_version_at_missing_dir_is_none` 在 `shim_in(dir)?` 就提前返回了，
-    /// 命令根本没跑 —— 所以一个"经 PATH 解析"的错误实现照样能通过它（只要 PATH
-    /// 上没有 dsh）。它断言的内容没错，但**测不到 TR-4**。
+    /// 命令根本没跑 —— 所以一个"经 PATH 解析"的错误实现照样能通过它。它断言的内容
+    /// 没错，但**测不到 TR-4**。
     ///
-    /// 本测试在临时目录里放一个真实可执行的 `dsh.cmd`，且该目录**不在 PATH 上**：
-    /// - 正确实现（执行该目录下的 shim）→ 拿到版本 ✓
-    /// - 错误实现（走 PATH 解析）→ 该目录不在 PATH，返回 None ✗
+    /// ⚠ 判别性的关键在于**版本号取什么值**，而不在"目录不在 PATH 上"。
+    /// 早期版本让 shim 打印 `0.1.6-alpha.2` 并断言它 —— **那个取值在本项目自己的
+    /// 开发机上无法判别**：`dsh` 本身就在 PATH 上（本项目自己的工具），走 PATH 的
+    /// 变异体会执行**真实 dsh** 并返回**相同版本号**，断言照样通过。判别性依赖机器环境。
+    ///
+    /// 因此 shim 打印 **`9.9.9-tr4probe`** —— 一个真实 dsh 不可能有的值：
+    /// - 正确实现（执行该目录下的 shim）→ `9.9.9-tr4probe` ✓
+    /// - 错误实现（走 PATH 解析）→ 拿到**真实 dsh 的版本**（≠ 它）✗
+    ///
+    /// ⚠ **不要"顺手"把版本号改回一个像真版本的值** —— 那会让这条测试重新变成
+    /// 环境依赖的。已用变异实测确认：改成 PATH 解析后本测试确实变红
+    /// （`left: Some(0.1.6-alpha.2)` 正是真实 dsh 的版本）。
     ///
     /// 顺带覆盖 `.cmd` shim 的真实 spawn 路径 —— 既有的 run_cmd 测试用的都是 cmd.exe。
     #[test]
@@ -1342,8 +1351,9 @@ pnpm\\bin 排在 npm 之前，所以这个顺序是真有影响的。
         let dir = std::env::temp_dir().join(format!("dsh-mgr-shim-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        // 一个最小但真实可执行的 .cmd shim
-        std::fs::write(dir.join("dsh.cmd"), "@echo 0.1.6-alpha.2\r\n").unwrap();
+        // 一个最小但真实可执行的 .cmd shim。
+        // 版本号必须是 9.9.9-tr4probe（理由见上），不能换成像真版本的值。
+        std::fs::write(dir.join("dsh.cmd"), "@echo 9.9.9-tr4probe\r\n").unwrap();
 
         let got = read_dsh_version_at(&dir);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1371,8 +1381,8 @@ pnpm\\bin 排在 npm 之前，所以这个顺序是真有影响的。
         std::fs::create_dir_all(&dir).unwrap();
         let shim = dir.join("dsh.cmd");
         // 先打印合法版本号，再以非零码退出
-        std::fs::write(&shim, "@echo 9.9.9-tr4probe
-@exit /b 3
+        std::fs::write(&shim, "@echo 9.9.9-tr4probe
+@exit /b 3
 ").unwrap();
 
         let got = version_from_shim(&shim);
@@ -1388,7 +1398,9 @@ pnpm\\bin 排在 npm 之前，所以这个顺序是真有影响的。
 - [ ] **Step 2: 运行测试，确认失败**
 
 Run: `cargo test pm`
-Expected: 编译失败 —— `path_dirs` / `run_cmd` / `read_dsh_version_at` 未定义。
+Expected: 编译失败 —— **E0425**，点名 `path_dirs` / `parse_path_var` / `run_cmd` / `read_dsh_version_at`
+（Step 1 只写类型与 `todo!()` 骨架，Step 3 才补实现，所以这些函数在 RED 阶段都不存在）。
+（若 Step 3 之后又改了实现，RED 的报错清单可能随之变化 —— 以实际输出为准，不要为了对上这句话去改测试。）
 
 - [ ] **Step 3: 实现**
 
