@@ -2069,7 +2069,7 @@ TR-3（目标 PM 的 bin 必须在 PATH 中）是阻断式的：不在 PATH 时
     #[test]
     fn rejected_target_produces_no_side_effects() {
         // TR-3 拒绝时零副作用
-        let b = FakeBackend::new().with_installed(Pm::Npm, "0.1.6-alpha.2");
+        let mut b = FakeBackend::new().with_installed(Pm::Npm, "0.1.6-alpha.2");
         b.bins.insert(Pm::Bun, PathBuf::from("C:/bun/bin"));
         let origin = Origin { pm: Pm::Npm, version: v("0.1.6-alpha.2") };
         let target = Target { pm: Pm::Bun, version: v("0.1.6-alpha.2") };
@@ -2166,15 +2166,14 @@ pub fn run<B: Backend>(b: &B, origin: Origin, target: Target) -> TxOutcome {
         Ok(d) => d,
         Err(e) => return compensate(b, origin, target, TxStep::S2Verify, e),
     };
-    if b.dsh_version_at(&target_dir).as_ref() != Some(&target.version) {
-        let got = b.dsh_version_at(&target_dir);
-        return compensate(
-            b,
-            origin,
-            target,
-            TxStep::S2Verify,
-            format!("新安装的版本不符：期望 {}，实际 {got:?}", target.version),
-        );
+    // ⚠ 只读一次：第二次读数会再执行一遍 shim，且两者若不一致，
+    // detail 里报的"实际"就不是触发本次失败的那个值。
+    let got = b.dsh_version_at(&target_dir);
+    if got.as_ref() != Some(&target.version) {
+        // ⚠ format! 也不能直接写在实参位置：实参从左到右求值，`target` 会先被
+        // 移动进 compensate（E0382），而这里还要读它的 version。故先求值再传。
+        let detail = format!("新安装的版本不符：期望 {}，实际 {got:?}", target.version);
+        return compensate(b, origin, target, TxStep::S2Verify, detail);
     }
 
     // ═══ S3 卸载旧 PM（同 PM 时跳过 —— FR-13）═══
@@ -2218,7 +2217,7 @@ fn compensate<B: Backend>(
 - [ ] **Step 4: 运行测试，确认通过**
 
 Run: `cargo test txn`
-Expected: 11 passed
+Expected: 12 passed（比最初估计多出 1 条：`fake_backend_semantics_are_modeled`，Task 8 修复轮补入）
 
 > 若 `v20_s1_failure_touches_nothing` 失败：检查 `FakeBackend::run` 是否真的对 `fail_install` 里的 PM 返回了非零退出码。该逻辑已在 **Task 8** 的 `FakeBackend::run` 中实现（含 `install_noop` 与 `path_override` 两个开关），本任务不应再改 `FakeBackend` —— 若发现它行为不符，说明 Task 8 的实现有偏差，**回到 Task 8 修复**，不要在这里打补丁。
 
@@ -2262,8 +2261,12 @@ Expected: 11 passed
             }
             other => panic!("期望 RolledBack，得到 {other:?}"),
         }
-        // 补偿必须清掉 pnpm 上的残留
-        assert!(b.called("Pnpm") && b.called("remove"), "应清理 pnpm 残留");
+        // 补偿必须清掉 pnpm 上的残留。
+        // ⚠ 必须在**同一条记录**里同时出现 "Pnpm" 与 "remove"：分开断言的话
+        // `called("Pnpm")` 会被 precheck 的 "Pnpm --version" 恒真满足，等于没断言。
+        let calls = b.calls.borrow().clone();
+        let pnpm_uninstall = calls.iter().any(|c| c.contains("Pnpm") && c.contains("remove"));
+        assert!(pnpm_uninstall, "应清理 pnpm 残留，实际调用 {calls:?}");
     }
 
     /// ★ SRS V-21：origin 已损坏时【不得】盲目卸载 target —— 否则两边都没了
@@ -2325,6 +2328,89 @@ Expected: 11 passed
         assert!(cmds[1].contains("pnpm.cmd") && cmds[1].contains("remove"));
     }
 
+    /// ★ 同 PM 时手动命令**绝不能**包含删包 —— 否则照做就是自毁。
+    ///
+    /// 场景可达：同 PM 换版本时 S1 "成功"但把 shim 弄坏了 → S2 失败 →
+    /// C1 探测的是**同一个目录**（所以必然也是坏的）→ C2b 重装失败 → Degraded。
+    /// 此时若给出"装回 V0 + 卸载 target 包"两条命令，用户照着执行会先把 dsh
+    /// 装回来、再把它删干净 —— 正是 TR-5 / TR-6 要避免的"一份都没有"。
+    #[test]
+    fn manual_commands_same_pm_never_removes_the_only_copy() {
+        let origin = Origin { pm: Pm::Npm, version: v("0.1.6-alpha.2") };
+        let target = Target { pm: Pm::Npm, version: v("0.1.6-alpha.2") };
+        let cmds = manual_commands(&origin, &target);
+        assert_eq!(cmds.len(), 1, "同 PM 时只该给重装那一条，实际 {cmds:?}");
+        assert!(cmds[0].contains("npm.cmd") && cmds[0].contains("install"));
+        assert!(cmds[0].contains("@deepseek-ai/dsh@0.1.6-alpha.2"));
+        assert!(!cmds[0].contains("remove"), "同 PM 时不得给出删包命令，实际 {cmds:?}");
+    }
+
+    /// ★ SRS §4.2.3 C3：恢复确认必须**真的探测**，不能假定"补偿动作跑完 = 已恢复"。
+    ///
+    /// 此前把 C3 换成 `let restored = true;` 全量 49 个测试**照样全绿** ——
+    /// 一个未恢复的环境会被报成 `RolledBack`（"已恢复"），而契约要求明确降级。
+    ///
+    /// 构造：origin(npm) 上没有 dsh，且对 npm 的"重装"返回成功但什么也没装上
+    /// （`install_noop`）—— 于是重装这一步**看起来成功了**，只有 C3 的探测
+    /// 能发现 origin 依然是空的，从而必须降级。
+    #[test]
+    fn c3_detects_incomplete_recovery_and_degrades() {
+        let b = FakeBackend::new();
+        {
+            let mut inst = b.installed.borrow_mut();
+            inst.insert(Pm::Npm, None);
+            inst.insert(Pm::Pnpm, Some(v("0.1.6-alpha.2")));
+        }
+        // 重装 origin "成功"但什么也没装上 —— 这正是 C3 存在的理由
+        b.install_noop.borrow_mut().push(Pm::Npm);
+        // 主流程在卸载旧的 npm 时失败，从而进入补偿
+        b.fail_uninstall.borrow_mut().push(Pm::Npm);
+
+        let origin = Origin { pm: Pm::Npm, version: v("0.1.6-alpha.2") };
+        let target = Target { pm: Pm::Pnpm, version: v("0.1.6-alpha.2") };
+        let out = run(&b, origin, target);
+        assert!(
+            matches!(out, TxOutcome::Degraded { failed: TxStep::S3Uninstall, .. }),
+            "C3 必须发现自己并未恢复（重装是 no-op）并明确降级，得到 {out:?}"
+        );
+    }
+
+    /// ★ C2a 的失败分支此前**无任何测试到达** —— 文件里所有 `fail_uninstall`
+    /// 推的都是 origin 的 Npm，所以"清理 target 残留失败"这条路从未被走过。
+    ///
+    /// 该守卫若被删除，清理失败会穿透到 C3：此时 origin 完好、C3 为真，于是返回
+    /// `RolledBack`（界面显示"已恢复"），而 target 上的残留还在 —— 一份**假成功报告**。
+    ///
+    /// 本测试同时钉住 F1：降级 `reason` 必须真的带上补偿失败的诊断（失败命令的
+    /// label + 退出码 + stderr）。把 `if let Err(e)` 退回 `.is_err()` 并原样传
+    /// `detail`，这两条 reason 断言就会失败。
+    #[test]
+    fn c2a_cleanup_failure_is_reported_as_degraded_with_cause() {
+        let b = FakeBackend::new().with_installed(Pm::Npm, "0.1.6-alpha.2");
+        // S3 卸载 origin 失败 → 进入补偿
+        b.fail_uninstall.borrow_mut().push(Pm::Npm);
+        // C2a 清理 target 残留也失败 → 必须降级，且带上失败原因
+        b.fail_uninstall.borrow_mut().push(Pm::Pnpm);
+
+        let origin = Origin { pm: Pm::Npm, version: v("0.1.6-alpha.2") };
+        let target = Target { pm: Pm::Pnpm, version: v("0.1.6-alpha.2") };
+        let out = run(&b, origin, target);
+        match out {
+            TxOutcome::Degraded { failed, reason, .. } => {
+                assert_eq!(failed, TxStep::S3Uninstall);
+                assert!(
+                    reason.contains("补偿失败"),
+                    "降级原因必须说明补偿为何失败，而不是只说主流程的失败；实际 {reason:?}"
+                );
+                assert!(
+                    reason.contains("pnpm"),
+                    "降级原因必须带上失败命令的身份（pnpm），实际 {reason:?}"
+                );
+            }
+            other => panic!("期望 Degraded，得到 {other:?}"),
+        }
+    }
+
     #[test]
     fn rejected_outcome_is_not_confused_with_rolled_back() {
         let b = FakeBackend::new();
@@ -2338,21 +2424,35 @@ Expected: 11 passed
 - [ ] **Step 2: 运行测试，确认失败**
 
 Run: `cargo test txn`
-Expected: FAIL —— `v17` 与 `tr11` 失败（当前简版 `compensate` 无条件返回 `RolledBack`，不会做 C1 探测与 C2 清理）；`degraded_outcome_carries_runnable_manual_commands` 编译失败（`manual_commands` 未定义）。
+Expected: RED 来自**编译失败**：`E0425 manual_commands 未定义`（`degraded_outcome_carries_runnable_manual_commands` 引用了本步骤才引入的函数）。先看到的是它，不是断言失败。
+
+以 Task 9 的简版 `compensate`（无条件返回 `RolledBack`、不做任何动作）为基准实测：
+- `v17_s3_failure_rolls_back_to_origin` —— **FAILS**
+- `v21_origin_broken_does_not_blindly_uninstall_target` —— **FAILS**
+- `degraded_outcome_carries_runnable_manual_commands` —— **FAILS**（`manual_commands` 未定义）
+- `tr11_compensation_probes_before_acting` —— **PASSES**
+- `rejected_outcome_is_not_confused_with_rolled_back` —— **PASSES**
+
+> ⚠ `tr11` 对着简版 `compensate` 是通过的（简版不做任何卸载，两条断言都成立）。**绝不要为了让它变红而弱化或改写它** —— 它的判别力由变异 M4（去掉 C2a 的"先探测再卸载"守卫）实测证明。
 
 - [ ] **Step 3: 用完整实现替换 Task 9 的简版 `compensate`**
 
 ```rust
-/// 手动恢复命令。FR-32 要求降级报告给出**可直接复制执行**的命令。
+/// 手动恢复命令。SRS §4.1 / §4.2.3 C3 要求降级报告给出**可直接复制执行**的命令。
+///
+/// ⚠ 同 PM（`origin.pm == target.pm`）时**只给重装那一条**。此时两条命令作用于
+/// 同一个包：照做会先把 origin 版本装回去、再把它删掉，结果是"一份都没有" ——
+/// 正是 TR-5 / TR-6 存在的意义所在。
 pub fn manual_commands(origin: &Origin, target: &Target) -> Vec<String> {
-    vec![
-        format!(
-            "{} {}",
-            origin.pm.exe(),
-            origin.pm.install_args(&origin.version.to_string()).join(" ")
-        ),
-        format!("{} {}", target.pm.exe(), target.pm.uninstall_args().join(" ")),
-    ]
+    let mut cmds = vec![format!(
+        "{} {}",
+        origin.pm.exe(),
+        origin.pm.install_args(&origin.version.to_string()).join(" ")
+    )];
+    if target.pm != origin.pm {
+        cmds.push(format!("{} {}", target.pm.exe(), target.pm.uninstall_args().join(" ")));
+    }
+    cmds
 }
 
 /// SRS §4.2.3 补偿流程。
@@ -2378,9 +2478,11 @@ fn compensate<B: Backend>(
     // ═══ C2b origin 损坏 → 先修复 origin ═══
     if !origin_ok {
         b.log("补偿：origin 已损坏，尝试重装");
-        if install(b, origin.pm, &origin.version).is_err() {
-            b.log("补偿：重装 origin 失败，进入降级");
-            return degraded(&origin, &target, failed, detail);
+        // ⚠ 不能只 `is_err()`：`install` 的 Err 里带着退出码与 stderr，
+        // 那是"为什么降级"唯一的诊断信息。丢掉它，用户只会看到主流程的原因。
+        if let Err(e) = install(b, origin.pm, &origin.version) {
+            b.log(&format!("补偿：重装 origin 失败（{e}），进入降级"));
+            return degraded(&origin, &target, failed, format!("{detail}；补偿失败：{e}"));
         }
     }
 
@@ -2396,9 +2498,10 @@ fn compensate<B: Backend>(
             .is_some();
         if present {
             b.log("补偿：清理 target 残留");
-            if uninstall(b, target.pm).is_err() {
-                b.log("补偿：清理失败，进入降级");
-                return degraded(&origin, &target, failed, detail);
+            // 同上：清理失败的原因（退出码 + stderr）必须带进降级报告。
+            if let Err(e) = uninstall(b, target.pm) {
+                b.log(&format!("补偿：清理失败（{e}），进入降级"));
+                return degraded(&origin, &target, failed, format!("{detail}；补偿失败：{e}"));
             }
         } else {
             b.log("补偿：target 上无残留，跳过卸载");
@@ -2430,7 +2533,7 @@ fn degraded(origin: &Origin, target: &Target, failed: TxStep, reason: String) ->
 - [ ] **Step 4: 运行全部测试，确认通过**
 
 Run: `cargo test`
-Expected: 全部通过（含此前各任务的测试）
+Expected: 全部通过（含此前各任务的测试）。最终计数：**20 txn / 52 总**（本步骤当时为 17 / 49；两轮修复各加 2 条与 1 条测试）
 
 - [ ] **Step 5: 提交**（合并 Task 9 + Task 10）
 
@@ -2668,6 +2771,8 @@ Expected（对照 SRS §2.2.5 的实测值）：
 
 **验证完把 `main` 改回 Task 1 的空窗口版本。**
 
+> **注意**：若 `cargo run` 看不到 `println` 输出：临时注释掉 `src/main.rs` 的 `#![cfg_attr(not(test), windows_subsystem = "windows")]`，验证完**必须还原**（临时改动一律不得入库）。
+
 - [ ] **Step 6: 提交**
 
 ```bash
@@ -2806,15 +2911,6 @@ fn heading_body(s: &str) -> Option<&str> {
     Some(rest)
 }
 
-/// FR-27 的强制预处理。
-///
-/// Slint 的 `StyledText` 官方 Currently Unsupported 列表包含 **Headings** 与
-/// **Other HTML tags**。而 DSH 的 release notes 通篇是 `### 新增功能` 这类 ATX
-/// 标题，且混有 `<h3 id="...">` 裸 HTML。不预处理就会原样显示成垃圾文本。
-///
-/// 只做两件事：剥离 HTML 标签、ATX 标题降级为粗体。
-/// 其余语法（粗体 / 斜体 / 行内代码 / **链接** / 列表）由 StyledText 原生支持，
-/// **不做干预** —— 尤其不要破坏链接。
 /// 这一行是否是 HTML 标题（`<h1>` ~ `<h6>`）？
 ///
 /// 必须单独识别：DSH 的 release notes **同时**使用两种标题写法 ——
@@ -2898,7 +2994,7 @@ pub fn fetch_notes(version: &Version) -> Result<String, NotesError> {
 - [ ] **Step 4: 运行测试，确认通过**
 
 Run: `cargo test dsh`
-Expected: 14 passed
+Expected: 13 passed
 
 - [ ] **Step 5: 手动验证真实拉取**
 
@@ -2920,6 +3016,8 @@ Run: `cargo run`
 Expected:
 - 第一个版本返回 `Ok(...)`，内容含 `新增功能`（中英双语正文的开头）
 - 第二个版本返回 `Err(Missing)` —— **这是正常结果，不是 bug**
+
+> **注意**：若 `cargo run` 看不到 `println` 输出：临时注释掉 `src/main.rs` 的 `#![cfg_attr(not(test), windows_subsystem = "windows")]`，验证完**必须还原**（临时改动一律不得入库）。
 
 - [ ] **Step 6: 提交**
 
@@ -2958,11 +3056,12 @@ GitHub 只有 18 个 release，6 个版本本就无说明。"
 在 `src/dsh.rs` 的 `mod tests` 内追加：
 
 ```rust
+    // TIME_WAIT 行必须排在 LISTENING 之前 —— 否则"不做 LISTENING 过滤"的错误实现照样会先命中 LISTENING 行并返回 13432，该测试永远不能失败。
     /// 取自 `netstat -ano` 的真实输出形状（本机实测 3080 被 dsh web 占用）
     const NETSTAT: &str = "\
   TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       1768
-  TCP    127.0.0.1:3080         0.0.0.0:0              LISTENING       13432
   TCP    127.0.0.1:3080         127.0.0.1:1716         TIME_WAIT       0
+  TCP    127.0.0.1:3080         0.0.0.0:0              LISTENING       13432
   TCP    [::]:445                [::]:0                 LISTENING       4
 ";
 
@@ -3068,7 +3167,7 @@ pub fn is_node(pid: u32) -> bool {
 - [ ] **Step 4: 运行测试，确认通过**
 
 Run: `cargo test dsh`
-Expected: 19 passed
+Expected: 18 passed
 
 - [ ] **Step 5: 提交**
 
@@ -3135,21 +3234,39 @@ fn spawn_reader<R: Read + Send + 'static>(
 /// 返回 pid。`Child` 句柄被 move 进内部的 waiter 线程，**不跨线程共享** ——
 /// 因此没有任何锁。停止只依赖 pid（见 `stop_by_pid`）。
 ///
+/// 按 `SHIM_NAMES` 顺序尝试 shim 全名（GC-7）：npm / pnpm / yarn 生成 `dsh.cmd`，
+/// 而 **bun 生成 `dsh.exe`** —— 写死 `.cmd` 会让 bun 用户的 FR-16 直接失败。
+/// 顺序与 `pm::find_dsh_on_path` 一致（也是 PATHEXT 的顺序）；失败的 `spawn`
+/// 无副作用（进程根本没起来）。
+///
 /// **不传 `--no-open`**：让 `dsh web` 自己打开浏览器，本项目零代码实现 FR-20
 /// 的自动打开。
 pub fn spawn_web(port: u16, tx: Sender<UiMsg>) -> Result<u32, String> {
     #[cfg(windows)]
     use std::os::windows::process::CommandExt;
 
-    let mut cmd = Command::new("dsh.cmd"); // GC-7：必须是 shim 全名
-    cmd.args(["web", "--port", &port.to_string()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(windows)]
-    cmd.creation_flags(pm::CREATE_NO_WINDOW); // GC-8
-
-    let mut child = cmd.spawn().map_err(|e| format!("启动 dsh web 失败: {e}"))?;
+    let port_arg = port.to_string();
+    let mut child = None;
+    let mut last_err = String::new();
+    for name in SHIM_NAMES {
+        let mut cmd = Command::new(name); // GC-7：必须是 shim 全名
+        cmd.args(["web", "--port", &port_arg])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(windows)]
+        cmd.creation_flags(pm::CREATE_NO_WINDOW); // GC-8
+        match cmd.spawn() {
+            Ok(c) => {
+                child = Some(c);
+                break;
+            }
+            Err(e) => last_err = format!("{name}: {e}"),
+        }
+    }
+    let mut child = child.ok_or_else(|| {
+        format!("无法启动 dsh web —— 已尝试 {}：{last_err}", SHIM_NAMES.join(" / "))
+    })?;
     let pid = child.id();
 
     let out = child.stdout.take();
@@ -4928,6 +5045,11 @@ Task 2 在 `src/main.rs` 加了一行临时的 `#![allow(dead_code)]`，用于�
 **若出现任何 `dead_code` 警告**：那是真实死代码，**必须删除对应项，不得恢复抑制**。逐个判断：
 - 从来没有消费者的项 → 删掉
 - 只是尚未接线的项 → 说明 Task 17~19 有遗漏，回到对应任务补上
+
+> **已知会出现的 `dead_code`**：`src/model.rs` 的 `TxStep::Precheck` / `C1Probe` / `C2Restore` / `C2Cleanup` / `C3Confirm` **五个变体零构造点**（全仓只构造 `S1Install` / `S2Verify` / `S3Uninstall` / `S4VerifyFinal`）。**删除这五个变体及其 `label()` 分支**，不要恢复 `allow`：
+> 1. `Degraded.failed` / `RolledBack.failed` 在 UI 里被渲染成「在「X」阶段失败」，语义是**主流程**在哪一步失败（补偿失败的原因由 `reason` 承载）；把补偿步骤塞进 `failed` 会显示成"降级：在「确认已恢复」阶段失败"，属语义错位。
+> 2. 补偿进度**结构上无法上报** —— `UiMsg::TxProgress` 只能由 `main.rs` 发送，而 `main.rs` 看不到 `compensate` 内部；同一 tick 内连发两条也只会渲染最后一条。为骗过 lint 而写这种代码是本末倒置。
+> 3. **不要**顺手删 `is_safe_version` 与 `RejectReason::InvalidVersion` —— 它们在 `precheck` 里**有构造点**（只是运行期不可达），是 NFR-6 的具名实现，按已记录在案的裁决**保留**。
 
 > 这一步的存在意义：那行 allow 会掩盖真实死代码。没有这一步，它会永久留在代码里。
 
