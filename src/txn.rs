@@ -701,6 +701,42 @@ mod tests {
         );
     }
 
+    /// ★ C2a 的失败分支此前**无任何测试到达** —— 文件里所有 `fail_uninstall`
+    /// 推的都是 origin 的 Npm，所以"清理 target 残留失败"这条路从未被走过。
+    ///
+    /// 该守卫若被删除，清理失败会穿透到 C3：此时 origin 完好、C3 为真，于是返回
+    /// `RolledBack`（界面显示"已恢复"），而 target 上的残留还在 —— 一份**假成功报告**。
+    ///
+    /// 本测试同时钉住 F1：降级 `reason` 必须真的带上补偿失败的诊断（失败命令的
+    /// label + 退出码 + stderr）。把 `if let Err(e)` 退回 `.is_err()` 并原样传
+    /// `detail`，这两条 reason 断言就会失败。
+    #[test]
+    fn c2a_cleanup_failure_is_reported_as_degraded_with_cause() {
+        let b = FakeBackend::new().with_installed(Pm::Npm, "0.1.6-alpha.2");
+        // S3 卸载 origin 失败 → 进入补偿
+        b.fail_uninstall.borrow_mut().push(Pm::Npm);
+        // C2a 清理 target 残留也失败 → 必须降级，且带上失败原因
+        b.fail_uninstall.borrow_mut().push(Pm::Pnpm);
+
+        let origin = Origin { pm: Pm::Npm, version: v("0.1.6-alpha.2") };
+        let target = Target { pm: Pm::Pnpm, version: v("0.1.6-alpha.2") };
+        let out = run(&b, origin, target);
+        match out {
+            TxOutcome::Degraded { failed, reason, .. } => {
+                assert_eq!(failed, TxStep::S3Uninstall);
+                assert!(
+                    reason.contains("补偿失败"),
+                    "降级原因必须说明补偿为何失败，而不是只说主流程的失败；实际 {reason:?}"
+                );
+                assert!(
+                    reason.contains("pnpm"),
+                    "降级原因必须带上失败命令的身份（pnpm），实际 {reason:?}"
+                );
+            }
+            other => panic!("期望 Degraded，得到 {other:?}"),
+        }
+    }
+
     #[test]
     fn rejected_outcome_is_not_confused_with_rolled_back() {
         let b = FakeBackend::new();
