@@ -226,4 +226,40 @@ mod tests {
         }
         let _ = std::fs::remove_file(&p);
     }
+
+    /// 判别性测试：唯一能区分"原子写入"与"朴素截断写入"的测试。
+    ///
+    /// 手法：把 .tmp 的路径占成目录，逼 `save_to` 在写临时文件这一步失败，
+    /// 然后断言**目标文件分毫未动**。
+    ///
+    /// 它捕获的变异：把 `save_to` 里"写 .tmp → rename"整段换成
+    /// `std::fs::write(path, text)`（朴素截断写入）。
+    ///   - 原子实现：写 .tmp 失败 → 目标从未被碰过 → 仍是 baseline → 通过
+    ///   - 朴素实现：直接写进目标 → 返回 Ok 且目标变成 different → 失败
+    ///
+    /// 这正是 FR-31 的立身之本：写入失败绝不能毁掉已有的 state.json，
+    /// 否则下次启动回落缺省端口，孤儿即失联。不要弱化本测试。
+    #[test]
+    fn failed_write_leaves_target_intact() {
+        let p = tmp("atomic-swap.json");
+        let tmp_dir = p.with_extension("json.tmp");
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+
+        let baseline = StateFile { preferred_port: Some(3080), running_port: None };
+        save_to(&p, &baseline).unwrap();
+
+        // 占住 .tmp 路径，使"写临时文件"必然失败
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let different = StateFile { preferred_port: Some(9999), running_port: Some(1) };
+        assert!(save_to(&p, &different).is_err(), "写 .tmp 失败时 save_to 必须报错");
+
+        match load_from(Some(&p)) {
+            Loaded::Ok(s) => assert_eq!(s, baseline, "写入失败时目标文件必须原封不动"),
+            other => panic!("目标被破坏，期望 Ok(baseline)，得到 {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        let _ = std::fs::remove_file(&p);
+    }
 }
