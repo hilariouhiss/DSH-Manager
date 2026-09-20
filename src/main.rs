@@ -24,6 +24,7 @@
 mod config;
 mod model;
 mod pm;
+mod txn;
 
 slint::include_modules!();
 
