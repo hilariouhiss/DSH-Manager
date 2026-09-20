@@ -1255,7 +1255,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let state = state.clone();
         let job_tx = job_tx.clone();
         Rc::new(move || {
-            let pid = state.borrow().web_pid;
+            let s = state.borrow();
+            let pid = s.web_pid;
+            let pending = s.start_pending;
+            let port = s.preferred_port;
+            drop(s);
             if let Some(pid) = pid {
                 // ⚠ 只有**确知已停**才清 running_port（评审轮 1）。无条件清除的话，
                 // taskkill 失败时孤儿还活着、而它唯一的恢复信号（FR-31 的运行态端口）
@@ -1276,6 +1280,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ),
                     ),
                 }
+            } else if pending {
+                // ⚠ 队列里还有 StartWeb（或它正在跑）时退出：worker 可能在我们退出
+                // **之后**才真正 spawn 出子进程，而那时界面已经没了 pid —— 于是留下
+                // 一个既不认识（quit 只认 web_pid）又找不回（state.json 里没有
+                // running_port）的孤儿。pid 在 UI 线程上无从得知，但端口可以记下来，
+                // 让 FR-31 下次启动认出它。
+                let _ = config::update(|f| f.running_port = Some(port));
+                push_log(
+                    &state.borrow(),
+                    format!("退出时有启动任务未完成；已记录运行态端口 {port}，下次启动会探测"),
+                );
             }
             let _ = job_tx; // 不再接受新任务
             slint::quit_event_loop().ok();
