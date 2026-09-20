@@ -23,6 +23,7 @@
 
 mod config;
 mod model;
+mod pm;
 
 slint::include_modules!();
 
