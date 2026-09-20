@@ -215,10 +215,17 @@ export component MainWindow inherits Window {
             border-color: #e0e0e0;
             min-height: 130px;
             ScrollView {
-                StyledText {
-                    text: root.notes-text;
-                    default-font-size: 12px;
-                    link-clicked(link) => { root.link-clicked(link); }
+                // ⚠ StyledText 必须由布局托管，不能直接当 Flickable 的子元素。
+                // 隐式尺寸的非布局子元素会被 Slint 在父元素里居中（maybe_center_in_parent）：
+                // 实测 257 字正文变成一条 2877px 的单行、左右各溢出卡片 1190px 被裁掉；
+                // 而 1275 字的正文（高 442px）会从卡片上方 -148px 开始，开头 10 行看不见。
+                // 套一层 VerticalLayout 后正文才既贴左、又按卡片宽度换行、又从顶部开始。
+                VerticalLayout {
+                    StyledText {
+                        text: root.notes-text;
+                        default-font-size: 12px;
+                        link-clicked(link) => { root.link-clicked(link); }
+                    }
                 }
             }
         }
@@ -287,6 +294,53 @@ export component MainWindow inherits Window {
                     Button { text: "关闭"; clicked => { root.about-visible = false; } }
                 }
             }
+        }
+    }
+}
+
+// 托盘组件是【顶层】组件：inherits SystemTrayIcon，不能放进 Window 里，
+// 且必须恰好包含一个 Menu 子元素。
+//
+// ⚠ 它与 MainWindow 各自持有 global 的独立副本，二者不共享任何状态 ——
+// 所有同步必须由 Rust 侧推送（SRS FR-25）。
+export component AppTray inherits SystemTrayIcon {
+    in property <bool> web-running: false;
+    in property <bool> busy: false;
+
+    icon: @image-url("tray-icon.png");
+    tooltip: "DSH Manager";
+
+    callback show-window();
+    callback open-web();
+    callback start-web();
+    callback stop-web();
+    callback quit-app();
+
+    Menu {
+        MenuItem {
+            title: "显示主窗口";
+            activated => { show-window(); }
+        }
+        MenuItem {
+            title: "打开 DSH 网页";
+            enabled: root.web-running && !root.busy;
+            activated => { open-web(); }
+        }
+        MenuSeparator { }
+        MenuItem {
+            title: "启动 dsh web";
+            enabled: !root.web-running && !root.busy;
+            activated => { start-web(); }
+        }
+        MenuItem {
+            title: "停止 dsh web";
+            enabled: root.web-running && !root.busy;
+            activated => { stop-web(); }
+        }
+        MenuSeparator { }
+        MenuItem {
+            title: "退出";
+            activated => { quit-app(); }
         }
     }
 }
