@@ -169,7 +169,20 @@ pub fn probe_pm(pm: Pm) -> Option<PmInfo> {
 /// pnpm\bin 排在 npm 之前，`pnpm → npm` 迁移时装完 npm 那份后
 /// `where dsh` 仍指向 pnpm 的旧文件，验证会【假通过】。
 pub fn read_dsh_version_at(dir: &Path) -> Option<Version> {
-    let shim = shim_in(dir)?;
+    version_from_shim(&shim_in(dir)?)
+}
+
+/// 执行指定 shim 读版本，**带退出码检查**。
+///
+/// ⚠ 抽成共享函数是为了**从结构上消除两个读取器的不对称**：
+/// 早先 `read_dsh_version_at` 检查退出码而 `read_dsh_version_on_path` 不检查，
+/// 于是一个"stdout 可解析但退出码非零"的 shim 会被 S4 接受、被 dir 读取器拒绝 ——
+/// 两者对**同一次安装**给出相反结论，S4 假通过。
+/// 只要守卫只写一份，这种不对称就不可能再出现。
+///
+/// 另一个好处：它是**可直接单测**的（传入任意 shim 路径），
+/// 不需要改动进程的 PATH —— 那是并行测试里不可靠的做法。
+pub fn version_from_shim(shim: &Path) -> Option<Version> {
     let out = run_cmd(&shim.to_string_lossy(), &["--version".to_string()]).ok()?;
     if out.code != 0 {
         return None;
@@ -180,18 +193,10 @@ pub fn read_dsh_version_at(dir: &Path) -> Option<Version> {
 /// 经 PATH 解析后读版本。**仅用于事务的 S4 最终验证**。
 pub fn read_dsh_version_on_path() -> Option<(Pm, Version)> {
     let shim = find_dsh_on_path(&path_dirs(), &|p| p.is_file())?;
-    let out = run_cmd(&shim.to_string_lossy(), &["--version".to_string()]).ok()?;
-    // ⚠ 必须与 read_dsh_version_at 一样检查退出码。
-    // 否则一个"stdout 可解析但退出码非零"的 shim 会被这里接受、却被
-    // read_dsh_version_at 拒绝 —— 两个读取器对**同一次安装**给出相反结论，
-    // 而 S4（事务的最终验证）会**假通过**。那正是 TR-4 要防的同一个失败方向。
-    if out.code != 0 {
-        return None;
-    }
-    let ver: Version = out.stdout.trim().parse().ok()?;
     let bins: Vec<PmInfo> = Pm::ALL.iter().filter_map(|pm| probe_pm(*pm)).collect();
     let owner = owner_of(&shim, &bins)?;
-    Some((owner, ver))
+    // 与 read_dsh_version_at 共用同一个带退出码检查的实现
+    Some((owner, version_from_shim(&shim)?))
 }
 
 /// FR-1 ~ FR-5：完整环境探测。
@@ -407,15 +412,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // 一个最小但真实可执行的 .cmd shim
-        std::fs::write(dir.join("dsh.cmd"), "@echo 0.1.6-alpha.2\r\n").unwrap();
+        std::fs::write(dir.join("dsh.cmd"), "@echo 9.9.9-tr4probe\r\n").unwrap();
 
         let got = read_dsh_version_at(&dir);
         let _ = std::fs::remove_dir_all(&dir);
 
         assert_eq!(
             got,
-            Some(v("0.1.6-alpha.2")),
-            "必须执行【该目录下】的 shim。返回 None 说明实现走了 PATH 解析（TR-4 违规）"
+            Some(v("9.9.9-tr4probe")),
+            "必须执行【该目录下】的 shim。返回 None 或【真实 dsh 的版本】都说明实现走了 PATH 解析（TR-4 违规）"
+        );
+    }
+
+    /// ★ 退出码守卫的**判别性**测试 —— Finding 1 的回归保护。
+    ///
+    /// 这个 shim **打印一个完全合法的版本号，然后以非零码退出** —— 正是
+    /// `read_dsh_version_on_path` 早先会误接受的那种形状。共享函数
+    /// `version_from_shim` 必须拒绝它。
+    ///
+    /// 之所以能直接单测而不必改进程 PATH：`version_from_shim` 接收 shim 路径
+    /// 作为参数。若把它写成内部直接调 `find_dsh_on_path`，这条测试就写不出来 ——
+    /// 那正是这个抽象存在的第二个理由。
+    #[test]
+    fn version_from_shim_rejects_nonzero_exit() {
+        let dir = std::env::temp_dir().join(format!("dsh-mgr-badshim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let shim = dir.join("dsh.cmd");
+        // 先打印合法版本号，再以非零码退出
+        std::fs::write(&shim, "@echo 9.9.9-tr4probe
+@exit /b 3
+").unwrap();
+
+        let got = version_from_shim(&shim);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            got, None,
+            "stdout 可解析但退出码非零的 shim 必须被拒绝；返回 Some 说明退出码守卫被删掉了"
         );
     }
 }
