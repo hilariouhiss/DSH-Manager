@@ -21,6 +21,7 @@
 // 本行会掩盖真实死代码（它覆盖面很宽），只应短期存在。
 #![allow(dead_code)]
 
+mod config;
 mod model;
 
 slint::include_modules!();
