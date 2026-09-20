@@ -1509,9 +1509,16 @@ pub struct FakeBackend {
     pub path: Vec<PathBuf>,
     /// 各 PM 目录当前的 dsh 版本（None = 该 PM 上没装）
     pub installed: RefCell<HashMap<Pm, Option<Version>>>,
-    /// 哪些 PM 的命令会失败
+    /// 哪些 PM 的安装命令会以非零码失败
     pub fail_install: RefCell<Vec<Pm>>,
     pub fail_uninstall: RefCell<Vec<Pm>>,
+    /// 哪些 PM 的安装命令"返回成功但什么也没装上"。
+    /// 用于构造 S2 验证必须失败的场景 —— 真实世界里这对应"装是装了但版本不对"。
+    pub install_noop: RefCell<Vec<Pm>>,
+    /// 强行指定 `dsh_version_on_path()` 的返回值。
+    /// 用于构造"目标目录里没有，但 PATH 解析能拿到"的场景 ——
+    /// 这是 TR-4 唯一的判别条件：若实现误用 PATH 验证，测试会假通过。
+    pub path_override: RefCell<Option<(Pm, Version)>>,
     /// 调用记录，用于断言"某操作从未被调用"
     pub calls: RefCell<Vec<String>>,
     /// 模拟 PM 完全不可用
@@ -1530,6 +1537,8 @@ impl FakeBackend {
             installed: RefCell::new(HashMap::new()),
             fail_install: RefCell::new(vec![]),
             fail_uninstall: RefCell::new(vec![]),
+            install_noop: RefCell::new(vec![]),
+            path_override: RefCell::new(None),
             calls: RefCell::new(vec![]),
             unavailable: RefCell::new(vec![]),
         }
@@ -1545,11 +1554,47 @@ impl FakeBackend {
 
 #[cfg(test)]
 impl Backend for FakeBackend {
+    /// ⚠ `run` **必须模拟安装/卸载的副作用**，不能只返回成功。
+    ///
+    /// 原因：事务的 S2 步骤会去读 `dsh_version_at(target_dir)` 来验证"装上了没有"。
+    /// 如果假 backend 的安装不改变 `installed`，那么**任何**迁移都不可能通过 S2，
+    /// `TxOutcome::Committed` 这条成功路径就永远无法在测试里走到 —— 而成功路径
+    /// 恰恰是最该被测试覆盖的那条。
+    ///
+    /// 三个开关的语义：
+    /// - `fail_install` / `fail_uninstall`：命令以**非零码**退出（真实失败）
+    /// - `install_noop`：命令**返回成功但什么也没装上**（真实世界里的"装是装了但版本不对"），
+    ///   用于构造 S2 必须失败的场景
     fn run(&self, pm: Pm, args: &[String]) -> Result<CmdOut, String> {
         self.calls.borrow_mut().push(format!("{pm:?} {}", args.join(" ")));
         if self.unavailable.borrow().contains(&pm) {
             return Err(format!("{pm:?} 不可用"));
         }
+
+        let joined = args.join(" ");
+        let is_install = args.iter().any(|a| a == "install" || a == "add");
+        let is_uninstall = args.iter().any(|a| a == "uninstall" || a == "remove");
+
+        if is_install && self.fail_install.borrow().contains(&pm) {
+            return Ok(CmdOut { code: 1, stdout: String::new(), stderr: "模拟安装失败".into() });
+        }
+        if is_uninstall && self.fail_uninstall.borrow().contains(&pm) {
+            return Ok(CmdOut { code: 1, stdout: String::new(), stderr: "模拟卸载失败".into() });
+        }
+
+        if is_install && !self.install_noop.borrow().contains(&pm) {
+            // 从包规格里取出目标版本并写入 —— 这是 S2 能通过的前提
+            if let Some(spec) = args.iter().find(|a| a.starts_with("@deepseek-ai/dsh@")) {
+                if let Some(ver) = spec.rsplit('@').next().and_then(|s| s.parse::<Version>().ok()) {
+                    self.installed.borrow_mut().insert(pm, Some(ver));
+                }
+            }
+        }
+        if is_uninstall {
+            self.installed.borrow_mut().insert(pm, None);
+        }
+
+        let _ = joined;
         Ok(CmdOut { code: 0, stdout: String::new(), stderr: String::new() })
     }
     fn bin_dir(&self, pm: Pm) -> Result<PathBuf, String> {
@@ -1565,6 +1610,12 @@ impl Backend for FakeBackend {
             .and_then(|(k, _)| self.installed.borrow().get(k).cloned().flatten())
     }
     fn dsh_version_on_path(&self) -> Option<(Pm, Version)> {
+        // 测试可以强行指定它的返回值（TR-4 的判别条件靠这个构造：
+        // "目标目录里没有，但 PATH 解析能拿到" —— 只有这样才能区分
+        // 实现到底用了目录检查还是 PATH 检查）
+        if let Some(forced) = self.path_override.borrow().clone() {
+            return Some(forced);
+        }
         // 按 PATH 顺序取第一个"有装 dsh"的 PM
         for dir in &self.path {
             for (k, d) in self.bins.iter() {
@@ -1784,18 +1835,28 @@ TR-3（目标 PM 的 bin 必须在 PATH 中）是阻断式的：不在 PATH 时
         assert!(!b.called("uninstall"), "S1 失败时不得触碰旧的安装");
     }
 
-    /// ★ SRS V-19 / TR-4：S2 验证绝不经 PATH
+    /// ★ SRS V-19 / TR-4：S2 验证**绝不经 PATH**
+    ///
+    /// 构造方式（两个开关缺一不可）：
+    /// - `install_noop = [Pnpm]` —— 安装返回成功但**什么也没装上**，
+    ///   所以 `dsh_version_at(Pnpm目录)` 是 None
+    /// - `path_override = Some((Pnpm, 目标版本))` —— 强行让 PATH 解析**报告成功**
+    ///
+    /// 于是：走目录检查 → S2 失败（正确）；走 PATH 检查 → S2 通过（错误）。
+    /// **这就是判别条件** —— 只有真正独立于 PATH 的实现才会让本测试通过。
     #[test]
     fn tr4_verify_does_not_use_path() {
-        // 构造：装完后目标目录里【没有】dsh（模拟装坏），
-        // 但 PATH 解析仍能拿到旧版本 —— 若实现误用 PATH 验证就会假通过。
         let b = FakeBackend::new().with_installed(Pm::Npm, "0.1.6-alpha.2");
-        // Pnpm 不在 installed 里 → dsh_version_at(Pnpm) = None
+        b.install_noop.borrow_mut().push(Pm::Pnpm);
+        *b.path_override.borrow_mut() = Some((Pm::Pnpm, v("0.1.6-alpha.2")));
+
         let origin = Origin { pm: Pm::Npm, version: v("0.1.6-alpha.2") };
         let target = Target { pm: Pm::Pnpm, version: v("0.1.6-alpha.2") };
         let out = run(&b, origin, target);
-        assert!(matches!(out, TxOutcome::RolledBack { failed: TxStep::S2Verify, .. }),
-                "S2 必须发现自己装的版本不对，得到 {out:?}");
+        assert!(
+            matches!(out, TxOutcome::RolledBack { failed: TxStep::S2Verify, .. }),
+            "S2 必须走目录检查并发现自己没装上；若这里得到 Committed，说明实现误用了 PATH 验证。得到 {out:?}"
+        );
     }
 ```
 
@@ -1902,19 +1963,7 @@ fn compensate<B: Backend>(
 Run: `cargo test txn`
 Expected: 11 passed
 
-> 若 `v20_s1_failure_touches_nothing` 失败：检查 `FakeBackend::run` 是否真的对 `fail_install` 里的 PM 返回了非零退出码。当前 FakeBackend 的 `fail_install` 字段尚未被 `run` 使用 —— **需要先在 `FakeBackend::run` 里补上**：
->
-> ```rust
-> if args.iter().any(|a| a == "add" || a == "install")
->     && self.fail_install.borrow().contains(&pm) {
->     return Ok(CmdOut { code: 1, stdout: String::new(), stderr: "模拟安装失败".into() });
-> }
-> if args.iter().any(|a| a == "remove" || a == "uninstall")
->     && self.fail_uninstall.borrow().contains(&pm) {
->     return Ok(CmdOut { code: 1, stdout: String::new(), stderr: "模拟卸载失败".into() });
-> }
-> ```
-> 放在 `run` 中 `unavailable` 检查之后、返回 `code: 0` 之前。
+> 若 `v20_s1_failure_touches_nothing` 失败：检查 `FakeBackend::run` 是否真的对 `fail_install` 里的 PM 返回了非零退出码。该逻辑已在 **Task 8** 的 `FakeBackend::run` 中实现（含 `install_noop` 与 `path_override` 两个开关），本任务不应再改 `FakeBackend` —— 若发现它行为不符，说明 Task 8 的实现有偏差，**回到 Task 8 修复**，不要在这里打补丁。
 
 - [ ] **Step 5: 提交**（与 Task 10 合并提交，见 Task 10 Step 5）
 
@@ -1991,7 +2040,12 @@ Expected: 11 passed
     #[test]
     fn tr11_compensation_probes_before_acting() {
         let b = FakeBackend::new().with_installed(Pm::Npm, "0.1.6-alpha.2");
-        // pnpm 上从来没有 dsh（不是 None，而是压根不在 installed 里）
+        // 关键：让 pnpm 的安装"返回成功但什么也没装上"。
+        // 若不用这个开关，安装会真的写入 installed，S2 就会通过、
+        // 事务会走到 S3 并成功提交 —— 那时根本不会进入补偿流程，
+        // 本测试就测不到 TR-11。
+        b.install_noop.borrow_mut().push(Pm::Pnpm);
+
         let origin = Origin { pm: Pm::Npm, version: v("0.1.6-alpha.2") };
         let target = Target { pm: Pm::Pnpm, version: v("0.1.6-alpha.2") };
         let out = run(&b, origin, target);
