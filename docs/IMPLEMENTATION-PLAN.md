@@ -72,7 +72,7 @@
 | `Cargo.toml` | 5 个依赖 + release profile | 1 |
 | `build.rs` | Slint 编译期集成 | 1 |
 | `ui/app.slint` | `MainWindow` + `AppTray` 两个顶层组件、`NotesStatus` 枚举 | 1, 4 |
-| `src/model.rs` | **纯数据叶子层**：`Pm` 枚举 + 命令表、`PmEnv`、`Catalog`、`Origin`/`Target`、`TxStep`/`RejectReason`/`TxOutcome`、`WebState`、`NotesStatus`/`NotesError`、`Job`、`UiMsg`。**不依赖任何模块** | 2 |
+| `src/model.rs` | **纯数据叶子层**：`Pm` 枚举 + 命令表、`PmEnv`、`Catalog`、`Origin`/`Target`、`TxStep`/`RejectReason`/`TxOutcome`、`WebState`、`NotesError`、`Job`、`UiMsg`。**不依赖任何模块**。⚠ `NotesStatus` **不在此处** —— 它由 `app.slint` 的 `export enum` 生成在 crate 根，此处的副本会被 glob 导入遮蔽而成为死代码 | 2 |
 | `src/config.rs` | `state.json` 读写：路径解析、读取与缺省回退、原子写入。**纯 I/O，无 UI 逻辑** | 2 |
 | `src/pm.rs` | PM 探测（扫描 / bin 目录 / owner 判定）+ 通道判定 + 命令执行helper | 2 |
 | `src/txn.rs` | 事务引擎 + `Backend` trait + `SystemBackend` 实现 | 2 |
@@ -223,7 +223,7 @@ git commit -m "feat: 工具链骨架与空窗口
   - `Catalog { versions: Vec<Version>, tags: BTreeMap<String, Version> }`
   - `Origin { pm: Pm, version: Version }` / `Target { pm: Pm, version: Version }`
   - `TxStep`、`RejectReason`、`TxOutcome`
-  - `WebState`、`NotesStatus`、`NotesError`
+  - `WebState`、`NotesError`（⚠ 不含 `NotesStatus` —— 见下方说明）
   - `Job`、`UiMsg`
   - `Version`（`semver::Version` 的别名）
   - `SHIM_NAMES: [&str; 2]`
@@ -418,14 +418,12 @@ impl WebState {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum NotesStatus {
-    Loading,
-    Ok,
-    Missing,
-    Failed,
-}
-
+// ⚠ `NotesStatus` 【刻意不在此处定义】。
+// app.slint 的 `export enum NotesStatus` 会让 Slint 在 crate 根生成同名的
+// Rust 枚举，那才是唯一使用者（`NotesState.status` 与 `set_notes_status`）。
+// 若此处也定义一份，main.rs 的 `use model::*` 是【glob 导入】，会被 crate 根
+// 的本地定义遮蔽 —— 结果是这份副本永远没有消费者，Task 20 删除
+// `#![allow(dead_code)]` 后必然报 dead_code。
 #[derive(Clone, Debug)]
 pub enum NotesError {
     Missing,
@@ -464,16 +462,20 @@ pub enum UiMsg {
 ```rust
 // ⚠ 临时（Task 2 ~ Task 16 期间存在）
 //
-// 各模块按依赖顺序逐步落地，先定义的类型/函数要到很晚才被消费
-// （model.rs 的类型直到 Task 17 才接上 UI），在【二进制 crate】中
-// 未使用的 pub 项会触发 dead_code 警告。实测确认：bin crate 不会
-// 因为是 pub 就豁免这个 lint。
+// 各模块按依赖顺序逐步落地，先定义的类型/函数要到很晚才被消费。
+// 在【二进制 crate】中未使用的 pub 项会触发 dead_code 警告 ——
+// 实测确认：bin crate 不会因为是 pub 就豁免这个 lint。
+//
+// 受影响的不止 model.rs：pm.rs 的 sorted_desc 要到 Task 11 才被消费、
+// probe_env 要到 Task 18；dsh.rs 的 fetch_catalog 要到 Task 18；
+// txn.rs 的 run 要到 Task 18。因此抑制必须是 crate 级的 ——
+// 单独给 `mod model;` 加属性解决不了其余模块。
 //
 // 若不抑制，Task 2~16 的构建输出会持续带着十几个无关警告 ——
 // 既让"输出必须干净"的检查失效，也会掩盖真实警告。
 //
-// 【Task 20 必须删除本行，并确认 cargo build 零警告】
-// 本行会掩盖真实死代码，只应短期存在。
+// 【Task 20 必须删除本行，并确认 cargo build 与 cargo test 都零警告】
+// 本行会掩盖真实死代码（它覆盖面很宽），只应短期存在。
 #![allow(dead_code)]
 
 mod model;
@@ -488,18 +490,79 @@ mod model;
 mod tests {
     use super::*;
 
+    /// FR-14 / FR-2 / GC-7 的**精确**断言。
+    ///
+    /// ⚠ 必须断言确切的参数序列，**不能只断言"非空"**。只查非空的话，
+    /// 把安装子命令误写成 `uninstall`、或写错 `-g` 的位置，测试仍会通过 ——
+    /// 而那恰恰是这张表唯一可能出错的方式。FR-14 的全部价值就在这些确切
+    /// 字符串上，断言必须钉到同一粒度。
     #[test]
-    fn pm_command_table_is_complete() {
-        for pm in Pm::ALL {
-            assert!(!pm.exe().is_empty(), "{pm:?} 缺少 exe");
-            assert!(!pm.install_args("1.2.3").is_empty(), "{pm:?} 缺少安装命令");
-            assert!(!pm.uninstall_args().is_empty(), "{pm:?} 缺少卸载命令");
+    fn pm_command_table_is_exact() {
+        let cases: [(Pm, &str, Vec<&str>, Vec<&str>, Vec<&str>); 4] = [
+            (
+                Pm::Npm,
+                "npm.cmd",
+                vec!["prefix", "-g"],
+                vec!["install", "-g", "@deepseek-ai/dsh@1.2.3"],
+                vec!["uninstall", "-g", "@deepseek-ai/dsh"],
+            ),
+            (
+                Pm::Pnpm,
+                "pnpm.cmd",
+                vec!["bin", "-g"],
+                vec!["add", "-g", "@deepseek-ai/dsh@1.2.3"],
+                vec!["remove", "-g", "@deepseek-ai/dsh"],
+            ),
+            (
+                Pm::Bun,
+                "bun.exe",
+                vec!["pm", "bin", "-g"],
+                vec!["add", "-g", "@deepseek-ai/dsh@1.2.3"],
+                vec!["remove", "-g", "@deepseek-ai/dsh"],
+            ),
+            (
+                Pm::Yarn,
+                "yarn.cmd",
+                vec!["global", "bin"],
+                vec!["global", "add", "@deepseek-ai/dsh@1.2.3"],
+                vec!["global", "remove", "@deepseek-ai/dsh"],
+            ),
+        ];
+
+        assert_eq!(
+            cases.len(),
+            Pm::ALL.len(),
+            "每个 Pm 变体都必须有断言用例（新增变体时同步更新）"
+        );
+
+        for (pm, exe, bin_dir, install, uninstall) in cases {
+            assert_eq!(pm.exe(), exe, "{pm:?} 的 exe 名不对（GC-7）");
+
+            assert_eq!(
+                pm.bin_dir_args().to_vec(),
+                bin_dir,
+                "{pm:?} 的全局 bin 目录参数不对（FR-2）"
+            );
+
+            let got: Vec<String> = pm.install_args("1.2.3");
+            let want: Vec<String> = install.iter().map(|s| s.to_string()).collect();
+            assert_eq!(got, want, "{pm:?} 的安装命令不对（FR-14）");
+
+            let got = pm.uninstall_args();
+            let want: Vec<String> = uninstall.iter().map(|s| s.to_string()).collect();
+            assert_eq!(got, want, "{pm:?} 的卸载命令不对（FR-14）");
         }
+
+        // label() 被 UI 与日志使用，一并钉住
+        assert_eq!(Pm::Npm.label(), "npm");
+        assert_eq!(Pm::Pnpm.label(), "pnpm");
+        assert_eq!(Pm::Bun.label(), "bun");
+        assert_eq!(Pm::Yarn.label(), "yarn");
     }
 }
 ```
 
-Run: `cargo test pm_command_table_is_complete`
+Run: `cargo test pm_command_table_is_exact`
 Expected: 看到 `test result: ok. 1 passed`。
 
 > **若看不到任何输出**：说明 `cfg_attr(not(test), ..)` 未生效，需把 `src/main.rs` 的模块与逻辑迁到 `src/lib.rs`，把测试目标与 GUI 目标分开。**此时停下来上报**，不要继续后续任务。
