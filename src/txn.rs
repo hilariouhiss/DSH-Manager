@@ -196,6 +196,158 @@ impl Backend for FakeBackend {
     }
 }
 
+pub fn install<B: Backend>(b: &B, pm: Pm, version: &Version) -> Result<(), String> {
+    let args = pm.install_args(&version.to_string());
+    b.log(&format!("$ {} {}", pm.exe(), args.join(" ")));
+    let out = b.run(pm, &args)?;
+    if out.code != 0 {
+        return Err(format!("{} 退出码 {}: {}", pm.label(), out.code, out.stderr.trim()));
+    }
+    Ok(())
+}
+
+pub fn uninstall<B: Backend>(b: &B, pm: Pm) -> Result<(), String> {
+    let args = pm.uninstall_args();
+    b.log(&format!("$ {} {}", pm.exe(), args.join(" ")));
+    let out = b.run(pm, &args)?;
+    if out.code != 0 {
+        return Err(format!("{} 退出码 {}: {}", pm.label(), out.code, out.stderr.trim()));
+    }
+    Ok(())
+}
+
+/// SRS §4.2.2 主流程。
+pub fn run<B: Backend>(b: &B, origin: Origin, target: Target) -> TxOutcome {
+    // ═══ 前置检查：任一条不通过即拒绝，零副作用 ═══
+    if let Some(reason) = precheck(b, &target) {
+        return TxOutcome::Rejected { reason };
+    }
+
+    // ═══ S1 安装新版本 ═══
+    // 顺序关键：先装后卸（TR-6）。最坏结果是"多一份"，而不是"一份都没有"。
+    if let Err(e) = install(b, target.pm, &target.version) {
+        return compensate(b, origin, target, TxStep::S1Install, e);
+    }
+
+    // ═══ S2 验证新安装 ═══
+    // TR-4：**绝不走 PATH**。用路径上的版本验证会在 pnpm→npm 迁移时假通过。
+    let target_dir = match b.bin_dir(target.pm) {
+        Ok(d) => d,
+        Err(e) => return compensate(b, origin, target, TxStep::S2Verify, e),
+    };
+    if b.dsh_version_at(&target_dir).as_ref() != Some(&target.version) {
+        let got = b.dsh_version_at(&target_dir);
+        // ⚠ brief 原样把 format! 直接写在实参位置，会 E0382：`target` 在它之前
+        // 已被移动进 compensate（实参从左到右求值）。仅把求值提前，字符串逐字不变。
+        let detail = format!("新安装的版本不符：期望 {}，实际 {got:?}", target.version);
+        return compensate(b, origin, target, TxStep::S2Verify, detail);
+    }
+
+    // ═══ S3 卸载旧 PM（同 PM 时跳过 —— FR-13）═══
+    if target.pm != origin.pm {
+        if let Err(e) = uninstall(b, origin.pm) {
+            return compensate(b, origin, target, TxStep::S3Uninstall, e);
+        }
+    }
+
+    // ═══ S4 最终验证（经 PATH）═══
+    match b.dsh_version_on_path() {
+        Some((pm, ver)) if pm == target.pm && ver == target.version => {
+            TxOutcome::Committed { pm: target.pm, version: target.version }
+        }
+        other => compensate(
+            b,
+            origin,
+            target,
+            TxStep::S4VerifyFinal,
+            format!("最终验证不符：{other:?}"),
+        ),
+    }
+}
+
+/// 手动恢复命令。FR-32 要求降级报告给出**可直接复制执行**的命令。
+pub fn manual_commands(origin: &Origin, target: &Target) -> Vec<String> {
+    vec![
+        format!(
+            "{} {}",
+            origin.pm.exe(),
+            origin.pm.install_args(&origin.version.to_string()).join(" ")
+        ),
+        format!("{} {}", target.pm.exe(), target.pm.uninstall_args().join(" ")),
+    ]
+}
+
+/// SRS §4.2.3 补偿流程。
+///
+/// 契约（§4.1）：要么回到操作前状态，要么明确报告降级并给出手动命令。
+fn compensate<B: Backend>(
+    b: &B,
+    origin: Origin,
+    target: Target,
+    failed: TxStep,
+    detail: String,
+) -> TxOutcome {
+    let origin_dir = b.bin_dir(origin.pm).ok();
+
+    // ═══ C1 先探测 origin 是否完好（TR-5）═══
+    // 关键：在动任何东西之前先看现状。若 origin 已被 S3 破坏，盲目卸载
+    // target 会把两边都毁掉 —— 那是比"操作失败"严重得多的事故。
+    let origin_ok = origin_dir
+        .as_ref()
+        .and_then(|d| b.dsh_version_at(d))
+        .is_some_and(|ver| ver == origin.version);
+
+    // ═══ C2b origin 损坏 → 先修复 origin ═══
+    if !origin_ok {
+        b.log("补偿：origin 已损坏，尝试重装");
+        if install(b, origin.pm, &origin.version).is_err() {
+            b.log("补偿：重装 origin 失败，进入降级");
+            return degraded(&origin, &target, failed, detail);
+        }
+    }
+
+    // ═══ C2a 清理 target 残留 —— 【先探测再动作】（TR-11）═══
+    // 通用规则：补偿中的每个动作都先确认目标状态是否存在。
+    // 若 target 上根本没有 dsh（S1 失败时会自然发生），卸载命令会非零退出，
+    // 从而被误判为补偿失败并错误报告 Degraded —— 让用户以为环境坏了。
+    if target.pm != origin.pm {
+        let present = b
+            .bin_dir(target.pm)
+            .ok()
+            .and_then(|d| b.dsh_version_at(&d))
+            .is_some();
+        if present {
+            b.log("补偿：清理 target 残留");
+            if uninstall(b, target.pm).is_err() {
+                b.log("补偿：清理失败，进入降级");
+                return degraded(&origin, &target, failed, detail);
+            }
+        } else {
+            b.log("补偿：target 上无残留，跳过卸载");
+        }
+    }
+
+    // ═══ C3 确认确实回到了 origin ═══
+    let restored = origin_dir
+        .as_ref()
+        .and_then(|d| b.dsh_version_at(d))
+        .is_some_and(|ver| ver == origin.version);
+
+    if restored {
+        TxOutcome::RolledBack { failed, restored: origin, detail }
+    } else {
+        degraded(&origin, &target, failed, detail)
+    }
+}
+
+fn degraded(origin: &Origin, target: &Target, failed: TxStep, reason: String) -> TxOutcome {
+    TxOutcome::Degraded {
+        failed,
+        reason,
+        manual: manual_commands(origin, target),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,5 +472,180 @@ mod tests {
         let f = FakeBackend::new();
         f.unavailable.borrow_mut().push(Pm::Pnpm);
         assert!(f.run(Pm::Pnpm, &["--version".to_string()]).is_err(), "不可用必须是 Err");
+    }
+
+    #[test]
+    fn same_pm_version_change_commits_and_skips_uninstall() {
+        // FR-13：同 PM 换版本时 S3 必须自动跳过
+        let b = FakeBackend::new().with_installed(Pm::Npm, "0.1.6-alpha.2");
+        let origin = Origin { pm: Pm::Npm, version: v("0.1.6-alpha.1") };
+        let target = Target { pm: Pm::Npm, version: v("0.1.6-alpha.2") };
+        let out = run(&b, origin, target);
+        assert!(matches!(out, TxOutcome::Committed { pm: Pm::Npm, .. }), "得到 {out:?}");
+        assert!(!b.called("uninstall"), "同 PM 时不得调用卸载");
+    }
+
+    #[test]
+    fn cross_pm_migration_installs_then_uninstalls() {
+        // TR-6：先装后卸
+        let b = FakeBackend::new().with_installed(Pm::Npm, "0.1.6-alpha.2");
+        let origin = Origin { pm: Pm::Npm, version: v("0.1.6-alpha.2") };
+        let target = Target { pm: Pm::Pnpm, version: v("0.1.6-alpha.2") };
+        let out = run(&b, origin, target);
+        assert!(matches!(out, TxOutcome::Committed { pm: Pm::Pnpm, .. }), "得到 {out:?}");
+
+        let calls = b.calls.borrow().clone();
+        let i_install = calls.iter().position(|c| c.contains("Pnpm") && c.contains("add"))
+            .expect("应有 pnpm add");
+        let i_uninstall = calls.iter().position(|c| c.contains("Npm") && c.contains("uninstall"))
+            .expect("应有 npm uninstall");
+        // 注意：install 之前 precheck 也会调 run(--version)，用 add/uninstall 关键字区分
+        assert!(i_install < i_uninstall, "TR-6：必须先装后卸，实际顺序 {calls:?}");
+    }
+
+    #[test]
+    fn rejected_target_produces_no_side_effects() {
+        // TR-3 拒绝时零副作用
+        // ⚠ brief 原文是 `let b` —— bins 是普通 HashMap（非 RefCell），
+        // 就地 insert 需要可变绑定，否则 E0596。与既有 precheck 测试同因。
+        let mut b = FakeBackend::new().with_installed(Pm::Npm, "0.1.6-alpha.2");
+        b.bins.insert(Pm::Bun, PathBuf::from("C:/bun/bin"));
+        let origin = Origin { pm: Pm::Npm, version: v("0.1.6-alpha.2") };
+        let target = Target { pm: Pm::Bun, version: v("0.1.6-alpha.2") };
+        let out = run(&b, origin, target);
+        assert!(matches!(out, TxOutcome::Rejected { .. }), "得到 {out:?}");
+        assert!(!b.called("add"), "被拒绝时不得执行任何安装");
+        assert!(!b.called("uninstall"), "被拒绝时不得执行任何卸载");
+    }
+
+    /// ★ SRS V-20：S1 失败时零副作用
+    #[test]
+    fn v20_s1_failure_touches_nothing() {
+        let b = FakeBackend::new().with_installed(Pm::Npm, "0.1.6-alpha.2");
+        b.fail_install.borrow_mut().push(Pm::Pnpm);
+        let origin = Origin { pm: Pm::Npm, version: v("0.1.6-alpha.2") };
+        let target = Target { pm: Pm::Pnpm, version: v("0.1.6-alpha.2") };
+        let out = run(&b, origin, target);
+        assert!(matches!(out, TxOutcome::RolledBack { failed: TxStep::S1Install, .. }),
+                "得到 {out:?}");
+        assert!(!b.called("uninstall"), "S1 失败时不得触碰旧的安装");
+    }
+
+    /// ★ SRS V-19 / TR-4：S2 验证**绝不经 PATH**
+    ///
+    /// 构造方式（两个开关缺一不可）：
+    /// - `install_noop = [Pnpm]` —— 安装返回成功但**什么也没装上**，
+    ///   所以 `dsh_version_at(Pnpm目录)` 是 None
+    /// - `path_override = Some((Pnpm, 目标版本))` —— 强行让 PATH 解析**报告成功**
+    ///
+    /// 于是：走目录检查 → S2 失败（正确）；走 PATH 检查 → S2 通过（错误）。
+    /// **这就是判别条件** —— 只有真正独立于 PATH 的实现才会让本测试通过。
+    #[test]
+    fn tr4_verify_does_not_use_path() {
+        let b = FakeBackend::new().with_installed(Pm::Npm, "0.1.6-alpha.2");
+        b.install_noop.borrow_mut().push(Pm::Pnpm);
+        *b.path_override.borrow_mut() = Some((Pm::Pnpm, v("0.1.6-alpha.2")));
+
+        let origin = Origin { pm: Pm::Npm, version: v("0.1.6-alpha.2") };
+        let target = Target { pm: Pm::Pnpm, version: v("0.1.6-alpha.2") };
+        let out = run(&b, origin, target);
+        assert!(
+            matches!(out, TxOutcome::RolledBack { failed: TxStep::S2Verify, .. }),
+            "S2 必须走目录检查并发现自己没装上；若这里得到 Committed，说明实现误用了 PATH 验证。得到 {out:?}"
+        );
+    }
+
+    /// ★ SRS V-17：S3 失败时补偿生效，状态回到 origin
+    #[test]
+    fn v17_s3_failure_rolls_back_to_origin() {
+        let b = FakeBackend::new().with_installed(Pm::Npm, "0.1.6-alpha.2");
+        // 迁移到 pnpm，但 pnpm 装完后旧版本 npm 卸载失败。
+        // 关键：npm 上的 origin 版本仍然完好 → 应卸掉 pnpm 残留并回到 npm。
+        b.fail_uninstall.borrow_mut().push(Pm::Npm);
+        // 让 pnpm 的安装"成功"（写进 installed），这样 S2 能过、走到 S3
+        {
+            let mut inst = b.installed.borrow_mut();
+            inst.insert(Pm::Pnpm, Some(v("0.1.6-alpha.2")));
+        }
+        let origin = Origin { pm: Pm::Npm, version: v("0.1.6-alpha.2") };
+        let target = Target { pm: Pm::Pnpm, version: v("0.1.6-alpha.2") };
+        let out = run(&b, origin, target);
+        match out {
+            TxOutcome::RolledBack { failed, restored, .. } => {
+                assert_eq!(failed, TxStep::S3Uninstall);
+                assert_eq!(restored.pm, Pm::Npm);
+            }
+            other => panic!("期望 RolledBack，得到 {other:?}"),
+        }
+        // 补偿必须清掉 pnpm 上的残留
+        assert!(b.called("Pnpm") && b.called("remove"), "应清理 pnpm 残留");
+    }
+
+    /// ★ SRS V-21：origin 已损坏时【不得】盲目卸载 target —— 否则两边都没了
+    #[test]
+    fn v21_origin_broken_does_not_blindly_uninstall_target() {
+        let b = FakeBackend::new();
+        // origin(npm) 上【没有】dsh —— 模拟 S3 已把 origin 弄坏
+        // target(pnpm) 装成功了
+        {
+            let mut inst = b.installed.borrow_mut();
+            inst.insert(Pm::Npm, None);
+            inst.insert(Pm::Pnpm, Some(v("0.1.6-alpha.2")));
+        }
+        // 重装 origin 也失败
+        b.fail_install.borrow_mut().push(Pm::Npm);
+        // 让它走到 S3：S2 对 pnpm 会成功
+        b.fail_uninstall.borrow_mut().push(Pm::Npm);
+
+        let origin = Origin { pm: Pm::Npm, version: v("0.1.6-alpha.2") };
+        let target = Target { pm: Pm::Pnpm, version: v("0.1.6-alpha.2") };
+        let out = run(&b, origin, target);
+        assert!(matches!(out, TxOutcome::Degraded { .. }), "得到 {out:?}");
+
+        // 关键断言：不得对 pnpm 执行卸载 —— 否则旧的坏了、新的也没了
+        let calls = b.calls.borrow().clone();
+        let pnpm_uninstall = calls.iter().any(|c| c.contains("Pnpm") && c.contains("remove"));
+        assert!(!pnpm_uninstall, "origin 已损坏时不得卸载 target，实际调用 {calls:?}");
+    }
+
+    /// ★ TR-11：补偿中对【不存在】的包执行卸载，其非零退出不得被误判为补偿失败
+    #[test]
+    fn tr11_compensation_probes_before_acting() {
+        let b = FakeBackend::new().with_installed(Pm::Npm, "0.1.6-alpha.2");
+        // 关键：让 pnpm 的安装"返回成功但什么也没装上"。
+        // 若不用这个开关，安装会真的写入 installed，S2 就会通过、
+        // 事务会走到 S3 并成功提交 —— 那时根本不会进入补偿流程，
+        // 本测试就测不到 TR-11。
+        b.install_noop.borrow_mut().push(Pm::Pnpm);
+
+        let origin = Origin { pm: Pm::Npm, version: v("0.1.6-alpha.2") };
+        let target = Target { pm: Pm::Pnpm, version: v("0.1.6-alpha.2") };
+        let out = run(&b, origin, target);
+        // S1 成功但 S2 失败（pnpm 上没装成）→ 补偿时 pnpm 上没东西，
+        // 应【跳过】卸载而不是执行它并因非零退出而 Degraded
+        assert!(matches!(out, TxOutcome::RolledBack { .. }), "得到 {out:?}");
+        let calls = b.calls.borrow().clone();
+        let pnpm_uninstall = calls.iter().any(|c| c.contains("Pnpm") && c.contains("remove"));
+        assert!(!pnpm_uninstall, "TR-11：对不存在的包不应执行卸载，实际 {calls:?}");
+    }
+
+    #[test]
+    fn degraded_outcome_carries_runnable_manual_commands() {
+        let origin = Origin { pm: Pm::Npm, version: v("0.1.6-alpha.2") };
+        let target = Target { pm: Pm::Pnpm, version: v("0.1.6-alpha.2") };
+        let cmds = manual_commands(&origin, &target);
+        assert_eq!(cmds.len(), 2);
+        assert!(cmds[0].contains("npm.cmd") && cmds[0].contains("install"));
+        assert!(cmds[0].contains("@deepseek-ai/dsh@0.1.6-alpha.2"));
+        assert!(cmds[1].contains("pnpm.cmd") && cmds[1].contains("remove"));
+    }
+
+    #[test]
+    fn rejected_outcome_is_not_confused_with_rolled_back() {
+        let b = FakeBackend::new();
+        b.unavailable.borrow_mut().push(Pm::Pnpm);
+        let origin = Origin { pm: Pm::Npm, version: v("0.1.6-alpha.2") };
+        let target = Target { pm: Pm::Pnpm, version: v("0.1.6-alpha.2") };
+        assert!(matches!(run(&b, origin, target), TxOutcome::Rejected { .. }));
     }
 }
