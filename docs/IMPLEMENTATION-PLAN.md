@@ -1406,8 +1406,11 @@ pub fn probe_pm(pm: Pm) -> Option<PmInfo> {
     if ver.code != 0 {
         return None;
     }
-    let dir = run_cmd(pm.exe(), &pm.bin_dir_args().iter().map(|s| s.to_string()).collect())
-        .ok()?;
+    // ⚠ 必须先把 Vec<String> 绑到变量再取引用：直接写
+    // `run_cmd(pm.exe(), &args.iter().map(..).collect())` 会因 collect() 的
+    // 目标类型无法穿过引用推断而报 E0277（已实测 2 处）。
+    let args: Vec<String> = pm.bin_dir_args().iter().map(|s| s.to_string()).collect();
+    let dir = run_cmd(pm.exe(), &args).ok()?;
     if dir.code != 0 {
         return None;
     }
@@ -1459,7 +1462,8 @@ pub fn probe_env() -> PmEnv {
 - [ ] **Step 4: 运行测试，确认通过**
 
 Run: `cargo test pm`
-Expected: 17 passed
+Expected: **18 passed**（Task 5 的 5 + Task 6 的 7 + 本任务的 6 —— 其中
+`parse_path_var_drops_empty_segments` 含 3 条断言用例，但只算 1 个 test）
 
 > 若 `path_dirs_is_nonempty_on_windows` 失败，说明测试环境没有 PATH —— 属环境问题，不是代码问题。
 
