@@ -204,7 +204,12 @@ pub enum Job {
     FetchNotes { version: Version },
     Transact { origin: Origin, target: Target, port: u16 },
     StartWeb { port: u16 },
-    StopWeb { pid: u32 },
+    /// ⚠ 载荷是 `port` + `own_pid`，**不是** pid。理由有两条：
+    /// - GC-16：定位监听者要跑 `netstat.exe`、校验要跑 `tasklist.exe` —— 都属
+    ///   "起子进程"，不得发生在 UI 线程。改成发端口后，定位与校验全在 worker 上。
+    /// - NFR-7：`own_pid` 优先，否则现场定位 + `is_node` 守卫 —— 守卫因此紧挨着
+    ///   `stop_by_pid`，任何未来的发送方都绕不过它。
+    StopWeb { port: u16, own_pid: Option<u32> },
     OpenUrl { url: String },
 }
 

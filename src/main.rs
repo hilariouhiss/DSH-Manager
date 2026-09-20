@@ -364,6 +364,14 @@ fn drain(rx: &Receiver<UiMsg>, state: &Rc<RefCell<AppState>>) -> bool {
                         }
                     }
                     UiMsg::WebState(ws) => {
+                        // FR-21：退出语义要靠 `web_pid` 才能"只停掉本程序启动的实例"。
+                        // 单一投影点在这里 —— 所有 WebState 变更都经过本臂，
+                        // 于是状态与 pid 不可能不同步（例如 External/Stopped 必须清空，
+                        // 否则退出时会去 taskkill 一个早已不属于我们的 pid）。
+                        s.web_pid = match &ws {
+                            WebState::Running { pid, .. } => Some(*pid),
+                            _ => None,
+                        };
                         s.web = ws;
                     }
                     UiMsg::WebExited { code } => {
@@ -518,11 +526,20 @@ fn spawn_worker(rx: Receiver<Job>, tx: Sender<UiMsg>) {
             // `&tx`，闭包改为按共享引用捕获。
             let result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| execute(job, &tx)));
-            if result.is_err() {
-                let _ = tx.send(UiMsg::Log("任务执行时发生 panic，已跳过该任务".into()));
+            if let Err(payload) = result {
+                // ⚠ 必须把 panic 载荷**本身**写进日志。原先只说"内部错误，请查看日志"，
+                // 而日志里根本没有具体信息 —— 本进程是 GUI 子系统（GC-8），默认 panic
+                // hook 的输出去了 NULL 的 stderr，于是第一次崩溃完全无法诊断。
+                // 载荷是 `Box<dyn Any + Send>`，只有两种可能的具体类型（&str / String）。
+                let detail = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "未知 panic（载荷不是字符串）".into());
+                let _ = tx.send(UiMsg::Log(format!("任务执行时发生 panic：{detail}")));
                 let _ = tx.send(UiMsg::Failed {
                     context: "任务执行",
-                    message: "内部错误，请查看日志".into(),
+                    message: format!("内部错误，请查看日志：{detail}"),
                 });
             }
         }
@@ -622,7 +639,30 @@ fn execute(job: Job, tx: &Sender<UiMsg>) {
 
         Job::StartWeb { port } => start_web(port, tx),
 
-        Job::StopWeb { pid } => {
+        Job::StopWeb { port, own_pid } => {
+            // NFR-7 的守卫就放在 stop_by_pid 旁边 —— 它不再依赖调用方自觉执行。
+            //
+            // ⚠ `own_pid` 分支【不能】跑 is_node 守卫：spawn_web 返回的是 cmd.exe
+            // 包装器的 pid，`is_node` 对它实测为假 —— 套上守卫等于永远停不掉自家实例。
+            // 反过来，现场按端口定位时端口**可能已被别的程序接管**，必须挡住，
+            // 否则 taskkill /T /F 会把无辜进程连同其子进程一起杀掉（NFR-7 的全部理由）。
+            let pid = match own_pid {
+                Some(pid) => pid,
+                None => match dsh::find_listener_pid(port) {
+                    Ok(pid) if dsh::is_node(pid) => pid,
+                    Ok(pid) => {
+                        send(UiMsg::Failed {
+                            context: "停止 dsh web",
+                            message: format!("端口 {port} 被非 node 进程占用（pid {pid}），拒绝停止"),
+                        });
+                        return;
+                    }
+                    Err(e) => {
+                        send(UiMsg::Failed { context: "定位 dsh web", message: e });
+                        return;
+                    }
+                },
+            };
             match dsh::stop_by_pid(pid) {
                 Ok(()) => {
                     // FR-31：停止后清除运行态端口。全部停止路径都汇聚到这里。
@@ -688,6 +728,229 @@ fn start_web(port: u16, tx: &Sender<UiMsg>) {
             send(UiMsg::Failed { context: "启动 dsh web", message: e });
             send(UiMsg::WebState(WebState::Failed { reason: "启动失败".into() }));
         }
+    }
+}
+
+/// 把 Slint 回调接到 Job 派发上。
+///
+/// ⚠ 这里是 GC-16 的边界：回调运行在 UI 线程，**不得**做任何子进程/网络动作。
+/// 于是所有回调都只有两种形态 —— "读 AppState → 打包 Job → send"，
+/// 或"写回纯内存状态"。定位 pid、校验进程名、开浏览器、拉版本全部在 worker 上。
+fn wire_callbacks(
+    win: &MainWindow,
+    tray: &AppTray,
+    job_tx: &Sender<Job>,
+    state: &Rc<RefCell<AppState>>,
+    win_weak: slint::Weak<MainWindow>,
+    quit: Rc<dyn Fn()>,
+) {
+    let send = {
+        let tx = job_tx.clone();
+        move |j: Job| {
+            let _ = tx.send(j);
+        }
+    };
+
+    // ── 主窗口 ──
+    {
+        let send = send.clone();
+        let state = state.clone();
+        win.on_install_clicked(move || {
+            let mut s = state.borrow_mut();
+            let (Some(owner), Some(installed)) = (s.env.owner, s.env.installed.clone()) else {
+                s.status = "未检测到已安装的 dsh，无法执行变更".into();
+                return;
+            };
+            // ⚠ 目标必须来自【用户的选择】。不能取 catalog.versions.first()
+            // （那是全局最新，可能是更旧的 rc），也不能取 owner PM
+            // （用户可能在下拉里切到了别的 PM）。
+            let Some(target_version) = s.selected_version.clone() else {
+                s.status = "请先选择一个目标版本".into();
+                return;
+            };
+            let target_pm = s.selected_pm.unwrap_or(owner);
+            // ⚠ 必须传【实际在运行】的端口（若有），而不是偏好端口。
+            // 若 dsh web 跑在非偏好端口上（例如上次用了 8080、偏好仍是 3080），
+            // 传偏好端口会让 TR-1 去停一个空端口 —— 真正持锁的实例还在，
+            // 事务照样撞上 Windows 文件锁，TR-1 就形同虚设。
+            let port = s.web.port().unwrap_or(s.preferred_port);
+            s.busy = true;
+            s.busy_label = "准备中…".into();
+            drop(s);
+
+            send(Job::Transact {
+                origin: Origin { pm: owner, version: installed },
+                target: Target { pm: target_pm, version: target_version },
+                port,
+            });
+        });
+    }
+
+    {
+        let state = state.clone();
+        win.on_pm_changed(move |idx| {
+            let mut s = state.borrow_mut();
+            if let Some(info) = s.env.available.get(idx as usize) {
+                s.selected_pm = Some(info.kind);
+            }
+        });
+    }
+
+    {
+        // ⚠ 不要 clone `state`：本回调只发 Job，多出来的克隆会变成
+        // "unused variable" 警告（构建要求零警告）。
+        let send = send.clone();
+        win.on_refresh_clicked(move || {
+            send(Job::Probe);
+            send(Job::FetchCatalog);
+        });
+    }
+
+    {
+        let send = send.clone();
+        let state = state.clone();
+        win.on_version_changed(move |idx| {
+            // 选中项必须写回 AppState —— install 回调读的就是它
+            let picked = {
+                let mut s = state.borrow_mut();
+                let picked = s
+                    .catalog
+                    .as_ref()
+                    .and_then(|c| c.versions.get(idx as usize).cloned());
+                s.selected_version = picked.clone();
+                picked
+            };
+            if let Some(v) = picked {
+                send(Job::FetchNotes { version: v });
+            }
+        });
+    }
+
+    {
+        let state = state.clone();
+        win.on_port_changed(move |text| {
+            if let Ok(p) = text.trim().parse::<u16>() {
+                state.borrow_mut().preferred_port = p;
+                // FR-30：用户修改端口时持久化偏好。
+                // 【不派发任何 Job】—— 端口变更只是改偏好，不触发动作。
+                let _ = config::update(|f| f.preferred_port = Some(p));
+            }
+        });
+    }
+
+    {
+        let send = send.clone();
+        let state = state.clone();
+        win.on_start_web(move || {
+            let port = state.borrow().preferred_port;
+            send(Job::StartWeb { port });
+        });
+    }
+
+    {
+        let send = send.clone();
+        let state = state.clone();
+        win.on_stop_web(move || {
+            let s = state.borrow();
+            if let Some(port) = s.web.port() {
+                let own_pid = s.web_pid;
+                drop(s);
+                // 只发端口 + own_pid：定位监听者（netstat）与 NFR-7 的
+                // is_node 守卫（tasklist）都在 worker 上做 —— 它们是子进程，
+                // 放这里就是 GC-16 禁止的"UI 线程可感知阻塞"，
+                // 而且会把同一条不变量复制到每个调用方。
+                send(Job::StopWeb { port, own_pid });
+            }
+        });
+    }
+
+    {
+        let send = send.clone();
+        let state = state.clone();
+        win.on_open_web(move || {
+            if let Some(port) = state.borrow().web.port() {
+                send(Job::OpenUrl { url: format!("http://127.0.0.1:{port}") });
+            }
+        });
+    }
+
+    {
+        let state = state.clone();
+        // ⚠ 必须先 clone：`win_weak` 是本函数的参数，直接 move 进这个闭包后，
+        // 下面托盘块的 `win_weak.clone()` 就会编译失败（use of moved value）。
+        let win_weak = win_weak.clone();
+        win.on_hide_to_tray(move || {
+            if let Some(w) = win_weak.upgrade() {
+                let _ = w.hide();
+            }
+            push_log(&state.borrow(), "主窗口已隐藏，程序仍在托盘运行");
+        });
+    }
+
+    {
+        let send = send.clone();
+        win.on_link_clicked(move |url| {
+            // FR-27b：说明正文自带的链接透传给系统浏览器
+            send(Job::OpenUrl { url: url.to_string() });
+        });
+    }
+
+    // ── 托盘 ──
+    {
+        let win_weak = win_weak.clone();
+        tray.on_show_window(move || {
+            if let Some(w) = win_weak.upgrade() {
+                let _ = w.show();
+            }
+        });
+    }
+    {
+        // V-9：左键单击托盘图标 → 显示主窗口（与菜单第一项同一动作）。
+        // ⚠ 只能用自定义的 `tray-clicked`：Slint 1.18 **不把内建 `clicked` 暴露到
+        // 生成的 Rust API 上**（`tray.on_clicked` 不存在，已实测），故 Task 16 在
+        // 组件体内把它转成了这个回调。
+        let win_weak = win_weak.clone();
+        tray.on_tray_clicked(move || {
+            if let Some(w) = win_weak.upgrade() {
+                let _ = w.show();
+            }
+        });
+    }
+    {
+        let send = send.clone();
+        let state = state.clone();
+        tray.on_start_web(move || {
+            let port = state.borrow().preferred_port;
+            send(Job::StartWeb { port });
+        });
+    }
+    {
+        let send = send.clone();
+        let state = state.clone();
+        tray.on_stop_web(move || {
+            let s = state.borrow();
+            if let Some(port) = s.web.port() {
+                let own_pid = s.web_pid;
+                drop(s);
+                // 与窗口"停止"同一条路径：托盘不再区分自启/外部，
+                // 一律把 own_pid（可能为 None）交给 worker —— 是 None 时那边
+                // 现场查端口并跑 is_node 守卫，端口被别的程序接管时会被挡住（NFR-7）。
+                send(Job::StopWeb { port, own_pid });
+            }
+        });
+    }
+    {
+        let send = send.clone();
+        let state = state.clone();
+        tray.on_open_web(move || {
+            if let Some(port) = state.borrow().web.port() {
+                send(Job::OpenUrl { url: format!("http://127.0.0.1:{port}") });
+            }
+        });
+    }
+    {
+        let q = quit.clone();
+        tray.on_quit_app(move || q());
     }
 }
 
@@ -815,6 +1078,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 配套的 `worker_dead` 闩锁在 `AppState` 里，否则这条分支一旦可达就会
     // 每个 tick 重复触发。
     drop(msg_tx);
+
+    // FR-23：关闭窗口 → 隐藏，不退出。
+    // ⚠ 两个已实测确认的易错点（ARCHITECTURE §2.4.2）：
+    //   1. on_close_requested 挂在 slint::Window 上（win.window()），
+    //      不在生成的组件上（win.on_close_requested 不存在）
+    //   2. 必须返回 HideWindow 才是"接受关闭并隐藏"；
+    //      返回 KeepWindowShown 会【取消】关闭 —— 表现是点 X 毫无反应
+    {
+        let state = state.clone();
+        win.window().on_close_requested(move || {
+            push_log(&state.borrow(), "主窗口已隐藏，程序仍在托盘运行");
+            slint::CloseRequestResponse::HideWindow
+        });
+    }
+
+    // FR-21：退出必须先停掉本程序启动的 dsh web，不留孤儿 node 进程。
+    // ⚠ 用 AppState.web_pid（由 drain 的 WebState 臂维护）而**不是**
+    // find_listener_pid：后者会拿到外部实例的 pid，退出时把它一起杀掉。
+    // ⚠ 这里的 stop_by_pid 是同步的子进程调用，落在 UI 线程上 —— 它是
+    // 【关机路径】上的有界动作（一次 taskkill），且必须在 quit_event_loop()
+    // 之前完成；改成 worker 往返需要一个"停完再退"的握手，与收益不成比例。
+    let quit: Rc<dyn Fn()> = {
+        let state = state.clone();
+        let job_tx = job_tx.clone();
+        Rc::new(move || {
+            let pid = state.borrow().web_pid;
+            if let Some(pid) = pid {
+                let _ = dsh::stop_by_pid(pid);
+                let _ = config::update(|f| f.running_port = None);
+            }
+            let _ = job_tx; // 不再接受新任务
+            slint::quit_event_loop().ok();
+        })
+    };
+
+    // 托盘"退出"也走同一条路径
+    wire_callbacks(&win, &tray, &job_tx, &state, win.as_weak(), quit);
 
     // ⚠ 简报漏了这一行（Task 16 的临时 main 里有，Task 17/19 的简报里都没有）。
     // `slint::run_event_loop_until_quit()` **不会** show 任何窗口 —— 只有

@@ -178,9 +178,37 @@ pub fn fetch_notes(version: &Version) -> Result<String, NotesError> {
 }
 
 /// FR-17：端口占用探测。stdlib 实现，无依赖。
+///
+/// ⚠ "连接被拒"与"连接超时"必须区别对待，不能只看 `is_ok()`。
+/// 依据（Task 18 的**实测**假阴性）：监听者的 accept 队列被塞满时，回环连接会
+/// **超时**而非被拒 —— 只看 `is_ok()` 就会把"有人在监听"读成"端口空闲"。后果有二：
+///   - FR-31：凭这条判断清掉 `running_port`，等于把孤儿进程**永久遗忘**（FR-22）；
+///   - FR-16：`wait_port_ready` 在慢机器上误报"启动超时"。
+///
+/// ⚠⚠ 但"超时 ⇒ 占用"单独用是**错的**，Task 19 实测撞到：本机（Windows 防火墙
+/// 三个 profile 全开）对**空闲**回环端口的拒绝延迟约 **2.0 秒**（3097/3098/3099/
+/// 3100/3081/8080 逐一实测：300 ms 与 1000 ms 内均未完成，2042 ms 才以
+/// ConnectionRefused 结束），而本探测的超时是 300 ms —— 于是**每个空闲端口都超时**，
+/// 被读成"占用"。后果比原 bug 更严重：`start_web` 的前置检查立刻走
+/// `find_listener_pid` 的 Err 分支，报"启动 dsh web失败: 未找到监听端口 X 的进程"，
+/// **FR-16 在这台机器上完全无法启动**（实测 3099 上点击"启动"必失败）；
+/// 此外 `Transact` 会被误判"端口被非 node 占用"而拒绝安装，`wait_port_ready`
+/// 还会在 dsh web 实际未就绪时立刻返回 true（假"运行中"）。
+///
+/// 结论：超时是**歧义**信号，必须回落到权威来源 —— 系统监听表（`find_listener_pid`）。
+/// 这条分支同时保住两个方向：
+///   - 真监听者（含 accept 队列塞满的）在 netstat 里有 LISTENING 行 → true；
+///   - 空闲端口即使被延迟拒绝 → netstat 无行 → false。
+/// 代价：仅在超时路径上多一次 `netstat.exe`（约 40 ms）。GC-16 无碍 —— `port_in_use`
+/// 的调用方全在 worker / 后台线程（`execute`、`start_web`、孤儿探测线程）；
+/// GC-8 无碍 —— `pm::run_cmd` 用 CREATE_NO_WINDOW（实测全程 0 个控制台窗口）。
 pub fn port_in_use(port: u16) -> bool {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
+    match TcpStream::connect_timeout(&addr, Duration::from_millis(300)) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => find_listener_pid(port).is_ok(),
+        Err(_) => false,
+    }
 }
 
 /// 解析 `netstat -ano`，找出监听指定端口的 PID。纯函数。
