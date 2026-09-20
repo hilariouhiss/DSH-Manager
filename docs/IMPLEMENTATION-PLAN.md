@@ -4676,6 +4676,16 @@ fn start_web(port: u16, tx: &Sender<UiMsg>) {
 
 并在 `timer.start(...)` 之后、`run_event_loop_until_quit()` 之前追加：
 
+> ⚠ **`drop(msg_tx);` 必须加在本段末尾**（孤儿探测那段之后、`run_event_loop_until_quit()` 之前）。
+> `try_recv` 只有在**所有**发送端都被丢弃后才返回 `Disconnected`；`msg_tx` 若不 drop 就会一直活到
+> `main` 结束，于是 `drain` 里那个"worker 已死"的分支（§5.2 的崩溃检测）**永远不可达** ——
+> 一条被提交信息宣传、却从不执行的安全网。此后 main 只发 `Job`，不再需要这个发送端
+> （孤儿探测线程自己 clone 一个）。
+>
+> 与之配套，`drain` 的 `Disconnected` 分支需要一个**闩锁**（`AppState` 加 `worker_dead: bool`）：
+> 该分支一旦可达就会**每个 tick 重复触发**（返回 true → 每 80ms 全量 `project()` 一次），
+> 既白烧 CPU（NFR-4 要求空闲接近零），又会把此后任何状态文案覆盖掉。只报一次即可。
+
 ```rust
     // 启动时的初始任务（Q-3：每次启动查询一次更新，不做后台轮询）
     let _ = job_tx.send(Job::Probe);
@@ -5058,6 +5068,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 托盘"退出"也走同一条路径
     wire_callbacks(&win, &tray, &job_tx, &state, win.as_weak(), quit);
+
+    // ⚠ 必须显式 show()：`run_event_loop_until_quit()` 只是跑事件循环并把"最后一个窗口关闭"
+    // 当作退出条件，**它不会显示窗口**（只有 `run()` 会）。漏了这一行，程序启动后只剩一个
+    // 托盘图标、窗口永远不可见 —— Task 17 已按 brief 逐字实测出这个后果（IsWindowVisible=false），
+    // 而 V-1 正是"启动 → 窗口出现"。放在 `project()` 之后，避免先闪一帧默认值。
+    win.show()?;
 
     slint::run_event_loop_until_quit()?;
     drop(timer);
