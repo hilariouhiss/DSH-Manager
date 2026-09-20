@@ -46,6 +46,21 @@ impl Pm {
         }
     }
 
+    /// FR-3 第 3 步：查询**全局包列表**的命令参数（`dsh` 不在 PATH 时的退化路径）。
+    ///
+    /// ⚠ 退出码**不能**当判据：`npm ls -g --depth=0` 在有 peer 依赖告警时会以非零码
+    /// 退出，而 stdout 依然是完整列表。因此调用方（`pm::version_in_global_list`）
+    /// 只看 stdout，不看退出码 —— 与 `probe_pm` / `version_from_shim` 的判据刻意相反，
+    /// 那两处要的是"命令真的可用"，这里要的只是"列表打印出来了"。
+    pub fn list_args(self) -> &'static [&'static str] {
+        match self {
+            Pm::Npm => &["ls", "-g", "--depth=0"],
+            Pm::Pnpm => &["list", "-g", "--depth=0"],
+            Pm::Bun => &["pm", "ls", "-g"],
+            Pm::Yarn => &["global", "list"],
+        }
+    }
+
     /// FR-2：取全局 bin 目录的命令参数
     pub fn bin_dir_args(self) -> &'static [&'static str] {
         match self {
@@ -240,6 +255,26 @@ pub enum Job {
     OpenUrl { url: String },
 }
 
+/// I-4：把一队已入队的任务折叠成"只保留**最后一个** `FetchNotes`"。
+///
+/// ⚠ 为什么丢掉更早的请求是安全的：说明区只认**当前选中版本**的回复
+/// （`drain` 的 `UiMsg::Notes` 臂按 `selected_version` 过滤），所以从用户改选的那一刻起，
+/// 早先那些请求的回复就已经确定会被丢弃 —— 它们唯一的作用是让 worker 多阻塞几次
+/// `fetch_notes`（每次最长 15 秒，NFR-3），并多烧几次 GitHub 的小时配额
+/// （实测：一次 22 步版本遍历把本机配额打光）。
+///
+/// **保序保证**：结果是原队列的**子序列** —— 除被取代的 `FetchNotes` 外**一个任务都不丢**，
+/// 且相对顺序与入队顺序完全一致（存活的最后一个说明请求也留在它原本的位置上）。
+/// 因此本函数是纯函数，可直接单测（`coalesce_notes_*`）。
+pub fn coalesce_notes(jobs: Vec<Job>) -> Vec<Job> {
+    let last = jobs.iter().rposition(|j| matches!(j, Job::FetchNotes { .. }));
+    jobs.into_iter()
+        .enumerate()
+        .filter(|(i, j)| !matches!(j, Job::FetchNotes { .. }) || Some(*i) == last)
+        .map(|(_, j)| j)
+        .collect()
+}
+
 #[derive(Debug)]
 pub enum UiMsg {
     Probed(PmEnv),
@@ -269,11 +304,12 @@ mod tests {
     /// 字符串上，断言必须钉到同一粒度。
     #[test]
     fn pm_command_table_is_exact() {
-        let cases: [(Pm, &str, Vec<&str>, Vec<&str>, Vec<&str>); 4] = [
+        let cases: [(Pm, &str, Vec<&str>, Vec<&str>, Vec<&str>, Vec<&str>); 4] = [
             (
                 Pm::Npm,
                 "npm.cmd",
                 vec!["prefix", "-g"],
+                vec!["ls", "-g", "--depth=0"],
                 vec!["install", "-g", "@deepseek-ai/dsh@1.2.3"],
                 vec!["uninstall", "-g", "@deepseek-ai/dsh"],
             ),
@@ -281,6 +317,7 @@ mod tests {
                 Pm::Pnpm,
                 "pnpm.cmd",
                 vec!["bin", "-g"],
+                vec!["list", "-g", "--depth=0"],
                 vec!["add", "-g", "@deepseek-ai/dsh@1.2.3"],
                 vec!["remove", "-g", "@deepseek-ai/dsh"],
             ),
@@ -288,6 +325,7 @@ mod tests {
                 Pm::Bun,
                 "bun.exe",
                 vec!["pm", "bin", "-g"],
+                vec!["pm", "ls", "-g"],
                 vec!["add", "-g", "@deepseek-ai/dsh@1.2.3"],
                 vec!["remove", "-g", "@deepseek-ai/dsh"],
             ),
@@ -295,6 +333,7 @@ mod tests {
                 Pm::Yarn,
                 "yarn.cmd",
                 vec!["global", "bin"],
+                vec!["global", "list"],
                 vec!["global", "add", "@deepseek-ai/dsh@1.2.3"],
                 vec!["global", "remove", "@deepseek-ai/dsh"],
             ),
@@ -306,13 +345,19 @@ mod tests {
             "每个 Pm 变体都必须有断言用例（新增变体时同步更新）"
         );
 
-        for (pm, exe, bin_dir, install, uninstall) in cases {
+        for (pm, exe, bin_dir, list, install, uninstall) in cases {
             assert_eq!(pm.exe(), exe, "{pm:?} 的 exe 名不对（GC-7）");
 
             assert_eq!(
                 pm.bin_dir_args().to_vec(),
                 bin_dir,
                 "{pm:?} 的全局 bin 目录参数不对（FR-2）"
+            );
+
+            assert_eq!(
+                pm.list_args().to_vec(),
+                list,
+                "{pm:?} 的全局包列表参数不对（FR-3 第 3 步）"
             );
 
             let got: Vec<String> = pm.install_args("1.2.3");
@@ -329,5 +374,59 @@ mod tests {
         assert_eq!(Pm::Pnpm.label(), "pnpm");
         assert_eq!(Pm::Bun.label(), "bun");
         assert_eq!(Pm::Yarn.label(), "yarn");
+    }
+
+    fn notes(v: &str) -> Job {
+        Job::FetchNotes { version: v.parse().unwrap() }
+    }
+
+    /// ★ I-4 的核心：连续切换版本时，队列里只该留下**最后一个**说明请求。
+    ///
+    /// 判别性：把 `coalesce_notes` 换成 `jobs`（即不合并），本测试立刻失败。
+    #[test]
+    fn coalesce_notes_keeps_only_the_last_fetch() {
+        let jobs = vec![notes("0.1.1"), notes("0.1.2"), notes("0.1.3")];
+        let merged = coalesce_notes(jobs);
+        assert_eq!(merged.len(), 1, "只该剩最后一个请求，实际 {merged:?}");
+        assert!(
+            matches!(&merged[0], Job::FetchNotes { version } if version.to_string() == "0.1.3"),
+            "剩下的必须是【最后】那个选择（最新选择赢），实际 {merged:?}"
+        );
+    }
+
+    /// ★ 保序：非 `FetchNotes` 的任务一个都不能丢，相对顺序也不能变。
+    ///
+    /// 这条断言是"合并不会打乱安装/启动/停止的执行次序"的唯一保证 ——
+    /// 一个"顺手把所有任务都去重"的实现会在第 2 条断言上失败。
+    #[test]
+    fn coalesce_notes_preserves_every_other_job_in_order() {
+        let jobs = vec![
+            notes("0.1.1"),
+            Job::StopWeb { port: 3099, own_pid: None },
+            notes("0.1.2"),
+            Job::StartWeb { port: 3099 },
+            notes("0.1.3"),
+            Job::OpenUrl { url: "http://127.0.0.1:3099".into() },
+        ];
+        let merged = coalesce_notes(jobs);
+        assert_eq!(merged.len(), 4, "6 个任务里只该丢掉 2 个过期的说明请求，实际 {merged:?}");
+        // ★ 合并结果是原队列的**子序列**：非 notes 任务一个不丢、顺序不变，
+        // 唯一存活的 notes 请求也留在**它原本的位置**上（不是被挪到队尾）。
+        assert!(matches!(merged[0], Job::StopWeb { .. }), "实际 {merged:?}");
+        assert!(matches!(merged[1], Job::StartWeb { .. }), "实际 {merged:?}");
+        assert!(
+            matches!(&merged[2], Job::FetchNotes { version } if version.to_string() == "0.1.3"),
+            "存活的说明请求必须留在原位（在 OpenUrl 之前），实际 {merged:?}"
+        );
+        assert!(matches!(merged[3], Job::OpenUrl { .. }), "实际 {merged:?}");
+    }
+
+    /// 队列里本来就没有说明请求时，合并必须是恒等变换（含空队列）。
+    #[test]
+    fn coalesce_notes_is_identity_without_fetch_notes() {
+        let jobs = vec![Job::Probe, Job::FetchCatalog, Job::OpenUrl { url: "x".into() }];
+        assert_eq!(coalesce_notes(jobs.clone()).len(), 3);
+        assert!(matches!(coalesce_notes(jobs)[0], Job::Probe));
+        assert!(coalesce_notes(vec![]).is_empty());
     }
 }

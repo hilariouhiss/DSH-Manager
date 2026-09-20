@@ -4,8 +4,10 @@
 
 被验证的代码：`feat/implementation` @ **`d8114ad`**（Task 19 的收尾提交）+ Task 20 的工作树改动
 （`src/main.rs` / `src/model.rs` / `src/pm.rs` / `src/txn.rs` / `src/dsh.rs` / `src/config.rs`，
-见本次提交信息）。构建：`cargo build` **0 警告**，`cargo test` **0 警告 / 70 passed**（`cargo clean -p`
-后强制全量重编译）。
+见本次提交信息），随后由 **`a646c9a`**（端到端验证记录）与 **最终修复轮**
+（`fix: 收尾最终评审的四项 Important 与加固（TR-1/TR-2/FR-3.3/队列合并等）`，见
+「最终修复轮记录（I-1 ~ I-4）」一节）继续。构建：`cargo build` **0 警告**，`cargo test`
+**0 警告 / 84 passed**（最终修复轮，`cargo clean -p` 后强制全量重编译；Task 20 那一轮为 70 passed）。
 
 **证据来源图例**（每行都标明来源，不混用）：
 
@@ -14,7 +16,8 @@
 | **T20 实测** | 本次 Task 20 会话中在**本机实测**，用 UI Automation 读回 + `netstat` + `state.json` 观测 |
 | **T19 实测** | Task 19 报告记录的实测（提交 `d8114ad`，同一份已评审代码；本次未重复执行） |
 | **T18 实测** | Task 18 报告记录的实测（提交 `8f00bb4`，`SetWinEventHook` 控制台窗口对照） |
-| **单测** | `cargo test` 中的具名单元测试（本次 70 项全绿） |
+| **终修实测** | **最终修复轮**的实测（I-1 ~ I-4）：UIA 读回 + `netstat -ano` + `state.json` + GitHub 配额计数，端口一律用 3099 |
+| **单测** | `cargo test` 中的具名单元测试（当前 84 项全绿） |
 
 端口纪律（安全包线）：**3080 是本次验证所在会话的 live `dsh web`（pid 13432），全程未触碰**；
 需要真实监听的场景一律用 **3099**，V-23 按原文用 8080（它从不启动监听）。每次观测前后都核对
@@ -53,7 +56,7 @@
 | **V-13** 外部进程停止 | **PASS** —— **T20 实测（本条为首次执行）** | 两半都实测：(a) **非 node 占用者被拒绝**：用 PowerShell `TcpListener` 占住 3099（`pwsh.exe` pid 19184）→ 点 `启动` → 日志 `启动 dsh web失败: 端口 3099 被非 node 进程占用（pid 19184）`、状态 `启动 dsh web失败`、web 状态保持 `已停止`，**且该占用进程事后仍存活**（证明没有对无辜进程执行 `taskkill`，NFR-7 的守卫有效）。(b) **真正的 dsh web 能被定位并终止**：外部实例（node pid 6184）→ 点 `停止` → **445 ms** 内 `已停止`，`3099` 变为空闲，外部 node 进程消失，`running_port` → `null`。 |
 | **V-14** 换版本事务（同 PM） | **未执行** —— 原因见下 | 需要真的执行 `npm install -g @deepseek-ai/dsh@0.1.6-alpha.1`：那会**降级用户正在使用的真实 dsh 安装**（本机唯一的 npm 那份，也是本会话所依赖的 CLI），事务中断就会把用户环境留在半成品状态。**替代证据（单测）**：`txn::tests::same_pm_version_change_commits_and_skips_uninstall`（FR-13：同 PM 跳过 S3）、`model::tests::pm_command_table_is_exact`（钉住每个 PM 的确切 argv）、`txn::tests::cross_pm_migration_installs_then_uninstalls`（装/卸顺序）。**未观测**：GUI 上一次真实事务的端到端运行。 |
 | **V-15** 迁移事务（npm → pnpm） | **未执行** —— 这是简报 Step 2，**已由控制器裁定不做** | 原因：`Job::Transact` 先按 TR-1 停掉 `dsh web`（本机就是**承载本次验证的 live 会话**，pid 13432），随后事务会 `npm uninstall` 掉 `@deepseek-ai/dsh` —— 半途失败会同时毁掉用户的环境与本次会话。**替代证据**：事务引擎语义由 **20 个单元测试**钉住（TR-4 / TR-5 / TR-6 / TR-11 及 V-17 / V-19 / V-20 / V-21），且"真实事务"代码路径已在 Task 18/19 通过 dry-run 后端（`txn::FakeBackend`）走过一遍，**零环境变更**。 |
-| **V-16** 事务前置检查 | **未执行（GUI 级）** —— 本机**无法构造**该场景 | 三条拒绝路径由单测逐条覆盖：`txn::tests::precheck_rejects_pm_bin_not_on_path`（TR-3）、`precheck_rejects_unavailable_pm`（TR-2）、`precheck_rejects_unsafe_version`（NFR-6），并由 `rejected_target_produces_no_side_effects` 断言**零副作用**。**为什么 GUI 级构造不出来**：TR-3 比较的是"该 PM 的 `bin -g` 输出目录是否在 PATH 上"，而 PM 的 shim 恰好就住在那个目录里（`C:\Users\xueyu\AppData\Local\pnpm\bin\pnpm.cmd`）—— 把该目录移出 PATH 后，`probe_env` 连这个 PM 都探不到，根本走不到 `precheck`。要造这个场景只能改真实 PATH 或让它真跑一次事务，两者都不在允许范围内。 |
+| **V-16** 事务前置检查 | **部分执行**：拒绝路径仍未在真实事务里跑到 S1，但 **GUI 级构造已可行**（I-3 之后），并已实测 TR-3 的拒绝 | 拒绝路径的单测：`txn::tests::precheck_rejects_pm_bin_not_on_path`（TR-3）+ `rejected_target_produces_no_side_effects`（零副作用）；TR-2 有 `precheck_rejects_unavailable_pm` **与 `tr2_precheck_rejects_pm_whose_version_command_exits_nonzero`**（退出码非零 = 不可用，与 `pm::probe_pm` 同判据）。**NFR-6 由 `safe_version_rejects_injection_attempts` 覆盖**（`is_safe_version` 的字符集校验）—— `precheck` 里那条 `RejectReason::InvalidVersion` 分支经 `Target` **类型上不可达**（`semver::Version` 表示不出带注入字符的版本号），保留它是 Ruling 39 的具名实现，对应测试已改名 `precheck_invalid_version_branch_is_unreachable_by_type`，不再宣称覆盖 NFR-6（M-2）。**GUI 级（终修实测，新增可达）**：I-3 的 FR-3 第 3 步退化路径让"该 PM 的 bin 目录不在 PATH"变得可构造 —— PATH 去掉 `%APPDATA%\npm` 后 dsh 不在 PATH，而 `npm ls -g` 仍能报出已安装版本与 owner，于是点 `安装` 真的进到 `precheck` 的 TR-3：日志 `已拒绝：npm 的全局目录不在 PATH 中：C:\Users\xueyu\AppData\Roaming\npm。请先把它加入 PATH 再试`，**零副作用**（无安装命令、`state.json` 未变、真实 dsh 版本仍为 `0.1.6-alpha.2`）。**仍未观测**：一次真实事务中由前置检查拦下的场景（TR-3 之后的 S1 起都没跑）。**为什么之前构造不出来**：PM 的 shim 恰好住在它的 `bin -g` 目录里，把该目录移出 PATH 后 `probe_env` 连这个 PM 都探不到，根本走不到 `precheck` —— I-3 的退化路径恰好补上了这个缺口。 |
 | **V-17** 事务失败补偿 | **未执行（GUI 级）** —— 需要一次真实失败事务 | 单测覆盖补偿全部关键分支：`txn::tests::v17_s3_failure_rolls_back_to_origin`（状态回到 `(PM_old, V0)`）、`c2a_cleanup_failure_is_reported_as_degraded_with_cause`、`c3_detects_incomplete_recovery_and_degrades`、`degraded_outcome_carries_runnable_manual_commands`、`tr11_compensation_probes_before_acting`。**未观测**：真实 PM 上的回滚。 |
 | **V-18** 事务期间 UI | **未执行** —— 需要一次真实事务在跑 | 未取得观测证据。代码侧：`busy` 由 `project()` 投影为 `enabled: !root.busy`（`ui/app.slint:137` 的 `安装` 按钮、`:132` 版本下拉），日志经 `VecModel` 在 UI 线程追加（`LOG_CAP` 裁剪），排空靠 80 ms timer —— 但"按钮禁用、日志实时滚动、界面不卡死"这三条**本轮没有实测**。 |
 | **V-23** 偏好端口持久化 | **PASS**（T19 实测按原文 8080；T20 另测 3099 读路径） | T19：端口 `[Edit]` `SetValue("8080")` → 字段读到 `8080` 且 `state.json` 变为 `{ "preferred_port": 8080, "running_port": null }`（FR-30 写路径，且**不派发任何 Job**）；杀进程重启 → 字段仍是 `8080`（读路径）。T20：预置 `state.json` 的 `preferred_port = 3099` 后启动，UIA 读到端口字段为 **`3099`**。 |
@@ -104,6 +107,97 @@
 
 ---
 
+## 最终修复轮记录（I-1 ~ I-4、TR-2、M-2、M-4、M-5）
+
+来源标记：**终修实测**（UIA 读回 + `netstat -ano` + `state.json` + GitHub 配额计数）。
+端口纪律同前：**3080（pid 13432，承载本会话的 live `dsh web`）全程未触碰**，凡需要真实监听一律用 **3099**，
+收尾时 `state.json` 恢复为**不存在**（本轮开始时它就不存在）。测试计数：`cargo build` **0 警告**，
+`cargo test` **0 警告 / 84 passed**（70 → 84：新增 14 条，旧 70 条**一条未少**；唯一"消失"的那条是
+被判为安慰剂的测试**改名重写**，见 M-2；全仓无任何 `#[allow]`/`#[expect]`）。
+
+### I-1 `Job::StopWeb` 无法收敛"已经没了"的实例（`运行中` 的永久谎言）
+
+| 项 | 内容 |
+|---|---|
+| 改动 | `src/main.rs` worker 的 `StopWeb` 臂：`own_pid` 为 `None`（= 外部实例，**没有任何存活监控**）时**先探测再动作**（TR-11 的同一条原则）—— `dsh::port_in_use(port)` 为假即视为"停止"的目标状态已经成立：清 `running_port`、发 `WebState::Stopped`、日志 `端口 {port} 上已无 dsh web，状态已清除`。`src/dsh.rs` 的 `stop_by_pid` 补上**语言无关**的**退出码 128** 判据，判据抽成纯函数 `taskkill_says_gone` 并单测。 |
+| 实测（终修实测） | 外部 `dsh web --port 3099`（**不由本程序启动**，`--no-open` 以免弹浏览器）→ 管理器经 `state.json` 的 `running_port=3099` 认领（日志 `检测到外部 dsh web 运行在端口 3099（pid 19092）`）→ **out-of-band 杀掉那个 node**（3099 随即空闲）→ 界面**仍显示 `运行中`**（这就是 I-1 要修的谎言，因为外部实例没有 `WebExited` 通道）→ 点 `停止` → **422 ms 后 `已停止`**，日志新增 `端口 3099 上已无 dsh web，状态已清除`，`state.json` 的 `running_port` → `null`，**没有出现** `未找到监听端口 3099 的进程`。随后 `启动` 被正常接受并在 **2505 ms** 后就绪（真实 dsh web，pid 13040），**证明确实没有卡死**；再点 `停止` 433 ms 收敛、3099 空闲。全程 3080 = 13432 未变。 |
+| `taskkill` 判据的本机实测（对 finding 的一处修正） | 把一个自己起的 sleeper 子进程 `taskkill /PID … /F`（退出码 **0**），紧接着对**同一个 pid** 再来一次：退出码 **128**、stderr = `ERROR: The process "11356" not found.`。两个要点：①**退出码 128 得到证实**，它正是 `stop_by_pid` 缺的那个判据；②但本机 taskkill 的错误文本是**英文 ASCII**，旧的 `"not found"` 文本匹配在本机**本来就能命中** —— 也就是说 finding 里"GBK `没有找到` 变成 U+FFFD 所以永远匹配不上"这一条在**本机不成立**（那是消息表为中文的 Windows 上的形状，本地无法复现，只能构造）。因此 128 判据的价值是"区域无关的兜底"，而不是"修好本机这个 bug"；单测把两种形状都钉住了（一种是实测，一种是构造）。 |
+| 单测 | `dsh::tests::taskkill_says_gone_accepts_exit_code_128`：实测形状（英文 + 128）、构造的 GBK-lossy 形状（128）、纯文本旧判据（英文 + 退出码 1）、以及 `Access is denied`（退出码 5）**不许**被吞。 |
+| 有意没做 | **80 ms tick 不做 `External → Stopped` 的自动收敛**。`port_in_use` 在空闲端口上并不便宜：300 ms 连接超时 + 一次 `netstat.exe`（约 40 ms）；12.5 Hz 地跑等于每秒起十几个子进程、持续唤醒 worker，与 NFR-4（空闲接近零）和 GC-16（UI 线程不阻塞）都相悖。用户手上的出口是 `停止`（实测 422 ms 收敛），也正是 SRS 给出的那个出口。 |
+
+### I-2 `Starting` 窗口内 TR-1 无人值守
+
+| 项 | 内容 |
+|---|---|
+| 改动 | ①`src/main.rs` 的 `on_install_clicked` 增加守卫：`s.start_pending \|\| matches!(s.web, WebState::Starting{..})` 时拒绝并写可见状态 `dsh web 正在启动，请稍候再执行变更`（+ `dirty`，否则稳态下没有消息可排空、提示投影不出来）。②`ui/app.slint` 新增 `in property <bool> web-starting`（由 `project()` 从 `start_pending \|\| Starting` 投影）：`安装` 与 `启动` 变灰，dsh web 卡片把 `已停止` 改成 `启动中…`（此前 `Starting` 期间卡片显示 `已停止` 本身就是假话）。**这是刻意的接口改动**：属性是新增的，生成 API 未破坏（`win.set_web_starting` 由 `project()` 调用）。 |
+| 实测（终修实测） | 夹具：PATH 前置一个**永不绑定**的假 `dsh.exe`（应答 `--version`，`web --port` 只 sleep）+ 一个假 `npm.cmd`（应答 `--version`/`prefix -g`，任何安装请求都拒绝）→ 环境探测成功（`已安装 0.1.6-alpha.2`、下拉 `npm ·  dsh 安装于此`）→ 点 `启动`：**在同一拍的 80 ms 空隙内**（`project()` 还没把按钮变灰）立刻点 `安装`，结果 **140 ms 内**状态栏出现 `dsh web 正在启动，请稍候再执行变更` —— **守卫分支是被真实点击走到的，不是只靠读代码**；随后投影落地：`安装` `IsEnabled=False`、`启动` `IsEnabled=False`、卡片文本 `启动中…`、日志里 **`事务开始` 行数 = 0**（没有派发任何事务）。20 秒超时路径照旧可见（`启动超时` 在 19968 ms 出现），子进程被超时兜底收掉（无残留 `dsh` 进程），`state.json` 的 `running_port` 保持 `null`。 |
+| 未覆盖 | **托盘菜单**没有 `web-starting` 属性（见「已知限制」第 2 条）：托盘里的 `启动` 在启动窗口内仍可点，但被同一道 `start_pending` 守卫拒绝。 |
+
+### I-3 FR-3 第 3 步（PATH 找不到时的退化路径）此前根本没实现
+
+| 项 | 内容 |
+|---|---|
+| 改动 | `src/pm.rs`：新增纯函数 `parse_global_list(pm, output) -> Option<Version>`（**不写 per-PM 解析器**：只认"同字段 `pkg@ver`"与"相邻字段 `pkg ver`"两种形态，版本号一律交给 `semver::Version::parse`）与 `version_in_global_list(pm)`（走 `pm::run_cmd`：shim 全名 + 参数数组 + `CREATE_NO_WINDOW` 都在既有 helper 里；**刻意不看退出码** —— `npm ls -g` 有 peer 依赖告警时会非零退出而 stdout 仍完整）。`src/model.rs` 新增 `Pm::list_args()`（四条命令，由 `pm_command_table_is_exact` 逐字钉住）。`probe_env` **只在 `find_dsh_on_path` 一无所获时**才依次问各 PM，命中即取其版本为 `installed`、该 PM 为 `owner`；`dsh_path` **保持 `None`**（它确实不在 PATH 上，不能伪造 → TR-3 随后照样拒绝事务，这是正确的）。 |
+| 实测（终修实测） | **退化路径**：把 `%APPDATA%\npm`（dsh shim 所在目录）从 PATH 去掉 → `where.exe dsh` 报 `Could not find files for the given pattern(s).` → 界面仍读到 `已安装 0.1.6-alpha.2`、`alpha 通道`、下拉 `npm  ·  dsh 安装于此`；关于对话框的 `dsh 安装路径` 为**空**（`dsh_path` 确实是 `None`，没有被伪造）。**正常路径未回归**：恢复常规 PATH 后同样读出 `0.1.6-alpha.2` + npm，且 `dsh 安装路径 = C:\Users\xueyu\AppData\Roaming\npm\dsh.cmd`。 |
+| 实测的真实输出形状（本机 2026-09-20，路径已替换） | **npm** `npm ls -g --depth=0`（退出码 0）：首行是全局目录 `C:\Users\<user>\AppData\Roaming\npm`，之后每行 `+-- pkg@ver`，最后一行是 `` `-- npm@12.0.2 `` —— 树状前缀是 **ASCII**（输出被重定向时不用 Unicode）。**pnpm** `pnpm list -g --depth=0`（退出码 0）：`Legend: production dependency, optional only, dev only` → 空行 → `C:\Users\<user>\AppData\Local\pnpm\global\v11 (PRIVATE)` → `│` → `│   dependencies:` → `├── pkg@ver`（**Unicode** 树状前缀）。**bun / yarn 本机未安装**（`where.exe` 报 not found），fixture 用的是各自公开的 `pm ls -g` / `global list` 形状（前者路径行带 `node_modules (N)`、条目 `├── pkg@ver`；后者有 `info "…" has binaries`、`warning … has unmet peer dependency`、`└─ pkg@ver`、`Done in …`）—— 与「已知限制」第 7 条同一性质，**未经真实运行**。 |
+| 单测 | 7 条 `parse_global_list_*`（npm/pnpm/pnpm 两字段/bun/yarn/无 dsh/整字段匹配的判别性用例）+ `list_args_run_for_installed_pms`（对**本机确实装了**的 PM 断言列表命令真的打得出 stdout；未安装的 PM 跳过）。`parse_global_list_requires_whole_field_match` 是判别性的：用 `contains("dsh")` 的实现会把 fixture 里的路径行当包名，再把别的包的 `9.9.9-bogus` 当成 dsh 的版本。 |
+
+**覆盖账目的缺口（本条 finding 的来历）**：计划的覆盖表把 FR-3 整体记在 **Task 6** 名下
+（`docs/IMPLEMENTATION-PLAN.md` 的「Spec 覆盖检查」），而 Task 6 的接口清单只含第 1~2 步
+（`find_dsh_on_path` / `owner_of`）—— 第 3 步（全局包列表退化）**从未有任务承接**，
+所以它在 70 条单测全绿的情况下依然没实现。本节记的是补上的实现与实测。
+
+### I-4 一次下拉浏览会给串行 worker 灌进 N 个阻塞式 GitHub 请求
+
+| 项 | 内容 |
+|---|---|
+| 改动 | `src/main.rs` 的 `spawn_worker`：worker 出队一个 `Job::FetchNotes` 时，用 `try_recv` 把**此刻已排队**的任务一次取空，交给纯函数 `model::coalesce_notes` 只保留**最后一个** `FetchNotes`，其余任务按原序放回队首逐个执行。保序保证（已写进 `coalesce_notes` 的文档与单测）：结果是原队列的**子序列** —— 除"已被更晚的同类请求取代"的 `FetchNotes` 外**一个任务都不丢**，相对顺序不变（存活的说明请求留在它原本的位置）。丢掉是安全的：`drain` 只采信**当前选中版本**的回复，被取代的请求即使回来也会被丢弃 —— 它们唯一的作用就是让 worker 再阻塞最长 15 秒并多烧一次 GitHub 配额。 |
+| 实测（终修实测，A/B） | 判别依据是 **GitHub 自己的配额计数器**（未认证 60/小时，两个 `rate_limit` 探测之间的差值 − 1 = 应用真正发出的请求数），配合 6 次快速版本切换（UIA 聚焦下拉 + `SendKeys` 六次 `{DOWN}`，实测选中项确实移动了 6 步：`0.1.6-alpha.2 (alpha) ← 当前` → `0.1.3-alpha.2 (alpha)`）。**修复版**：60 → 58 ⇒ **应用只发了 1 个请求**（读回时说明区仍是 `更新说明 · 加载中…`，即那一个请求还在飞）。**对照版**（把合并块摘掉后另编的 `target/debug/dsh-manager-nofix.exe`，源码随即按 blob 哈希还原）：58 → 52 ⇒ **应用发了 5 个请求**。同一台机器、同一个夹具、同样的 6 次选择：**1 vs 5**。 |
+| 单测 | `model::tests::coalesce_notes_keeps_only_the_last_fetch`（3 个请求 → 只剩最后一个）、`coalesce_notes_preserves_every_other_job_in_order`（6 个任务 → 4 个，且结果是原队列的子序列）、`coalesce_notes_is_identity_without_fetch_notes`。 |
+
+### TR-2：`precheck` 与 `probe_pm` 对"PM 可用"必须同判据
+
+`src/txn.rs` 的 `precheck` 改为 `Ok(out) if out.code == 0`（此前只判 `is_err()`）。判别性单测
+`txn::tests::tr2_precheck_rejects_pm_whose_version_command_exits_nonzero`：`FakeBackend` 新增
+`fail_version` 开关（`--version` 命令跑得起来但退出码非零）—— 退回旧实现该测试即变红。
+
+### M-2：安慰剂测试与过头的记录
+
+`precheck_rejects_unsafe_version` 断言的是同一个合法版本两次（其注释自己承认那条分支不可达），却被
+`docs/VERIFICATION.md` 的 V-16 引为"NFR-6 逐条覆盖"。现改为
+`precheck_invalid_version_branch_is_unreachable_by_type`：断言**合法版本必然通过**，并钉住
+"`Version` 的字符串形式必然满足 `is_safe_version`"（若有人把字符集校验改严，这条会红）；注释写明
+NFR-6 的真实覆盖在 `safe_version_rejects_injection_attempts`、`is_safe_version` 与 `InvalidVersion`
+按 Ruling 39 保留为具名实现。V-16 行已同步改写（见上）。
+
+### M-4：管道日志流不能被第一个坏字节掐断
+
+`src/dsh.rs` 的 `spawn_reader`：`map_while(Result::ok)` → `filter_map(Result::ok)`。前者在**第一个**读错误
+处结束整个循环，于是一行非 UTF-8 字节就会让该管道此后的全部日志消失（本程序 GC-8 没有 stderr，
+日志面板是唯一出口）。`lines()` 在 `InvalidData` 之后缓冲区已前移，跳过坏行继续读是安全的；EOF 仍由
+`read` 返回 0 长度表示，循环照常结束。
+
+### M-5：`strip_html` 静默吞掉未闭合 `<` 之后的内容
+
+`src/dsh.rs` 的 `strip_html` 重写为"只有本行内存在配对 `>` 的 `<` 才算标签"：未配对的 `<` 连同本行剩余
+内容按正文保留（`支持 <1s 启动` 此前渲染成 `支持 `）。判别性单测
+`strip_html_keeps_text_after_unmatched_angle_bracket`（含 `a < b`、`<未闭合`、以及"真标签 + 未配对 `<`"
+的混合行）；既有的 `strip_html_removes_tags_but_keeps_inner_text` 与 `preprocess_*` 全部照旧通过。
+
+### 规格漂移（spec drift）
+
+以下是**已交付代码刻意不按 SRS 字面**的地方。`docs/SRS.md` 不改（规格变更属于人的决定），此处只登记
+漂移与当时据以裁决的理由：
+
+| # | SRS 字面 | 实际实现 | 裁决理由 |
+|---|---|---|---|
+| 1 | FR-20：`cmd /c start "" <url>`（+ `CREATE_NO_WINDOW`） | `explorer.exe <url>` + **http(s) 协议白名单**（`dsh::open_url`） | URL 来自**网络**（release notes 正文里的链接），属信任边界；Rust 的参数编码**不**转义 `& \| ^ < > % !`，交给 `cmd` 解析就是 shell 注入向量（`https://a/&calc.exe` 会被拆成两条命令）。`explorer.exe` 单参数没有 shell 层，白名单是第二道防线。 |
+| 2 | §4.2.3 C3：降级时"输出**两条**可复制的手动命令" | 同 PM（`origin.pm == target.pm`）时**只给重装那一条**（`txn::manual_commands`） | 两条命令作用于同一个包：照做会先装回 origin 再把它删掉，结果是"一份都没有" —— 正是 TR-5/TR-6 要避免的最坏结果。单测 `manual_commands_same_pm_never_removes_the_only_copy` 钉住。 |
+| 3 | §3.8 文档的 JSON 形状 `{"running": {"port": …}}` | 平铺的 `running_port`（`config::StateFile` / `state.json`） | FR-31 的语义只需要一个端口号，嵌套对象不承载任何额外信息；SRS 自己的 §8.2 V-24 行与全部实现片段用的都是 `running_port`，本记录也一直按后者取证。 |
+| 4 | FR-31："**唯一写入点约束（强制）**：写入与清除只允许发生在一处" | 写入/清除分布在 `dsh web` 生命周期的若干站点（就绪后、各停止路径、启动超时兜底、退出前、启动时的过期清除、事务中的 TR-1 停止与事务后重启） | "唯一写入点"的**目的**是让记录与实际运行状态不脱节。裁决多轮下来，收敛到单一函数反而会制造脱节：只有**确知已停**才能清（评审轮 1）、队列未完成时必须记下**接受启动时**那个端口（Ruling 93）、启动超时且杀不掉子进程时必须补记端口（评审轮 4）。因此纪律改成"每个站点都必须与一个真实生命周期事件一一对应"，全部站点都在 `src/main.rs` 的启停/退出路径内。 |
+| 5 | FR-4："已安装版本一律通过执行 `dsh --version` 获取…**不得**解析各 PM 的全局列表输出格式来读取版本" | 退化路径（`dsh` 不在 PATH）下由 `parse_global_list` 从全局列表里取版本 | I-3 的修复要求。此时 `dsh --version` **根本无从执行**（没有 shim 可跑），而 FR-3 第 3 步本来就要求读全局列表来定 owner；若因此把 `installed` 留空，界面会对一个"明明装了"的用户报 `未检测到已安装的 dsh` —— 正是 SRS:786 禁止的未探测先下结论。正常路径（PATH 命中）仍**只**用 `dsh --version`，FR-4 的约束在那里完整成立。 |
+---
+
 ## 未通过项与处理
 
 **没有失败项。** 以下是**未执行**项及其处置，逐条列出以便追溯（不留空、不跳过）：
@@ -112,7 +206,7 @@
 |---|---|---|
 | V-14 换版本事务 | 未执行：真实 `npm install -g` 会降级用户正在使用的 dsh 安装（本机唯一那份，也是本会话依赖的 CLI） | 由单测钉住（`same_pm_version_change_commits_and_skips_uninstall`、`pm_command_table_is_exact`）；**真实事务的端到端运行仍未被任何人验证过**，属已知缺口 |
 | V-15 迁移事务 | 未执行：控制器裁定（TR-1 会先停掉承载本次会话的 `dsh web`，随后 `npm uninstall` 掉 dsh 本身） | 20 个事务单测 + Task 18/19 的 dry-run 后端；`docs/VERIFICATION.md` 即本条记录 |
-| V-16 前置检查 | 未执行（GUI 级）：本机 PM shim 与它的 `bin -g` 目录是同一个目录，移出 PATH 后连 PM 都探不到，构造不出该场景 | 三条拒绝路径 + 零副作用由 4 个单测覆盖 |
+| V-16 前置检查 | 部分执行：拒绝路径未在真实事务里走到 S1；原先连 GUI 级都无法构造 | **最终修复轮改变了这一点**：I-3 的 FR-3 第 3 步退化路径让"PM 的 bin 目录不在 PATH"可构造，TR-3 的拒绝已在 GUI 级实测（零副作用）；NFR-6 的真实覆盖是 `safe_version_rejects_injection_attempts`，`InvalidVersion` 分支按类型不可达（M-2）。细节见 V-16 行与 I-3 一节 |
 | V-17 失败补偿 | 未执行：需要一次真实的 S3 失败（= 动用户的安装） | 5 个补偿单测覆盖回滚/降级/手动命令 |
 | V-18 事务期间 UI | 未执行：需要一次真实事务在跑 | 无观测证据；仅代码路径（`busy` → 按钮禁用、`VecModel` 日志、80 ms 排空）。**这是本轮最明显的验证缺口** |
 | V-22 双实例状态同步 | 部分执行：托盘 → 窗口（状态）方向未执行（锁屏桌面无法识别弹出菜单项） | 窗口 → 托盘方向由 T19 的 V-10 覆盖；托盘 → UI 的可见性通路本轮实测；**待解锁桌面复验** |
@@ -127,13 +221,17 @@
    的错误串尾部都挂了 `PROXY_HINT`（"若本机仅允许通过系统代理出网，请设置 HTTPS_PROXY 后重启本程序"）。
    本机实测就撞上过这个组合：直连 `api.github.com` 得 HTTP 403（出口 IP 配额），而系统代理返回 200 ——
    即**只有本程序会失败**，所以失败信息必须自己解释原因。
-2. **托盘的 `Starting` 态不渲染**：`ui/app.slint` 没有 `web-starting` 属性，`web-running` 在 `Starting`
-   期间仍为 false → 从点击到就绪（正常约 2 s，超时路径最长 20 s）**"启动"按钮一直可点**。守卫
-   （`start_pending` + 状态检查）会拒绝重复请求并写一条日志/状态栏（"已在启动或运行中，忽略重复的启动请求"），
-   所以不会造出第二个子进程 —— 但用户看到的是"点得动、被拒绝"，不是按钮变灰。
+2. **托盘的 `Starting` 态不渲染**：`ui/app.slint` 的 `AppTray` 没有 `web-starting` 属性，托盘菜单的启用
+   条件只看 `web-running`/`busy` → 从点击到就绪（正常约 2 s，超时路径最长 20 s）**托盘里的"启动"仍可点**。
+   守卫（`start_pending` + 状态检查）会拒绝并写一条日志/状态栏（"已在启动或运行中，忽略重复的启动请求"），
+   所以不会造出第二个子进程 —— 但托盘用户看到的是"点得动、被拒绝"，不是菜单项变灰。
+   （**主窗口**自最终修复轮起有 `web-starting`：`安装`/`启动` 变灰、卡片显示"启动中…"，见 I-2。）
 3. **被采用的外部实例没有存活监控**：孤儿恢复认领的（以及预检发现的外部）实例只能靠用户点 `停止` 或它自己退出；
    `dsh::spawn_web` 的三个监督线程只属于**本程序自己启动**的实例，外部实例没有对应的 `WebExited` 通知，
-   它的状态因此可能长期停留在 `运行中`（点 `停止` 时由 `tasklist`/`netstat` 现场兜底）。
+   它的状态因此可能**显示**为 `运行中` 直到用户操作。**最终修复轮（I-1）补上了出口**：点 `停止` 时先按端口探测，
+   没有监听者即视为已达成"停止"（清 `running_port` + `已停止` + 日志 `端口 N 上已无 dsh web，状态已清除`），
+   实测 422 ms 收敛；80 ms tick **刻意不做**自动收敛（`port_in_use` 在空闲端口上要 300 ms 连接超时 + 一次
+   `netstat.exe`，12.5 Hz 地跑与 NFR-4 相悖）。
 4. **UI 最多滞后一个 tick**：所有 `WebState` 驱动的界面变化要等下一次 80 ms 排空（架构决策 3），
    因此状态显示与 worker 的实际动作之间最多差一帧。
 5. **`wait_port_ready` 的 `alive` 回调未被使用**：`main.rs` 传的是 `|| true`，所以即便子进程立刻死掉，
@@ -180,3 +278,17 @@
 6. **UIA 读回的形状**（本轮实测）：日志面板的每一行是一个 `Text` 元素（`Name` 即行内容），
    状态栏也是 `Text`；端口是 `[Edit]` 的 `ValuePattern`；按钮用 `InvokePattern`。窗口名 `DSH Manager`
    （类名 `Window Class`）。`StyledText`（更新说明正文）**没有** UIA 表示。
+7. **最终修复轮的两条可复现配方**（夹具是临时物，已随本轮清理；照下面重建即可）：
+   - **I-1**（外部实例自然退出后点 `停止`）：先 `node …\@deepseek-ai\dsh\lib\bin.js web --port 3099 --no-open`
+     起一个**不由本程序启动**的实例（`--no-open` 免得弹浏览器），写 `state.json` =
+     `{"preferred_port": 3099, "running_port": 3099}` 让管理器在启动时认领它（日志 `检测到外部 dsh web …`），
+     然后 `Stop-Process` 掉那个 node → 界面会**仍显示 `运行中`**（外部实例没有 `WebExited` 通道）→
+     点 `停止`：修复后 422 ms 内 `已停止` + 日志 `端口 3099 上已无 dsh web，状态已清除`。
+   - **I-2**（`Starting` 窗口里的 TR-1）：PATH 前置一个假目录，内含**永不绑定**的 `dsh.exe`
+     （`--version` 打印版本；参数含 `web` 就 sleep）与假 `npm.cmd`（`--version` → `12.0.2`、
+     `prefix -g` → **打印该假目录自身**，于是 owner 判定成立；其余参数一律 `exit /b 1`，
+     万一有事务漏出去也绝不会碰真实环境）。点 `启动`，**在同一拍的 80 ms 内**点 `安装` ——
+     状态栏会出现 `dsh web 正在启动，请稍候再执行变更`；随后按钮变灰、卡片显示 `启动中…`、
+     日志里不应出现 `事务开始`。用 `SendKeys` 连按 `{DOWN}` 驱动版本下拉，是 I-4 的输入手法
+     （需要 `SetForegroundWindow` + UIA `SetFocus`；本会话桌面**未锁屏**，故可用）。
+

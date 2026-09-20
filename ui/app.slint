@@ -33,6 +33,10 @@ export component MainWindow inherits Window {
 
     // ── dsh web（FR-18）──
     in property <bool>   web-running: false;
+    // I-2：`web-running` 在 `Starting` 期间是 false（那时还没有监听者），
+    // 所以"正在启动"必须是一个独立属性 —— 否则界面把启动窗口渲染成"已停止"，
+    // 而"安装"在 TR-1 最危险的窗口里可点。见 main.rs 的 project()。
+    in property <bool>   web-starting: false;
     in property <string> web-url: "";
     in-out property <string> port-text: "3080";
 
@@ -134,7 +138,10 @@ export component MainWindow inherits Window {
             }
             Button {
                 text: "安装";
-                enabled: !root.busy;
+                // I-2 / TR-1：dsh web 正在启动时不得执行变更（见 web-starting 的说明）。
+                // 变灰不是唯一的守卫 —— main.rs 的 on_install_clicked 里还有一道，
+                // 并会给出可见的状态栏提示（两者条件相同，这里是"点不动"，那里是"说出来"）。
+                enabled: !root.busy && !root.web-starting;
                 clicked => { root.install-clicked(); }
             }
             Button {
@@ -158,10 +165,11 @@ export component MainWindow inherits Window {
                     cross-axis-alignment: center;
                     Rectangle {
                         width: 8px; height: 8px; border-radius: 4px;
-                        background: root.web-running ? #0c0 : #bbb;
+                        background: root.web-running ? #0c0 : (root.web-starting ? #c60 : #bbb);
                     }
                     Text {
-                        text: root.web-running ? "运行中" : "已停止";
+                        // "启动中…" 而不是"已停止"：前者是事实，后者在 Starting 期间是谎话
+                        text: root.web-starting ? "启动中…" : (root.web-running ? "运行中" : "已停止");
                         font-weight: 600;
                     }
                     Text {
@@ -182,7 +190,9 @@ export component MainWindow inherits Window {
                     }
                     Button {
                         text: "启动";
-                        enabled: !root.web-running && !root.busy;
+                        // I-2：启动窗口内不给第二次点击（守卫同样在 main.rs 里，
+                        // 因为托盘菜单项不受这里的 enabled 约束）。
+                        enabled: !root.web-running && !root.busy && !root.web-starting;
                         clicked => { root.start-web(); }
                     }
                     Button {

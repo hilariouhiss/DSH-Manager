@@ -94,17 +94,28 @@ pub fn fetch_catalog() -> Result<Catalog, String> {
 }
 
 /// 删除裸 HTML 标签，**保留标签内的文本**。
+///
+/// ⚠ 只有**本行内还存在配对 `>`** 的 `<` 才算标签（M-5）。逐字符状态机早先无条件
+/// 进入"标签态"，于是没有闭合尖括号的正文被整段吞掉：`支持 <1s 启动` 渲染成 `支持 `
+/// —— FR-27 面板里的**静默内容丢失**，比显示垃圾文本更难发现（用户看不出少了什么）。
+/// 未配对的 `<` 与它后面的内容一律按正文保留。
 fn strip_html(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut in_tag = false;
-    for ch in s.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' if in_tag => in_tag = false,
-            _ if !in_tag => out.push(ch),
-            _ => {}
+    let mut rest = s;
+    while let Some(i) = rest.find('<') {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 1..];
+        match after.find('>') {
+            // 配对：整段（含尖括号）丢弃，但内部文字在上面/下面照常保留
+            Some(j) => rest = &after[j + 1..],
+            // 未配对：这个 '<' 不是标签，连同本行剩余内容原样保留
+            None => {
+                out.push_str(&rest[i..]);
+                return out;
+            }
         }
     }
+    out.push_str(rest);
     out
 }
 
@@ -292,13 +303,19 @@ pub fn is_node(pid: u32) -> bool {
 ///
 /// 泛型化是因为 `ChildStdout` 与 `ChildStderr` 是两个不同的类型 —— 它们都
 /// 实现了 `Read + Send + 'static`。
+///
+/// ⚠ `filter_map(Result::ok)` 而**不是** `map_while(Result::ok)`（M-4）：后者在第一个
+/// 错误处就结束整个读取循环，于是一行非 UTF-8 字节（或任何一次瞬时读错误）会让
+/// **这个管道此后的全部日志消失** —— 对一个"日志面板是唯一出口"的 GUI 程序
+/// （GC-8：没有 stderr）等于静默失聪。`lines()` 在 `InvalidData` 后缓冲区已前移，
+/// 跳过坏行继续读是安全的；EOF 仍由 `read` 返回 0 长度表示，循环照常结束。
 fn spawn_reader<R: Read + Send + 'static>(
     src: Option<R>,
     tx: Sender<UiMsg>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let Some(src) = src else { return };
-        for line in BufReader::new(src).lines().map_while(Result::ok) {
+        for line in BufReader::new(src).lines().filter_map(Result::ok) {
             if tx.send(UiMsg::Log(line)).is_err() {
                 break; // UI 侧已关闭
             }
@@ -410,15 +427,35 @@ pub fn stop_by_pid(pid: u32) -> Result<(), String> {
         "/F".to_string(),
     ];
     let out = pm::run_cmd("taskkill.exe", &args)?;
-    if out.code == 0 {
+    if out.code == 0 || taskkill_says_gone(&out) {
         return Ok(());
     }
-    // 进程已不存在视为成功（幂等）
+    Err(format!(
+        "taskkill 退出码 {}: {}",
+        out.code,
+        format!("{}{}", out.stdout, out.stderr).trim()
+    ))
+}
+
+/// `taskkill` 的输出是否表示"这个进程已经不存在"（= 停止目标已达成，幂等成功）。
+///
+/// 抽成**纯函数**是为了让它可单测：这个判据早先是错的，而错的后果很严重
+/// （I-1：外部实例自然退出后 `停止` 永远失败，状态永久停在"运行中"，
+/// 唯一的出路是退出重开）。两条判据各有分工：
+///
+/// - **退出码 128** —— 本机**实测**：`taskkill /PID <已退出的子进程> /F` 的退出码就是 128，
+///   而且它**与区域设置无关**，因此是主判据；
+/// - 文本匹配 —— ⚠ 它是**区域相关**的：taskkill 的错误文本来自系统消息表。本机实测是
+///   英文 ASCII（`ERROR: The process "11356" not found.`），能被 `"not found"` 匹配到；
+///   但在消息表为中文的 Windows 上，同样的文本是 GBK 字节，而 `pm::run_cmd` 用
+///   `from_utf8_lossy` 解码，中文会全变成 U+FFFD —— 代码里那几个中文串**永远匹配不上**。
+///   所以文字判据只对英文（及恰好能被这几个词命中的）区域设置有效，**绝不能**是唯一判据。
+fn taskkill_says_gone(out: &pm::CmdOut) -> bool {
+    if out.code == 128 {
+        return true;
+    }
     let msg = format!("{}{}", out.stdout, out.stderr);
-    if msg.contains("not found") || msg.contains("没有找到") || msg.contains("找不到") {
-        return Ok(());
-    }
-    Err(format!("taskkill 退出码 {}: {}", out.code, msg.trim()))
+    msg.contains("not found") || msg.contains("没有找到") || msg.contains("找不到")
 }
 
 /// FR-20：在默认浏览器打开 URL。
@@ -528,6 +565,71 @@ mod tests {
         assert_eq!(strip_html("无标签"), "无标签");
         assert_eq!(strip_html("<b>粗</b>体"), "粗体");
     }
+
+    /// ★ M-5：没有配对 `>` 的 `<` 是**正文**，不是标签。
+    ///
+    /// 判别性：旧的逐字符状态机在这里返回 `"支持 "`（`<1s 启动` 整段消失），
+    /// 而 FR-27 面板上表现为"内容凭空少了一半" —— 用户看不出来，评审也难发现。
+    #[test]
+    fn strip_html_keeps_text_after_unmatched_angle_bracket() {
+        assert_eq!(
+            strip_html("支持 <1s 启动"),
+            "支持 <1s 启动",
+            "未配对的 '<' 必须连同本行剩余内容一起保留"
+        );
+        assert_eq!(strip_html("<未闭合"), "<未闭合");
+        assert_eq!(strip_html("a < b"), "a < b", "两侧都是普通文本时不得吞掉后半句");
+        // 同一行里先有一个真标签、再有一个未配对的 '<'：真标签照常剥离，尾部保留
+        assert_eq!(strip_html("<b>粗</b> 支持 <1s"), "粗 支持 <1s");
+    }
+
+    /// I-1：`停止` 的幂等判据必须认**退出码 128**。
+    ///
+    /// 判据 ① 是**本机实测**的形状（2026-09-20）：把一个子进程杀掉后再 `taskkill /PID <它> /F`，
+    /// 退出码 **128**、stderr 是英文 `ERROR: The process "11356" not found.`。
+    /// 注意本机这条**英文**文本本来就能被 `"not found"` 匹配到 —— 也就是说
+    /// "只看文本"的旧实现在**本机**是能通过的，I-1 的第二个漏洞在本机不显形。
+    ///
+    /// 判据 ② 是**构造的**最坏形状（不是本机实测）：消息表为中文的 Windows 上，
+    /// 同一句话是 GBK 字节，经 `pm::run_cmd` 的 `from_utf8_lossy` 解码后中文全变 U+FFFD，
+    /// 于是三个文本分支全部落空。这正是"必须有语言无关判据"的理由 ——
+    /// 把它钉在测试里，比写一句"中文系统上会失败"的注释有用得多。
+    #[test]
+    fn taskkill_says_gone_accepts_exit_code_128() {
+        // ① 本机实测：英文文本 + 退出码 128
+        assert!(taskkill_says_gone(&pm::CmdOut {
+            code: 128,
+            stdout: String::new(),
+            stderr: "ERROR: The process \"11356\" not found.".into(),
+        }));
+
+        // ② 构造的中文消息表形状：GBK 被 lossy 解码成 U+FFFD，文本判据完全失效
+        let gbk_lossy = pm::CmdOut {
+            code: 128,
+            stdout: String::new(),
+            stderr: "\u{fffd}\u{fffd}: \u{fffd}\u{fffd}\u{fffd}\u{fffd}\u{fffd} \"1\"\u{fffd}".into(),
+        };
+        assert!(taskkill_says_gone(&gbk_lossy), "退出码 128 = 进程不存在，必须视为已停止");
+
+        // 文本判据仍在（对英文区域设置有效），但它不是主判据
+        assert!(taskkill_says_gone(&pm::CmdOut {
+            code: 1,
+            stdout: String::new(),
+            stderr: "ERROR: The process \"1\" not found.".into(),
+        }));
+
+        // 真正的失败（拒绝访问等）不许被吞掉
+        assert!(!taskkill_says_gone(&pm::CmdOut {
+            code: 5,
+            stdout: String::new(),
+            stderr: "ERROR: Access is denied.".into(),
+        }));
+    }
+
+    /// ⚠ 上面那条测的是**纯判据**，不是 `stop_by_pid` 本身：后者要带一个真实 pid 起
+    /// `taskkill.exe`，而测试里唯一拿得到的 pid 是"已退出子进程"的 pid —— 它有被系统
+    /// 复用的极小可能，届时测试会杀掉一个无辜进程。接线只有一行
+    /// （`if out.code == 0 || taskkill_says_gone(&out)`），刻意如此，便于肉眼核对。
 
     #[test]
     fn heading_body_detects_atx_headings() {

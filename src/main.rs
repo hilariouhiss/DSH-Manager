@@ -10,6 +10,7 @@ mod pm;
 mod txn;
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
@@ -278,6 +279,13 @@ fn project(state: &AppState, win: &MainWindow, tray: &AppTray) {
     win.set_version_index(state.selected_version_index());
 
     win.set_web_running(state.web.is_running());
+    // ⚠ I-2：`web-running` 只认 Running/External，而 `Starting`（正常约 2 秒，超时路径
+    // 最长 20 秒）期间它仍是 false —— 于是界面把"正在启动"渲染成"已停止"，且
+    // `安装` 按钮在此期间可点。那正是 TR-1 最危险的窗口：此刻**还没有任何监听者**，
+    // 事务的端口探测会得出"端口空闲"的结论，然后在我们自己的 `dsh web` 正启动时
+    // 去动全局包 —— 就是 TR-1 要避开的 Windows 文件锁场景。
+    // 这个属性把"启动中"这一事实投影到 UI：按钮变灰 + 卡片显示"启动中…"。
+    win.set_web_starting(state.start_pending || matches!(state.web, WebState::Starting { .. }));
     win.set_web_url(
         state
             .web
@@ -584,9 +592,46 @@ fn panic_detail(payload: &(dyn std::any::Any + Send)) -> String {
 
 /// 唯一的 worker 线程。**无状态** —— 它需要的一切都在 Job 载荷里。
 /// 串行执行天然满足 FR-15（禁止并发事务）。
+///
+/// ⚠ 唯一的例外是 I-4 的**队列合并**：`FetchNotes` 是纯读取，且它的回复只有
+/// "当前选中版本"那一条会被采信（见 `drain`），所以同一个出队批次里更早的同类请求
+/// 必然是废的 —— 合并掉它们不会改变任何可观测结果，只是不再让它们各阻塞 worker
+/// 最长 15 秒（NFR-3）。合并逻辑本身是纯函数 `model::coalesce_notes`，可直接单测。
 fn spawn_worker(rx: Receiver<Job>, tx: Sender<UiMsg>) {
     std::thread::spawn(move || {
-        while let Ok(job) = rx.recv() {
+        // 合并后待执行的任务（只有"当前是 FetchNotes 且后面还排着队"时才会非空）。
+        let mut pending: VecDeque<Job> = VecDeque::new();
+        loop {
+            // ⚠ Ruling 77 的另一半：所有发送端丢弃后 `recv` 返回 Err，线程退出 ——
+            // 这正是 `drain` 里"worker 已死"分支可达的前提。
+            let job = match pending.pop_front() {
+                Some(j) => j,
+                None => match rx.recv() {
+                    Ok(j) => j,
+                    Err(_) => break,
+                },
+            };
+
+            // ⚠ I-4：合并**只对 FetchNotes 生效**，且只丢掉"已被更晚的同类请求取代"的那些。
+            // 做法：把此刻已排队的任务一次取空（try_recv 非阻塞），交给纯函数合并 ——
+            // 结果是原队列的子序列（非 notes 任务一个不丢、顺序不变，存活的说明请求
+            // 留在原位），所以这里只是把合并后的批次按原序放回队首逐个执行。
+            // 出队时这个子队列本来就是空的，所以"没东西可合并"时直接执行当前任务，
+            // 不绕一圈（否则 `pending` 会把同一个任务反复推回队首，空转）。
+            if matches!(job, Job::FetchNotes { .. }) {
+                let mut drained: Vec<Job> = Vec::new();
+                while let Ok(next) = rx.try_recv() {
+                    drained.push(next);
+                }
+                if !drained.is_empty() {
+                    drained.push(job);
+                    for j in model::coalesce_notes(drained).into_iter().rev() {
+                        pending.push_front(j);
+                    }
+                    continue;
+                }
+            }
+
             // ⚠ 单个 worker 线程意味着**一次 panic 就会让此后所有 Job 石沉大海** ——
             // 队列还在收，却再也没人取。而 §5.2 的 Disconnected 兜底接不住这种情形：
             // `dsh::spawn_web` 的两个 reader 线程和一个等待线程各自持有
@@ -732,20 +777,37 @@ fn execute(job: Job, tx: &Sender<UiMsg>) {
             // 否则 taskkill /T /F 会把无辜进程连同其子进程一起杀掉（NFR-7 的全部理由）。
             let pid = match own_pid {
                 Some(pid) => pid,
-                None => match dsh::find_listener_pid(port) {
-                    Ok(pid) if dsh::is_node(pid) => pid,
-                    Ok(pid) => {
-                        send(UiMsg::Failed {
-                            context: "停止 dsh web",
-                            message: format!("端口 {port} 被非 node 进程占用（pid {pid}），拒绝停止"),
-                        });
+                None => {
+                    // ⚠ I-1：**外部实例没有存活监控**（`dsh::spawn_web` 的三个监督线程
+                    // 只属于本程序自己启动的那个实例），所以它自己退出后 `External{port}`
+                    // 会一直留着 —— 界面显示"运行中"，`启动` 被 `is_running()` 挡住，
+                    // 而 `停止` 又定位不到进程（`find_listener_pid` 报"未找到监听端口"），
+                    // 用户唯一的出路是退出重开。
+                    //
+                    // 按 TR-11 的同一原则处理：**先探测，再动作**。"这个端口上已经
+                    // 没有监听者"本身就是"停止"要达成的目标状态，此时该做的是清除状态，
+                    // 而不是报一个用户无法处理的错误。
+                    if !dsh::port_in_use(port) {
+                        let _ = config::update(|f| f.running_port = None);
+                        send(UiMsg::Log(format!("端口 {port} 上已无 dsh web，状态已清除")));
+                        send(UiMsg::WebState(WebState::Stopped));
                         return;
                     }
-                    Err(e) => {
-                        send(UiMsg::Failed { context: "定位 dsh web", message: e });
-                        return;
+                    match dsh::find_listener_pid(port) {
+                        Ok(pid) if dsh::is_node(pid) => pid,
+                        Ok(pid) => {
+                            send(UiMsg::Failed {
+                                context: "停止 dsh web",
+                                message: format!("端口 {port} 被非 node 进程占用（pid {pid}），拒绝停止"),
+                            });
+                            return;
+                        }
+                        Err(e) => {
+                            send(UiMsg::Failed { context: "定位 dsh web", message: e });
+                            return;
+                        }
                     }
-                },
+                }
             };
             match dsh::stop_by_pid(pid) {
                 Ok(()) => {
@@ -881,6 +943,17 @@ fn wire_callbacks(
                 return;
             };
             let target_pm = s.selected_pm.unwrap_or(owner);
+            // ⚠ I-2：TR-1 在 `Starting` 窗口里**必须自己挡住**（守卫 + UI 变灰两道）。
+            // 理由见 `project()` 里 `web-starting` 的说明：这段窗口里"端口探测"必然
+            // 得出"空闲"，而我们的 `dsh web` 正在启动 —— 事务会在文件锁上撞车。
+            //
+            // ⚠ 这条守卫不能只靠 UI 的 `enabled`：`project()` 要等下一次 80ms tick，
+            // 点击与变灰之间存在一拍的空隙，且托盘/未来入口不受按钮约束。
+            if s.start_pending || matches!(s.web, WebState::Starting { .. }) {
+                s.status = "dsh web 正在启动，请稍候再执行变更".into();
+                s.dirty = true; // 同下面两条：这条路径也不发 Job，不置 dirty 就投影不出来
+                return;
+            }
             // ⚠ 必须传【实际在运行】的端口（若有），而不是偏好端口。
             // 若 dsh web 跑在非偏好端口上（例如上次用了 8080、偏好仍是 3080），
             // 传偏好端口会让 TR-1 去停一个空端口 —— 真正持锁的实例还在，

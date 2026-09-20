@@ -200,12 +200,108 @@ pub fn read_dsh_version_on_path() -> Option<(Pm, Version)> {
 }
 
 /// FR-1 ~ FR-5：完整环境探测。
+///
+/// ⚠ 探测分两段，**不能合并**：正常路径（PATH 上有 dsh shim）与退化路径
+/// （FR-3 第 3 步：问各 PM 的全局包列表）是互斥的 —— 只在 `find_dsh_on_path`
+/// 一无所获时才查列表。理由是成本与语义：查一次列表要起一个 PM 子进程
+/// （`npm ls -g --depth=0` 本机实测约 **1.5 秒** —— node 启动 + 解析全局树），
+/// 而 PATH 命中时列表答案**无关紧要** ——
+/// PATH 顺序才是"用户敲 dsh 时真正执行哪一个"的语义（见 `find_dsh_on_path`）。
 pub fn probe_env() -> PmEnv {
     let available: Vec<PmInfo> = Pm::ALL.iter().filter_map(|pm| probe_pm(*pm)).collect();
     let dsh_path = find_dsh_on_path(&path_dirs(), &|p| p.is_file());
-    let owner = dsh_path.as_deref().and_then(|s| owner_of(s, &available));
-    let installed = read_dsh_version_on_path().map(|(_, v)| v);
+    let mut owner = dsh_path.as_deref().and_then(|s| owner_of(s, &available));
+    let mut installed = read_dsh_version_on_path().map(|(_, v)| v);
+
+    // FR-3 第 3 步：`dsh` 不在 PATH 上（无 shim）时，退化为依次查询各 PM 的
+    // 全局包列表，**第一个**列出 `@deepseek-ai/dsh` 的即为 owner PM。
+    //
+    // ⚠ `dsh_path` 此时**保持 `None`** —— 它确实不在 PATH 上，不能因为"包列表里有"
+    // 就伪造一个路径。代价是 TR-3 随后会拒绝事务（`BinNotOnPath`）—— 那是**正确的**：
+    // 装完之后用户敲 `dsh` 仍然找不到它（SRS TR-3 存在的全部理由）。
+    if dsh_path.is_none() {
+        for info in &available {
+            if let Some(v) = version_in_global_list(info.kind) {
+                installed = Some(v);
+                owner = Some(info.kind);
+                break;
+            }
+        }
+    }
+
+    // FR-4 注：版本号在这里**不解析列表正文**——正常路径走 `dsh --version`
+    // （`read_dsh_version_on_path` → `version_from_shim`）；只有退化路径
+    // 才从列表里取（见上），因为此时 `dsh --version` 根本无从执行。
     PmEnv { available, owner, installed, dsh_path }
+}
+
+/// 包名。只在本模块的退化路径里用；`model::Pm::{install,uninstall}_args` 里
+/// 的同一字面量由 `pm_command_table_is_exact` 钉住，两边不会各自漂移。
+const PKG: &str = "@deepseek-ai/dsh";
+/// 短名。少数 PM 的列表只印短名（不带 scope）。
+const PKG_SHORT: &str = "dsh";
+
+/// 这个空白分隔字段是否"点名"了 dsh 包？
+///
+/// ⚠ 必须是**整字段**匹配（`== PKG` / `== "dsh"` / 以 `PKG@`、`dsh@` 开头），
+/// 不能用 `contains`：列表第一行是安装目录（`C:\Users\x\AppData\Roaming\npm`），
+/// 用户名或路径里出现 `dsh` 三个字母是完全正常的，`contains` 会把路径当包名。
+fn names_dsh(field: &str) -> bool {
+    [PKG, PKG_SHORT]
+        .iter()
+        .any(|p| field == *p || field.strip_prefix(p).is_some_and(|r| r.starts_with('@')))
+}
+
+/// FR-3 第 3 步：从某个 PM 的**全局包列表输出**里取出 dsh 的版本。
+///
+/// **纯函数**，可用 fixture 单测（本机实测的四种输出形状见测试）。
+///
+/// 刻意**不为四个 PM 各写一个格式解析器**：四种输出的差异只有"包名与版本号怎么分隔"
+/// 这一件事，其余（树状前缀 `+--` / `├──` / `└─`、`Legend:` / 路径行、`info` / `warning` 行）
+/// 都是**独立的空白分隔字段**，按字段扫描时天然被跳过。于是只需要认两种形态：
+///
+/// - **同字段**：`@deepseek-ai/dsh@1.2.3`（npm / pnpm / bun / yarn 的树状行都长这样）
+/// - **相邻字段**：`@deepseek-ai/dsh 1.2.3`（pnpm 的原生列表格式）
+///
+/// 版本号一律交给 `semver::Version::parse` 判定 —— 手写版本号规则是 AS-4 明确
+/// 列为假设的东西，绝不能重写一遍。
+///
+/// ⚠ 形参 `pm` 是签名的一部分（与 `version_in_global_list` 对称），但**刻意不用**：
+/// 一旦按 PM 分支，"四种格式"的知识就又回到了 per-PM 解析器里，而这里要的恰恰相反。
+pub fn parse_global_list(_pm: Pm, output: &str) -> Option<Version> {
+    for line in output.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        for (i, f) in fields.iter().enumerate() {
+            // 形态 A：包名与版本在同一个字段
+            if let Some((name, ver)) = f.rsplit_once('@') {
+                if names_dsh(name) {
+                    if let Ok(v) = ver.parse::<Version>() {
+                        return Some(v);
+                    }
+                }
+            }
+            // 形态 B：包名与版本是两个相邻字段
+            if names_dsh(f) {
+                if let Some(v) = fields.get(i + 1).and_then(|t| t.parse::<Version>().ok()) {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// FR-3 第 3 步：跑某个 PM 的全局包列表命令并解析。
+///
+/// `pm.exe()` 是 shim 全名（GC-7）、参数以数组传递（GC-9）、
+/// `CREATE_NO_WINDOW` 在 `run_cmd` 内部（GC-8）—— 这里不需要重复任何一条。
+pub fn version_in_global_list(pm: Pm) -> Option<Version> {
+    // ⚠ 与 probe_pm / version_from_shim 相反：**不检查退出码**。
+    // `npm ls -g --depth=0` 在有 peer 依赖告警时会以非零码退出，而 stdout 里的
+    // 列表是完整的 —— 按退出码一刀切会让这个退化路径在最需要它的机器上永远为空。
+    let args: Vec<String> = pm.list_args().iter().map(|s| s.to_string()).collect();
+    let out = run_cmd(pm.exe(), &args).ok()?;
+    parse_global_list(pm, &out.stdout)
 }
 
 #[cfg(test)]
@@ -456,5 +552,158 @@ mod tests {
             got, None,
             "stdout 可解析但退出码非零的 shim 必须被拒绝；返回 Some 说明退出码守卫被删掉了"
         );
+    }
+
+    // ═══ FR-3 第 3 步：全局包列表解析（I-3）═══
+    //
+    // 下面四条 fixture 都是**真实输出形状**，捕获自本机：
+    //   npm  `npm ls -g --depth=0`          （实测，2026-09-20，路径已替换为占位符）
+    //   pnpm `pnpm list -g --depth=0`       （实测，2026-09-20）
+    //   bun / yarn                          （本机未安装，取自各自官方输出的公开形状）
+    // 只有 dsh 那一行是按同样格式**加**进 pnpm/bun/yarn 的 fixture 的 ——
+    // 本机 pnpm 的全局列表里没有 dsh（dsh 装在 npm 上）。
+
+    /// 本机实测的 npm 形状。注意树状前缀是 **ASCII** 的 `+--` / `` `-- ``
+    /// （`npm ls` 在输出被重定向时不用 Unicode 制表符）。
+    const NPM_LIST: &str = "\
+C:\\Users\\<user>\\AppData\\Roaming\\npm
++-- @colbymchenry/codegraph@1.6.0
++-- @deepseek-ai/dsh@0.1.6-alpha.2
++-- @earendil-works/pi-coding-agent@0.85.1
++-- npm@12.0.2
+";
+
+    /// 本机实测的 pnpm 形状：**Unicode** 树状前缀 + `Legend:` 行 + 路径行（含 `(PRIVATE)`）。
+    const PNPM_LIST: &str = "\
+Legend: production dependency, optional only, dev only
+
+C:\\Users\\<user>\\AppData\\Local\\pnpm\\global\\v11 (PRIVATE)
+│
+│   dependencies:
+├── @pnpm/exe@11.24.0
+├── @deepseek-ai/dsh@0.1.6-alpha.2
+└── pnpm@12.3.4
+";
+
+    /// pnpm 的原生列表格式：包名与版本是**两个字段**（无 `@` 连接）。
+    const PNPM_TWO_FIELD: &str = "\
+C:\\Users\\<user>\\AppData\\Local\\pnpm\\global\\v11 (PRIVATE)
+dependencies:
+@deepseek-ai/dsh 0.1.6-alpha.2
+";
+
+    /// bun `pm ls -g`：路径行带 `node_modules (N)` 后缀，条目是 `├── pkg@ver`。
+    const BUN_LIST: &str = "\
+C:\\Users\\<user>\\.bun\\install\\global node_modules (2)
+├── @deepseek-ai/dsh@0.1.6-alpha.2
+└── typescript@5.5.4
+";
+
+    /// yarn v1 `global list`：`info` 噪声行 + `└─ pkg@ver`。
+    const YARN_LIST: &str = "\
+yarn global v1.22.22
+info \"fsevents@2.3.2\" has binaries, but yarn does not support binaries for fsevents yet
+warning @deepseek-ai/dsh@0.1.6-alpha.2 has unmet peer dependency zod@3.22.4
+└─ @deepseek-ai/dsh@0.1.6-alpha.2
+Done in 0.31s.
+";
+
+    #[test]
+    fn parse_global_list_reads_npm_ascii_tree() {
+        assert_eq!(
+            parse_global_list(Pm::Npm, NPM_LIST),
+            Some(v("0.1.6-alpha.2")),
+            "npm 的 `+-- pkg@ver` 行"
+        );
+    }
+
+    #[test]
+    fn parse_global_list_reads_pnpm_unicode_tree() {
+        assert_eq!(parse_global_list(Pm::Pnpm, PNPM_LIST), Some(v("0.1.6-alpha.2")));
+    }
+
+    #[test]
+    fn parse_global_list_reads_pnpm_two_field_form() {
+        // 包名与版本分开两个字段 —— 这是"扫描相邻字段"那条规则存在的唯一理由
+        assert_eq!(
+            parse_global_list(Pm::Pnpm, PNPM_TWO_FIELD),
+            Some(v("0.1.6-alpha.2"))
+        );
+    }
+
+    #[test]
+    fn parse_global_list_reads_bun_tree() {
+        assert_eq!(parse_global_list(Pm::Bun, BUN_LIST), Some(v("0.1.6-alpha.2")));
+    }
+
+    #[test]
+    fn parse_global_list_reads_yarn_v1_list() {
+        assert_eq!(
+            parse_global_list(Pm::Yarn, YARN_LIST),
+            Some(v("0.1.6-alpha.2")),
+            "yarn 的 warning 行与真正的 `└─` 行都提到 dsh，取到的必须是同一个版本"
+        );
+    }
+
+    /// 没有 dsh 的列表必须返回 `None` —— 否则"哪个 PM 是 owner"会由噪声决定。
+    #[test]
+    fn parse_global_list_returns_none_when_package_absent() {
+        let no_dsh = "\
+C:\\Users\\<user>\\AppData\\Roaming\\npm
++-- @colbymchenry/codegraph@1.6.0
++-- npm@12.0.2
+";
+        assert_eq!(parse_global_list(Pm::Npm, no_dsh), None);
+        assert_eq!(parse_global_list(Pm::Npm, ""), None);
+    }
+
+    /// ★ 判别性：包名必须**整字段**匹配。
+    ///
+    /// 列表第一行是安装目录。用户名或路径里带 `dsh` 完全正常（本机就有 `dsh-manager`
+    /// 这个目录），一个用 `contains("dsh")` 的实现会把路径行当成包名，再往下找到
+    /// **别的包的版本**（这里埋了 `9.9.9-bogus`）当成 dsh 的版本 —— 那会让退回路径
+    /// 报出一个根本不存在的版本，甚至把 owner 判给错误的 PM。
+    #[test]
+    fn parse_global_list_requires_whole_field_match() {
+        let trap = "\
+C:\\Work\\Projects\\Tools\\dsh-manager\\target\\fakebin
++-- some-other-pkg@9.9.9-bogus
+";
+        assert_eq!(
+            parse_global_list(Pm::Npm, trap),
+            None,
+            "路径里的 `dsh` 与别的包的版本号都不能被当成 dsh 的安装记录"
+        );
+
+        // 反过来，短名（不带 scope）的列表行必须**能**认出来
+        assert_eq!(
+            parse_global_list(Pm::Npm, "dependencies:\ndsh 0.1.6-alpha.2\n"),
+            Some(v("0.1.6-alpha.2"))
+        );
+        assert_eq!(
+            parse_global_list(Pm::Npm, "+-- dsh@0.1.6-alpha.2\n"),
+            Some(v("0.1.6-alpha.2"))
+        );
+    }
+
+    /// `list_args` 的**每个** PM 都必须真的能跑（参数表写错就起不来）。
+    ///
+    /// 只对**本机确实装了**的 PM 断言（bun / yarn 未安装，见 VERIFICATION 的已知限制）：
+    /// 命令跑不起来（`Err`）不算失败 —— 那是"该 PM 不存在"，与参数表无关；
+    /// 但**跑起来了却连 stdout 都是空**就说明参数表错了。
+    #[test]
+    fn list_args_run_for_installed_pms() {
+        for pm in Pm::ALL {
+            if probe_pm(pm).is_none() {
+                continue; // 该 PM 未安装 —— 与本条无关
+            }
+            let args: Vec<String> = pm.list_args().iter().map(|s| s.to_string()).collect();
+            let out = run_cmd(pm.exe(), &args).expect("已探测到可用的 PM，列表命令必须能跑起来");
+            assert!(
+                !out.stdout.trim().is_empty(),
+                "{pm:?} 的 list_args {:?} 打不出任何 stdout —— 参数表写错了",
+                pm.list_args()
+            );
+        }
     }
 }

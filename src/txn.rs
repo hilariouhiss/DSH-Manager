@@ -44,9 +44,16 @@ pub fn is_safe_version(s: &str) -> bool {
 /// TR-1（dsh web 已停止）**不在此处** —— 它需要与 UI 交互（可能要求用户确认），
 /// 而事务引擎必须保持纯逻辑、无 UI 依赖。调用方在派发 Job 前完成停止。
 pub fn precheck<B: Backend>(b: &B, target: &Target) -> Option<RejectReason> {
-    // TR-2：目标 PM 可用
-    if b.run(target.pm, &["--version".to_string()]).is_err() {
-        return Some(RejectReason::PmUnavailable(target.pm));
+    // TR-2：目标 PM 可用。判据与 `pm::probe_pm` **逐字一致**：命令跑不起来（Err）
+    // **或退出码非零**都算不可用。
+    //
+    // ⚠ 早先这里只判 `is_err()`，于是 `precheck` 与 `probe_pm` 对同一个 PM 可能给出
+    // 相反结论：一个 `--version` 会失败（退出码非零）的 PM 在 UI 里根本不出现，
+    // 却能被 `Target` 手工选中并通过前置检查 —— TR-2 在两处含义不同。
+    // 现在两处都要求 `code == 0`，"PM 可用"只有一种含义。
+    match b.run(target.pm, &["--version".to_string()]) {
+        Ok(out) if out.code == 0 => {}
+        _ => return Some(RejectReason::PmUnavailable(target.pm)),
     }
     // NFR-6：版本号字符集（在拼命令前校验）
     let vs = target.version.to_string();
@@ -86,6 +93,11 @@ pub struct FakeBackend {
     pub calls: RefCell<Vec<String>>,
     /// 模拟 PM 完全不可用
     pub unavailable: RefCell<Vec<Pm>>,
+    /// 哪些 PM 的 `--version` 会以**非零码**退出（命令跑得起来，但 PM 不可用）。
+    ///
+    /// TR-2 的判别性开关：只有 `Err` 才算不可用的实现会在
+    /// `tr2_precheck_rejects_pm_whose_version_command_exits_nonzero` 上失败。
+    pub fail_version: RefCell<Vec<Pm>>,
 }
 
 #[cfg(test)]
@@ -104,6 +116,7 @@ impl FakeBackend {
             path_override: RefCell::new(None),
             calls: RefCell::new(vec![]),
             unavailable: RefCell::new(vec![]),
+            fail_version: RefCell::new(vec![]),
         }
     }
     pub fn with_installed(self, pm: Pm, v: &str) -> Self {
@@ -132,6 +145,10 @@ impl Backend for FakeBackend {
         self.calls.borrow_mut().push(format!("{pm:?} {}", args.join(" ")));
         if self.unavailable.borrow().contains(&pm) {
             return Err(format!("{pm:?} 不可用"));
+        }
+        if args.iter().any(|a| a == "--version") && self.fail_version.borrow().contains(&pm) {
+            // "命令跑起来了，但 PM 不工作" —— 真实世界对应一个损坏的 PM 安装。
+            return Ok(CmdOut { code: 1, stdout: String::new(), stderr: "模拟 PM 不可用".into() });
         }
 
         let is_install = args.iter().any(|a| a == "install" || a == "add");
@@ -407,16 +424,53 @@ mod tests {
         }
     }
 
+    /// ★ TR-2：`precheck` 的"PM 可用"判据必须与 `pm::probe_pm` **相同** ——
+    /// 退出码非零也算不可用。
+    ///
+    /// 判别性：把 `precheck` 退回 `b.run(..).is_err()`，本测试立刻失败 ——
+    /// 那时一个"命令在但会失败"的 PM 能通过前置检查，却在 UI 的下拉里根本不存在。
     #[test]
-    fn precheck_rejects_unsafe_version() {
-        // NFR-6
+    fn tr2_precheck_rejects_pm_whose_version_command_exits_nonzero() {
+        let b = FakeBackend::new();
+        b.fail_version.borrow_mut().push(Pm::Pnpm);
+        let t = Target { pm: Pm::Pnpm, version: v("0.1.6-alpha.2") };
+        assert_eq!(
+            precheck(&b, &t),
+            Some(RejectReason::PmUnavailable(Pm::Pnpm)),
+            "退出码非零 → 不可用（与 pm::probe_pm 同判据）"
+        );
+        // 同一次运行里，正常的 PM 不受影响
+        assert_eq!(precheck(&b, &Target { pm: Pm::Npm, version: v("0.1.6-alpha.2") }), None);
+    }
+
+    /// ⚠ 本测试**不覆盖** NFR-6 的拒绝路径 —— 真正覆盖它的是
+    /// `safe_version_rejects_injection_attempts`（`is_safe_version` 的字符集校验）。
+    ///
+    /// 这里钉住的是**另一件事**：`Target.version` 的类型是 `semver::Version`，
+    /// 它**在类型上就不可能**表示带注入字符的版本号，因此 `precheck` 里那条
+    /// `RejectReason::InvalidVersion` 分支经 `Target` **不可达**。
+    /// （早先这条测试叫 `precheck_rejects_unsafe_version`，却把同一个合法版本断了两次 ——
+    /// 名字承诺了它没有的覆盖，`docs/VERIFICATION.md` 的 V-16 还据此宣称"NFR-6 逐条覆盖"。）
+    ///
+    /// `is_safe_version` 与 `InvalidVersion` 都**照旧保留**：它们是 NFR-6 的具名实现
+    /// （Ruling 39），只是其运行期不可达这件事必须写在测试与文档里，而不是假装测到了。
+    #[test]
+    fn precheck_invalid_version_branch_is_unreachable_by_type() {
         let b = FakeBackend::new();
         let t = Target { pm: Pm::Npm, version: v("0.1.6-alpha.2") };
         assert_eq!(precheck(&b, &t), None, "合法版本应通过");
 
-        let mut bad = t.clone();
-        bad.version = v("0.1.6-alpha.2"); // semver 本身已挡住非法字符
-        assert_eq!(precheck(&b, &bad), None);
+        // 本测试能钉住的上限：`Version` 的 Display 形式**必然**满足字符集校验 ——
+        // 两处判据不会互相矛盾。若有人把 is_safe_version 改严（例如禁掉 '+' 或预发布段），
+        // 这条断言会失败：那时 precheck 的 InvalidVersion 分支就不再是"类型上不可达"，
+        // 而是会真的拒绝合法的 semver。
+        for s in ["0.1.6-alpha.2", "1.0.0+build.5", "0.1.0", "1.2.3-rc.1+b.2"] {
+            let parsed = v(s);
+            assert!(
+                is_safe_version(&parsed.to_string()),
+                "{parsed} 是合法 semver，字符串形式必须通过 is_safe_version"
+            );
+        }
     }
 
     #[test]
