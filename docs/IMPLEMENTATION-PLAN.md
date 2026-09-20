@@ -3861,6 +3861,14 @@ export component AppTray inherits SystemTrayIcon {
     callback start-web();
     callback stop-web();
     callback quit-app();
+    /// 左键单击托盘图标。
+    ///
+    /// ⚠ 名字**不能**叫 `clicked` —— Slint 1.18 **不把 `SystemTrayIcon.clicked`
+    /// 这个内建回调暴露到生成的 Rust API 上**（实测 `tray.on_clicked(...)` 编译不过；
+    /// 根元素的**内建成成员**一律不进公开 API，同理 `MainWindow` 也拿不到
+    /// `close-requested`，见 SRS §429）。内建回调只在**组件体内**可见，因此必须
+    /// 自己声明一个回调把它转出去，Task 19 才有东西可接。
+    callback tray-clicked();
 
     Menu {
         MenuItem {
@@ -3889,6 +3897,9 @@ export component AppTray inherits SystemTrayIcon {
             activated => { quit-app(); }
         }
     }
+
+    // 把内建 clicked 转出去 —— 这是组件体内唯一能挂上它的位置（内建回调作用于根元素）。
+    clicked => { root.tray-clicked(); }
 }
 ```
 
@@ -3912,7 +3923,9 @@ Expected:
 1. 窗口出现，**系统托盘中出现图标**（若图标未出现在可见区域，点任务栏的 `^` 展开隐藏图标）
 2. 鼠标悬停显示 "DSH Manager"
 3. **右键**托盘图标 → 弹出菜单，含 5 个条目与 2 条分隔线
-4. **左键**单击托盘图标 → 触发 `clicked()`（本步骤无需可见反应，Task 19 接上）
+4. **左键**单击托盘图标 → 转发到 `tray-clicked`（本步骤无需可见反应，Task 19 接上
+   `on_tray_clicked` → 显示主窗口）。注意：若图标被 Win11 收进折叠面板，**该面板不会把点击转发给托盘宿主**，
+   此时点不到属正常 —— 把图标拖到可见任务栏再点。
 5. 关闭窗口后进程仍在运行（事件循环未退出）—— 这就是 FR-23 的基础
 
 > **若托盘图标不出现**：检查 `ui/tray-icon.png` 是否真的非空且能解码。Slint 在 `icon` 为空时**静默不创建**图标，不报错。
@@ -4926,6 +4939,18 @@ fn wire_callbacks(
     {
         let win_weak = win_weak.clone();
         tray.on_show_window(move || {
+            if let Some(w) = win_weak.upgrade() {
+                let _ = w.show();
+            }
+        });
+    }
+    {
+        // V-9：左键单击托盘图标 → 显示主窗口（与菜单第一项同一动作）。
+        // ⚠ 只能用自定义的 `tray-clicked`：Slint 1.18 **不把内建 `clicked` 暴露到
+        // 生成的 Rust API 上**（`tray.on_clicked` 不存在，已实测），故 Task 16 在
+        // 组件体内把它转成了这个回调。
+        let win_weak = win_weak.clone();
+        tray.on_tray_clicked(move || {
             if let Some(w) = win_weak.upgrade() {
                 let _ = w.show();
             }
