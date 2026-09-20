@@ -789,6 +789,13 @@ fn start_web(port: u16, tx: &Sender<UiMsg>) {
                 send(UiMsg::WebState(WebState::Running { port, pid }));
                 send(UiMsg::Log(format!("dsh web 已就绪：http://127.0.0.1:{port}")));
             } else {
+                // ⚠ 光发 WebState::Failed 是**看不见的**：界面只把 web-running 渲染成
+                // "已停止"，reason 没有任何属性承载 —— 于是用户等了整整 20 秒却什么
+                // 提示都没有。补一条 UiMsg::Failed，让它落到状态栏与日志面板。
+                send(UiMsg::Failed {
+                    context: "启动 dsh web",
+                    message: "启动超时：端口未在 20 秒内就绪".into(),
+                });
                 send(UiMsg::WebState(WebState::Failed { reason: "启动超时".into() }));
                 let _ = dsh::stop_by_pid(pid);
             }
