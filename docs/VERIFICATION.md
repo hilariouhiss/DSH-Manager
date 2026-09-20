@@ -17,6 +17,7 @@
 | **T19 实测** | Task 19 报告记录的实测（提交 `d8114ad`，同一份已评审代码；本次未重复执行） |
 | **T18 实测** | Task 18 报告记录的实测（提交 `8f00bb4`，`SetWinEventHook` 控制台窗口对照） |
 | **终修实测** | **最终修复轮**的实测（I-1 ~ I-4）：UIA 读回 + `netstat -ano` + `state.json` + GitHub 配额计数，端口一律用 3099 |
+| **真实事务实测** | 本分支**唯一一次真实环境变更**（同 PM 重装 `@deepseek-ai/dsh@0.1.6-alpha.2`）的观测：UIA 读回 + `netstat` + 文件 mtime + 独立端口采样器，端口 3099，见「真实事务实测」一节 |
 | **单测** | `cargo test` 中的具名单元测试（当前 84 项全绿） |
 
 端口纪律（安全包线）：**3080 是本次验证所在会话的 live `dsh web`（pid 13432），全程未触碰**；
@@ -54,11 +55,11 @@
 | **V-11** 托盘"退出" | **PASS**（T19 实测） | 运行中选 `退出` → 进程消失（两次运行分别 3 ms / 485 ms）、`3099` 不再监听，消失的 node pid 包含 3099 的持有者及其助手进程 → **无孤儿**；`3080` 仍为 `13432`；`state.json` 的 `running_port` → `null`。 |
 | **V-12** 端口冲突 | **PASS（含一处呈现差异，见备注）** —— **T20 实测（本条为首次执行）** | 先在 3099 上跑一个**不是本程序启动**的真实 `dsh web`（`node.exe` pid 6184），再在 GUI 点 `启动`：日志出现 **`端口 3099 已被外部 dsh web 占用（pid 6184）`**，状态变为 `运行中` + `http://127.0.0.1:3099`，`state.json` 写入 `running_port: 3099`。**备注（呈现差异）**：SRS 写的是"提示…提供三个出口：打开网页 / 停止 / 改用其他端口启动"。实现里没有模态对话框 —— 检测结果直接落到日志与状态栏，`打开网页` / `停止` 两个出口是主界面按钮，"改用其他端口"由端口输入框 + 停止后重启动达成（`ui/app.slint` 无对应对话框；与 Task 14 的设计决策 2「自启/外部合并为同一条停止路径」一致）。另：按安全包线在 **3099** 而非 3080 上构造，端口号不影响该分支的代码路径。 |
 | **V-13** 外部进程停止 | **PASS** —— **T20 实测（本条为首次执行）** | 两半都实测：(a) **非 node 占用者被拒绝**：用 PowerShell `TcpListener` 占住 3099（`pwsh.exe` pid 19184）→ 点 `启动` → 日志 `启动 dsh web失败: 端口 3099 被非 node 进程占用（pid 19184）`、状态 `启动 dsh web失败`、web 状态保持 `已停止`，**且该占用进程事后仍存活**（证明没有对无辜进程执行 `taskkill`，NFR-7 的守卫有效）。(b) **真正的 dsh web 能被定位并终止**：外部实例（node pid 6184）→ 点 `停止` → **445 ms** 内 `已停止`，`3099` 变为空闲，外部 node 进程消失，`running_port` → `null`。 |
-| **V-14** 换版本事务（同 PM） | **未执行** —— 原因见下 | 需要真的执行 `npm install -g @deepseek-ai/dsh@0.1.6-alpha.1`：那会**降级用户正在使用的真实 dsh 安装**（本机唯一的 npm 那份，也是本会话所依赖的 CLI），事务中断就会把用户环境留在半成品状态。**替代证据（单测）**：`txn::tests::same_pm_version_change_commits_and_skips_uninstall`（FR-13：同 PM 跳过 S3）、`model::tests::pm_command_table_is_exact`（钉住每个 PM 的确切 argv）、`txn::tests::cross_pm_migration_installs_then_uninstalls`（装/卸顺序）。**未观测**：GUI 上一次真实事务的端到端运行。 |
-| **V-15** 迁移事务（npm → pnpm） | **未执行** —— 这是简报 Step 2，**已由控制器裁定不做** | 原因：`Job::Transact` 先按 TR-1 停掉 `dsh web`（本机就是**承载本次验证的 live 会话**，pid 13432），随后事务会 `npm uninstall` 掉 `@deepseek-ai/dsh` —— 半途失败会同时毁掉用户的环境与本次会话。**替代证据**：事务引擎语义由 **20 个单元测试**钉住（TR-4 / TR-5 / TR-6 / TR-11 及 V-17 / V-19 / V-20 / V-21），且"真实事务"代码路径已在 Task 18/19 通过 dry-run 后端（`txn::FakeBackend`）走过一遍，**零环境变更**。 |
-| **V-16** 事务前置检查 | **部分执行**：拒绝路径仍未在真实事务里跑到 S1，但 **GUI 级构造已可行**（I-3 之后），并已实测 TR-3 的拒绝 | 拒绝路径的单测：`txn::tests::precheck_rejects_pm_bin_not_on_path`（TR-3）+ `rejected_target_produces_no_side_effects`（零副作用）；TR-2 有 `precheck_rejects_unavailable_pm` **与 `tr2_precheck_rejects_pm_whose_version_command_exits_nonzero`**（退出码非零 = 不可用，与 `pm::probe_pm` 同判据）。**NFR-6 由 `safe_version_rejects_injection_attempts` 覆盖**（`is_safe_version` 的字符集校验）—— `precheck` 里那条 `RejectReason::InvalidVersion` 分支经 `Target` **类型上不可达**（`semver::Version` 表示不出带注入字符的版本号），保留它是 Ruling 39 的具名实现，对应测试已改名 `precheck_invalid_version_branch_is_unreachable_by_type`，不再宣称覆盖 NFR-6（M-2）。**GUI 级（终修实测，新增可达）**：I-3 的 FR-3 第 3 步退化路径让"该 PM 的 bin 目录不在 PATH"变得可构造 —— PATH 去掉 `%APPDATA%\npm` 后 dsh 不在 PATH，而 `npm ls -g` 仍能报出已安装版本与 owner，于是点 `安装` 真的进到 `precheck` 的 TR-3：日志 `已拒绝：npm 的全局目录不在 PATH 中：C:\Users\xueyu\AppData\Roaming\npm。请先把它加入 PATH 再试`，**零副作用**（无安装命令、`state.json` 未变、真实 dsh 版本仍为 `0.1.6-alpha.2`）。**仍未观测**：一次真实事务中由前置检查拦下的场景（TR-3 之后的 S1 起都没跑）。**为什么之前构造不出来**：PM 的 shim 恰好住在它的 `bin -g` 目录里，把该目录移出 PATH 后 `probe_env` 连这个 PM 都探不到，根本走不到 `precheck` —— I-3 的退化路径恰好补上了这个缺口。 |
+| **V-14** 换版本事务（同 PM） | **部分执行** —— **同 PM 的真实安装已实测到 `Committed`**（见「真实事务实测」一节）；**"换版本"那一半仍未执行** | **已覆盖的那一半**：GUI 上一次真实事务端到端跑通 —— 点 `安装` → `事务开始：npm 0.1.6-alpha.2 → npm 0.1.6-alpha.2` → `$ npm.cmd install -g @deepseek-ai/dsh@0.1.6-alpha.2`（FR-28）→ 186.6 秒后终态 `已安装 0.1.6-alpha.2（npm）`（`Committed`）；同 PM ⇒ **S3 跳过**这一条也在真实日志里成立（全程无卸载命令）；安装后 `npm ls -g` / `where.exe dsh` / `dsh --version` 全部照旧。**仍未执行的那一半**：真正的版本迁移（例如 `0.1.6-alpha.2 → 0.1.6-alpha.1`）没跑 —— 那会把用户**唯一**一份 dsh CLI 降级，而它正是本次验证依赖的 CLI。**替代证据（单测）**：`txn::tests::same_pm_version_change_commits_and_skips_uninstall`（FR-13：同 PM 跳过 S3）、`model::tests::pm_command_table_is_exact`（钉住每个 PM 的确切 argv）、`txn::tests::cross_pm_migration_installs_then_uninstalls`（装/卸顺序）。 |
+| **V-15** 迁移事务（npm → pnpm） | **未执行** —— 这是简报 Step 2，**已由控制器裁定不做**（本次实测后仍是这个结论） | 原因：`Job::Transact` 先按 TR-1 停掉 `dsh web`（本机就是**承载本次验证的 live 会话**，pid 13432），随后事务会 `npm uninstall` 掉 `@deepseek-ai/dsh` —— 半途失败会同时毁掉用户的环境与本次会话。**本次真实事务只走了同 PM 分支**（`origin.pm == target.pm` ⇒ S3 被跳过），因此**迁移分支本身（S3 卸载 + 跨 PM 的 S2/S4 判据）依然只有单测**：**20 个单元测试**（TR-4 / TR-5 / TR-6 / TR-11 及 V-17 / V-19 / V-20 / V-21）钉住其语义，这次真实运行另把**公共骨架**（precheck → S1 → S2 →【S3】→ S4 → 终态）在真实 PM 上走了一遍。**未观测**：任何一次真实的 `uninstall`、任何一次跨 PM 迁移。 |
+| **V-16** 事务前置检查 | **部分执行**：拒绝路径仍未在真实事务里跑到 S1，但 **GUI 级构造已可行**（I-3 之后），并已实测 TR-3 的拒绝 | 拒绝路径的单测：`txn::tests::precheck_rejects_pm_bin_not_on_path`（TR-3）+ `rejected_target_produces_no_side_effects`（零副作用）；TR-2 有 `precheck_rejects_unavailable_pm` **与 `tr2_precheck_rejects_pm_whose_version_command_exits_nonzero`**（退出码非零 = 不可用，与 `pm::probe_pm` 同判据）。**NFR-6 由 `safe_version_rejects_injection_attempts` 覆盖**（`is_safe_version` 的字符集校验）—— `precheck` 里那条 `RejectReason::InvalidVersion` 分支经 `Target` **类型上不可达**（`semver::Version` 表示不出带注入字符的版本号），保留它是 Ruling 39 的具名实现，对应测试已改名 `precheck_invalid_version_branch_is_unreachable_by_type`，不再宣称覆盖 NFR-6（M-2）。**GUI 级（终修实测，新增可达）**：I-3 的 FR-3 第 3 步退化路径让"该 PM 的 bin 目录不在 PATH"变得可构造 —— PATH 去掉 `%APPDATA%\npm` 后 dsh 不在 PATH，而 `npm ls -g` 仍能报出已安装版本与 owner，于是点 `安装` 真的进到 `precheck` 的 TR-3：日志 `已拒绝：npm 的全局目录不在 PATH 中：C:\Users\xueyu\AppData\Roaming\npm。请先把它加入 PATH 再试`，**零副作用**（无安装命令、`state.json` 未变、真实 dsh 版本仍为 `0.1.6-alpha.2`）。**仍未观测**：一次真实事务中由前置检查拦下的场景（TR-3 之后的 S1 起都没跑）。**本次真实事务观测到的是它的通过路径**：`precheck` 返回 `None`（PM 可用、bin 目录在 PATH、版本号合法）后事务才进入 `S1`。**为什么之前构造不出来**：PM 的 shim 恰好住在它的 `bin -g` 目录里，把该目录移出 PATH 后 `probe_env` 连这个 PM 都探不到，根本走不到 `precheck` —— I-3 的退化路径恰好补上了这个缺口。 |
 | **V-17** 事务失败补偿 | **未执行（GUI 级）** —— 需要一次真实失败事务 | 单测覆盖补偿全部关键分支：`txn::tests::v17_s3_failure_rolls_back_to_origin`（状态回到 `(PM_old, V0)`）、`c2a_cleanup_failure_is_reported_as_degraded_with_cause`、`c3_detects_incomplete_recovery_and_degrades`、`degraded_outcome_carries_runnable_manual_commands`、`tr11_compensation_probes_before_acting`。**未观测**：真实 PM 上的回滚。 |
-| **V-18** 事务期间 UI | **未执行** —— 需要一次真实事务在跑 | 未取得观测证据。代码侧：`busy` 由 `project()` 投影为 `enabled: !root.busy`（`ui/app.slint:137` 的 `安装` 按钮、`:132` 版本下拉），日志经 `VecModel` 在 UI 线程追加（`LOG_CAP` 裁剪），排空靠 80 ms timer —— 但"按钮禁用、日志实时滚动、界面不卡死"这三条**本轮没有实测**。 |
+| **V-18** 事务期间 UI | **部分执行**（真实事务实测） | 事务进行中 `安装` 按钮 `IsEnabled=False`（`busy` 经 `project()` 投影为 `enabled: !root.busy`，实测生效）；日志行**在事务运行期间**就能从面板读回（不是结束后一次性出现）；每 250 ms 一次的 UIA 读回在 185 秒里没有一次超时 —— 即 UI 线程没有被事务阻塞。**仍未观测**：事务期间用**物理输入**验证界面可交互（拖动/点击其他控件）、以及托盘侧在事务期间的表现。 |
 | **V-23** 偏好端口持久化 | **PASS**（T19 实测按原文 8080；T20 另测 3099 读路径） | T19：端口 `[Edit]` `SetValue("8080")` → 字段读到 `8080` 且 `state.json` 变为 `{ "preferred_port": 8080, "running_port": null }`（FR-30 写路径，且**不派发任何 Job**）；杀进程重启 → 字段仍是 `8080`（读路径）。T20：预置 `state.json` 的 `preferred_port = 3099` 后启动，UIA 读到端口字段为 **`3099`**。 |
 | **V-24** 运行态端口记录 | **PASS**（T20 实测全周期 + T19 实测） | T20（3099）完整周期：启动就绪后 `state.json` = `{ "preferred_port": 3099, "running_port": 3099 }`；管理器被强杀后**仍是** `running_port: 3099`（这正是孤儿恢复的信号）；点 `停止` 后 → `running_port: null`。T19：启动/停止/托盘停止/退出四条路径同样收敛。 |
 | **V-25** **孤儿恢复（FR-22 + FR-31）** | **PASS —— T20 实测（FR-31 存在的唯一理由，必验项）** | 五步全过程见下方「V-25 实录」。要点：非默认端口 3099 启动 → 强杀管理器留下孤儿 → 孤儿存活且 `running_port` 仍在 → 重启后界面 `运行中` + `http://127.0.0.1:3099`，日志 `检测到外部 dsh web 运行在端口 3099（pid 23124）` → 点 `停止` 在 **432 ms** 内真正终止该孤儿（3099 变空闲、pid 23124 消失、`running_port` 清空）。 |
@@ -101,7 +102,7 @@
 | 编号 | 结果 | 证据 |
 |---|---|---|
 | **V-19** TR-4：验证不走 PATH | **PASS**（单测） | 判别性测试 `pm::tests::tr4_read_dsh_version_at_executes_shim_in_that_directory`：在临时目录放一个打印 `9.9.9-tr4probe` 的真实 `dsh.cmd`，正确实现必须执行**该目录**下的 shim 拿到这个版本号；一个"忽略 `dir`、走 PATH"的实现会因为本机 PATH 上真有一份 dsh 而返回 `0.1.6-alpha.2` → 断言失败。事务侧另有 `txn::tests::tr4_verify_does_not_use_path`（S2 用 `dsh_version_at(target_dir)` 而非 PATH）。SRS 原文要求"构造 pnpm → npm 迁移场景"实测 —— 那正是本轮被裁定的 V-15（未执行，见上）。 |
-| **V-20** TR-6：先装后卸 | **PASS**（单测） | `txn::tests::v20_s1_failure_touches_nothing`：构造 S1 安装失败，断言**任何 uninstall 都没有被执行**（npm 那份分毫未动）。顺序本身由 `txn::tests::cross_pm_migration_installs_then_uninstalls` 断言（先装后卸）。SRS 要求的"确认 dsh 仍完全可用"是真实环境断言，本轮未执行（同 V-14/V-15 的理由）。 |
+| **V-20** TR-6：先装后卸 | **PASS**（单测 + 同 PM 真实事务） | `txn::tests::v20_s1_failure_touches_nothing`：构造 S1 安装失败，断言**任何 uninstall 都没有被执行**（npm 那份分毫未动）。顺序本身由 `txn::tests::cross_pm_migration_installs_then_uninstalls` 断言（先装后卸）。SRS 要求的"确认 dsh 仍完全可用"在**同 PM 的真实事务**里已实测：重装后 `dsh --version` 仍是 `0.1.6-alpha.2`、`where.exe dsh` 仍是同一对 shim，且整个重装过程发生在一个**正在运行的** `dsh web`（pid 13432）脚下而没有中断它；**跨 PM 顺序**（先装 pnpm 那份、再卸 npm 那份）仍只有单测。 |
 | **V-21** TR-5：补偿前探测 | **PASS**（单测） | `txn::tests::v21_origin_broken_does_not_blindly_uninstall_target`：PM_old 已损坏 + S3 失败时**不会**盲目卸载 PM_new；`txn::tests::tr11_compensation_probes_before_acting` 另钉住"补偿动作前必须先探测"。 |
 | **V-22** FR-25：双实例状态同步 | **部分执行 / 未完成** | **窗口 → 托盘**方向有观测：T19 的 V-10 在窗口驱动状态变化后读托盘菜单项 `IsEnabled`（运行中 ↔ 已停止两侧都读到了正确的启用关系）。**托盘 → 窗口**方向本轮**未执行**：锁屏会话下无法用 UIA 识别我们自己那个弹出菜单里的菜单项（详见「验证方法说明」第 4 条），因此没法可靠地选中 `启动 dsh web`。本轮实际观测到的托盘→UI 通路只有**可见性**那一条：点 `隐藏到托盘` 后窗口消失，posted `WM_TRAYICON`+`WM_LBUTTONUP` 后窗口重新可见。代码侧：`project()` 把同一份状态**同时**推给 `win` 与 `tray`（FR-25 存在的理由就是把两次赋值放在同一个函数里）。**待解锁桌面复验。** |
 
@@ -152,7 +153,8 @@
 | 项 | 内容 |
 |---|---|
 | 改动 | `src/main.rs` 的 `spawn_worker`：worker 出队一个 `Job::FetchNotes` 时，用 `try_recv` 把**此刻已排队**的任务一次取空，交给纯函数 `model::coalesce_notes` 只保留**最后一个** `FetchNotes`，其余任务按原序放回队首逐个执行。保序保证（已写进 `coalesce_notes` 的文档与单测）：结果是原队列的**子序列** —— 除"已被更晚的同类请求取代"的 `FetchNotes` 外**一个任务都不丢**，相对顺序不变（存活的说明请求就是**最后一次选择**那个，`coalesce_notes` 的"保留末位"因此要求交进去的批次按入队顺序＝旧→新排列：已出队的旧任务必须插到批次**队首**，`drained.push(job)` 会让最旧的那个占据末位）。丢掉是安全的：`drain` 只采信**当前选中版本**的回复，被取代的请求即使回来也会被丢弃 —— 它们唯一的作用就是让 worker 再阻塞最长 15 秒并多烧一次 GitHub 配额。 |
-| 实测（终修实测，A/B） | 判别依据是 **GitHub 自己的配额计数器**（未认证 60/小时，两个 `rate_limit` 探测之间的差值 − 1 = 应用真正发出的请求数），配合 6 次快速版本切换（UIA 聚焦下拉 + `SendKeys` 六次 `{DOWN}`，实测选中项确实移动了 6 步：`0.1.6-alpha.2 (alpha) ← 当前` → `0.1.3-alpha.2 (alpha)`）。**修复版**：60 → 58 ⇒ **应用只发了 1 个请求**（读回时说明区仍是 `更新说明 · 加载中…`，即那一个请求还在飞）。**对照版**（把合并块摘掉后另编的 `target/debug/dsh-manager-nofix.exe`，源码随即按 blob 哈希还原）：58 → 52 ⇒ **应用发了 5 个请求**。同一台机器、同一个夹具、同样的 6 次选择：**1 vs 5**。 |
+| 实测（终修实测，A/B） | 判别依据是 **GitHub 自己的配额计数器**（未认证 60/小时，两个 `rate_limit` 探测之间的差值 − 1 = 应用真正发出的请求数），配合 6 次快速版本切换（UIA 聚焦下拉 + `SendKeys` 六次 `{DOWN}`，实测选中项确实移动了 6 步：`0.1.6-alpha.2 (alpha) ← 当前` → `0.1.3-alpha.2 (alpha)`）。**保序版**：60 → 58 ⇒ **应用只发了 1 个请求**。**对照版**（把合并块摘掉后另编的 `target/debug/dsh-manager-nofix.exe`，源码随即按 blob 哈希还原）：58 → 52 ⇒ **应用发了 5 个请求**。同一台机器、同一个夹具、同样的 6 次选择：**1 vs 5**。 |
+| ⚠ 本行的历史注记 | 上表这次实测的"保序版"当时读回说明区仍是 `更新说明 · 加载中…`，**被解读为"那一个请求还在飞" —— 这个解读是错的**。后续评审查明：该版本把**最旧**的选择留在了批次末位（`drained.push(job)`），其回复会被 `version == selected_version` 过滤丢弃，故面板其实**永久卡住**。`0f2cb9b` 改为 `drained.insert(0, job)`，并补上**正/红相位对照**：保序版派发**最后一次**选择、`REPLY accepted=true`、标题 2.0 秒离开加载中并稳定 70 秒、正文 13630 字符与同一 tag 的 release body（13817，去 HTML 后 13630）吻合；把那一行翻回去的对照版派发的是**被放弃**的选择、`accepted=false`、70 秒后仍"加载中"。 |
 | 单测 | `model::tests::coalesce_notes_keeps_only_the_last_fetch`（3 个请求 → 只剩最后一个）、`coalesce_notes_preserves_every_other_job_in_order`（6 个任务 → 4 个，且结果是原队列的子序列）、`coalesce_notes_is_identity_without_fetch_notes`。 |
 
 ### TR-2：`precheck` 与 `probe_pm` 对"PM 可用"必须同判据
@@ -172,10 +174,12 @@ NFR-6 的真实覆盖在 `safe_version_rejects_injection_attempts`、`is_safe_ve
 
 ### M-4：管道日志流不能被第一个坏字节掐断
 
-`src/dsh.rs` 的 `spawn_reader`：`map_while(Result::ok)` → `filter_map(Result::ok)`。前者在**第一个**读错误
-处结束整个循环，于是一行非 UTF-8 字节就会让该管道此后的全部日志消失（本程序 GC-8 没有 stderr，
-日志面板是唯一出口）。`lines()` 在 `InvalidData` 之后缓冲区已前移，跳过坏行继续读是安全的；EOF 仍由
-`read` 返回 0 长度表示，循环照常结束。
+`src/dsh.rs` 的 `spawn_reader`：原为 `map_while(Result::ok)`，它在**第一个**读错误处结束整个循环，
+于是一行非 UTF-8 字节就会让该管道此后的全部日志消失（本程序 GC-8 没有 stderr，日志面板是唯一出口）。
+**最终实现是一段显式三分支（不是简单的 `filter_map`）**：`Ok(0)`（EOF）照常结束循环；
+`Err(e) if e.kind() == InvalidData`（一行里混了非 UTF-8 字节）**只丢掉那一行**并继续 ——
+`read_until` 此时缓冲区已前移，跳过坏行是安全的；其余读错误 `break`，这也**恢复**了 `map_while`
+原有的"任何错误即结束该管道"语义，避免在持续性错误上自旋。EOF 仍由读操作的 0 长度表示。
 
 ### M-5：`strip_html` 静默吞掉未闭合 `<` 之后的内容
 
@@ -198,17 +202,42 @@ NFR-6 的真实覆盖在 `safe_version_rejects_injection_attempts`、`is_safe_ve
 | 5 | FR-4："已安装版本一律通过执行 `dsh --version` 获取…**不得**解析各 PM 的全局列表输出格式来读取版本" | 退化路径（`dsh` 不在 PATH）下由 `parse_global_list` 从全局列表里取版本 | I-3 的修复要求。此时 `dsh --version` **根本无从执行**（没有 shim 可跑），而 FR-3 第 3 步本来就要求读全局列表来定 owner；若因此把 `installed` 留空，界面会对一个"明明装了"的用户报 `未检测到已安装的 dsh` —— 正是 SRS:786 禁止的未探测先下结论。正常路径（PATH 命中）仍**只**用 `dsh --version`，FR-4 的约束在那里完整成立。 |
 ---
 
+## 真实事务实测（V-14 / V-15 的同 PM 路径）
+
+来源标记：**真实事务实测** —— 本机 UI Automation 读回 + `netstat -ano` + 文件 mtime + 一个与夹具
+无关的独立端口采样器。夹具与观测脚本在 gitignore 的 `target/realtxn/` 下
+（`run-txn2.ps1` / `run-txn2.txt` / `before.txt` / `after.txt` / `port-watch.txt`）。
+**这是本分支唯一一次真实的、会改环境的事务**，也是此前 V-14/V-15/V-18 一直缺的那条端到端证据。
+
+| 项 | 内容 |
+|---|---|
+| 安全包线（为什么必须先改端口框） | `Job::Transact` 会按 **TR-1** 先停掉"它拿到的那个端口"上的 `dsh web`，端口取自 `state.web.port().unwrap_or(state.preferred_port)`（`src/main.rs` 的 `on_install_clicked`）。本机 **3080** 上跑的正是**承载本会话的 live `dsh web`（pid 13432）**，所以动手前先把端口框改成 **3099**：3099 空闲 ⇒ `dsh::port_in_use(3099)` 为假 ⇒ TR-1 的预停分支根本不进入，3080 从头到尾不在候选集里。 |
+| 允许的唯一环境改动 | **同一个 PM（npm）重装同一个版本** `@deepseek-ai/dsh@0.1.6-alpha.2`。同 PM ⇒ `txn::run` 的 **S3 被跳过（FR-13）** ⇒ 全程**没有一条卸载命令**，不存在"两份都毁了"的窗口；也没有切换 PM、没有装别的版本。 |
+| 动手前 | `npm ls -g --depth=0` → `+-- @deepseek-ai/dsh@0.1.6-alpha.2`（其余 6 个全局包同前）；`where.exe dsh` → `C:\Users\xueyu\AppData\Roaming\npm\dsh`、`…\dsh.cmd`；`netstat` **3080 → pid 13432**，3099 → 空闲；`state.json` → **不存在**。 |
+| 点击前的界面读数（UIA） | 端口框 `3099`（先由 `state.json` 的 `preferred_port` 落地，再用**真实按键** `^a` + `3099` 改一次并读回，防止"字段其实指在 3080 上"这种致命误配）、PM 下拉 `npm  ·  dsh 安装于此`、版本下拉 `0.1.6-alpha.2  (alpha)  ← 当前`、`安装` 按钮 `IsEnabled=True`。三者同时成立才允许点击（硬闸门；不成立即中止且零副作用）。 |
+| 日志面板实录（UIA 读回；时间为相对点击的时刻） | `+0.30s` `事务开始：npm 0.1.6-alpha.2 → npm 0.1.6-alpha.2`；`+0.66s` 状态栏 `正在安装新版本…`（= `TxProgress(S1Install)`）；`+1.72s` **`$ npm.cmd install -g @deepseek-ai/dsh@0.1.6-alpha.2`**（FR-28 的"执行的命令原文"）；`+186.57s` `事务结束，重新探测环境`。日志面板最终 4 行（另有启动行 `DSH Manager 启动`）。 |
+| 最终状态 | **`Committed`** —— 状态栏 `已安装 0.1.6-alpha.2（npm）`，即 `describe_outcome(TxOutcome::Committed { pm: npm, version: 0.1.6-alpha.2 })` 的唯一形状。点击后 **186.6 秒**收敛（npm 真的要下载/重写整包，见下）。 |
+| S2 / S4 的可见证据 | **日志里没有**，这是设计使然：`txn::install` 打命令原文，**S2/S4 不打日志**，成功路径也不回灌 PM 的 stdout（`describe_outcome_log(Committed) = vec![]`，只有 `Degraded`/`RolledBack`/`Rejected` 才写行）。所以"S2、S4 都通过"是由**两个否定证据**共同推出的：日志里**没有** `在「安装新版本」阶段失败`、**没有** `在「验证新安装」阶段失败`、**没有** `在「最终验证」阶段失败`、**没有** `已完成回滚`（S2/S4 任一不符都会走 `compensate`，`RolledBack` 必打两行），且终态是 `Committed`。想让 S2/S4 有**直接**读数，得给引擎补日志——本轮没有改代码。 |
+| 这次确实是重装，不是 npm 的 `up to date` 空转 | `…\npm\node_modules\@deepseek-ai\dsh\package.json` 的 mtime 从 **09:43:22** 变为 **22:57:40**，`README*`/`LICENSE`/`lib/` 一并重写、`node_modules/` 到 22:58:03 —— 与 185 秒的耗时吻合。**关键事实**：整个重写发生在**那个 live `dsh web`（pid 13432）正在运行**的时候，Windows 允许替换（node/libuv 以共享删除方式打开文件），进程没有中断。 |
+| 动手后 | `npm ls -g --depth=0` → 仍是 `+-- @deepseek-ai/dsh@0.1.6-alpha.2`；`where.exe dsh` → 同一对 shim；`dsh --version` → `0.1.6-alpha.2`；`netstat` **3080 → pid 13432（未变）**；3099 与 8080 → **无本地监听**；**无 `dsh-manager.exe` 进程**残留；`state.json` **已恢复为不存在**（本轮开始时它就不存在）。 |
+| 3080 的连续性（独立观察器） | 一个与夹具无关的 `netstat` 采样循环在 **22:52:46 → 22:58:38** 采样 **155 次**：`3080=13432` **155/155**、`3099=`（空）**155/155**。事务那 185 秒的前后都被覆盖，不存在"短暂断开又回来"的可能。 |
+| 顺带观测到的 V-18 片段 | 事务进行中 `安装` 按钮 `IsEnabled=False`（`busy` 经 `project()` 投影成 `enabled: !root.busy`，**实测生效**，不只是读代码）；日志新增行**在事务运行期间**就能从面板读回（不是结束后一次性出现）；每 250 ms 一次的 UIA 读回在 185 秒里**没有一次超时或失败**，即 UI 线程确实没有被事务阻塞（GC-16）。 |
+| 有意**未**执行：跨 PM 迁移（V-15 的 npm → pnpm、V-16 的迁移路径） | **没跑，且不该跑**：迁移要求 `npm → pnpm`，而 TR-1 会先停掉 3080 上那个 `dsh web`（= **承载本会话的进程**），随后 `npm uninstall -g @deepseek-ai/dsh` 会删掉用户机器上**唯一**一份 dsh CLI —— 正是本会话依赖的 CLI。半途失败会同时毁掉用户环境与这次会话。因此迁移语义仍然只由 **20 个事务单测**（TR-4 / TR-5 / TR-6 / TR-11 及 V-17 / V-19 / V-20 / V-21）钉住；这次真实运行补上的是**公共骨架**（`precheck` → S1 → S2 →【S3 跳过】→ S4 → 终态）在真实 PM/真实网络下的端到端行为，**S3 与迁移分支本身依然没有被任何人真实运行过**。 |
+| 方法学注记（给下一位用 UIA 驱动的验证者） | 主窗口的 UIA 子树里，**标题栏的 `关闭` 按钮排在任何自绘内容之前**。第一轮尝试在读完"关于"卡片后用 `Get-ByName '关闭'` 去关它，命中的是**标题栏关闭**，于是程序按正常路径退出（窗口关 = 退出），那一轮因此**没有点到 `安装`**（零副作用，3080 依然 13432）。教训：按名字找控件在 Slint 窗口上不安全，先按 `ControlType` + 矩形位置筛选，或干脆不去点"关于"。 |
+
+---
+
 ## 未通过项与处理
 
 **没有失败项。** 以下是**未执行**项及其处置，逐条列出以便追溯（不留空、不跳过）：
 
 | 编号 | 现象 | 处理 |
 |---|---|---|
-| V-14 换版本事务 | 未执行：真实 `npm install -g` 会降级用户正在使用的 dsh 安装（本机唯一那份，也是本会话依赖的 CLI） | 由单测钉住（`same_pm_version_change_commits_and_skips_uninstall`、`pm_command_table_is_exact`）；**真实事务的端到端运行仍未被任何人验证过**，属已知缺口 |
-| V-15 迁移事务 | 未执行：控制器裁定（TR-1 会先停掉承载本次会话的 `dsh web`，随后 `npm uninstall` 掉 dsh 本身） | 20 个事务单测 + Task 18/19 的 dry-run 后端；`docs/VERIFICATION.md` 即本条记录 |
-| V-16 前置检查 | 部分执行：拒绝路径未在真实事务里走到 S1；原先连 GUI 级都无法构造 | **最终修复轮改变了这一点**：I-3 的 FR-3 第 3 步退化路径让"PM 的 bin 目录不在 PATH"可构造，TR-3 的拒绝已在 GUI 级实测（零副作用）；NFR-6 的真实覆盖是 `safe_version_rejects_injection_attempts`，`InvalidVersion` 分支按类型不可达（M-2）。细节见 V-16 行与 I-3 一节 |
-| V-17 失败补偿 | 未执行：需要一次真实的 S3 失败（= 动用户的安装） | 5 个补偿单测覆盖回滚/降级/手动命令 |
-| V-18 事务期间 UI | 未执行：需要一次真实事务在跑 | 无观测证据；仅代码路径（`busy` → 按钮禁用、`VecModel` 日志、80 ms 排空）。**这是本轮最明显的验证缺口** |
+| V-14 换版本事务 | **已部分执行**（原来是"未执行"）：同 PM 的真实 `npm install -g @deepseek-ai/dsh@0.1.6-alpha.2` 已在 GUI 上端到端跑到 `Committed`（185 秒、真实重写文件、3080 未动） | **仍未执行**：真正的"换版本"（降级到 `0.1.6-alpha.1`）—— 那会降级用户正在使用的 dsh 安装（本机唯一那份，也是本会话依赖的 CLI）。单测另钉住：`same_pm_version_change_commits_and_skips_uninstall`、`pm_command_table_is_exact`。细节与全部读数见「真实事务实测」一节 |
+| V-15 迁移事务 | **未执行**：控制器裁定（TR-1 会先停掉承载本次会话的 `dsh web`，随后 `npm uninstall` 掉 dsh 本身）。本次真实事务只走**同 PM 分支**，没有触及迁移路径 | 20 个事务单测 + 同 PM 真实运行覆盖的公共骨架；**迁移分支（S3 卸载）依然零真实运行** |
+| V-16 前置检查 | 部分执行：拒绝路径未在真实事务里走到 S1；原先连 GUI 级都无法构造。**本次真实事务观测到了前置检查的通过路径**（`precheck` 返回 `None` ⇒ 事务进入 S1），拒绝路径仍只有 GUI 级构造（I-3 的 TR-3） | **最终修复轮改变了"能不能构造"**：I-3 的 FR-3 第 3 步退化路径让"PM 的 bin 目录不在 PATH"可构造，TR-3 的拒绝已在 GUI 级实测（零副作用）；NFR-6 的真实覆盖是 `safe_version_rejects_injection_attempts`，`InvalidVersion` 分支按类型不可达（M-2）。细节见 V-16 行与 I-3 一节 |
+| V-17 失败补偿 | 未执行：需要一次真实的 S3 失败（= 动用户的安装） | 5 个补偿单测覆盖回滚/降级/手动命令；本次真实事务**成功路径**没有触发任何补偿 |
+| V-18 事务期间 UI | **已部分执行**（原来是"未执行"）：本次真实事务进行中读回 `安装` `IsEnabled=False`、日志行在运行期间实时出现、每 250 ms 一次的 UIA 读回 185 秒无一次失败 | 仍需补的是"界面不卡死"的**强**证据（例如手动拖动/交互）与托盘侧在事务期间的表现；细节见「真实事务实测」一节 |
 | V-22 双实例状态同步 | 部分执行：托盘 → 窗口（状态）方向未执行（锁屏桌面无法识别弹出菜单项） | 窗口 → 托盘方向由 T19 的 V-10 覆盖；托盘 → UI 的可见性通路本轮实测；**待解锁桌面复验** |
 | V-10 托盘菜单状态 | 本轮未重复执行（T19 已 PASS） | 本轮试图复读菜单项时 UIA 返回 0 个 `MenuItem`，方法学记录见下 |
 
