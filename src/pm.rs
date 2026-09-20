@@ -148,6 +148,9 @@ pub fn probe_pm(pm: Pm) -> Option<PmInfo> {
     if ver.code != 0 {
         return None;
     }
+    // ⚠ 必须先把 Vec<String> 绑到变量再取引用：直接写
+    // `run_cmd(pm.exe(), &args.iter().map(..).collect())` 会因 collect() 的
+    // 目标类型无法穿过引用推断而报 E0277（已实测 2 处）。
     let args: Vec<String> = pm.bin_dir_args().iter().map(|s| s.to_string()).collect();
     let dir = run_cmd(pm.exe(), &args).ok()?;
     if dir.code != 0 {
@@ -177,12 +180,15 @@ pub fn read_dsh_version_at(dir: &Path) -> Option<Version> {
 /// 经 PATH 解析后读版本。**仅用于事务的 S4 最终验证**。
 pub fn read_dsh_version_on_path() -> Option<(Pm, Version)> {
     let shim = find_dsh_on_path(&path_dirs(), &|p| p.is_file())?;
-    let ver: Version = run_cmd(&shim.to_string_lossy(), &["--version".to_string()])
-        .ok()?
-        .stdout
-        .trim()
-        .parse()
-        .ok()?;
+    let out = run_cmd(&shim.to_string_lossy(), &["--version".to_string()]).ok()?;
+    // ⚠ 必须与 read_dsh_version_at 一样检查退出码。
+    // 否则一个"stdout 可解析但退出码非零"的 shim 会被这里接受、却被
+    // read_dsh_version_at 拒绝 —— 两个读取器对**同一次安装**给出相反结论，
+    // 而 S4（事务的最终验证）会**假通过**。那正是 TR-4 要防的同一个失败方向。
+    if out.code != 0 {
+        return None;
+    }
+    let ver: Version = out.stdout.trim().parse().ok()?;
     let bins: Vec<PmInfo> = Pm::ALL.iter().filter_map(|pm| probe_pm(*pm)).collect();
     let owner = owner_of(&shim, &bins)?;
     Some((owner, ver))
@@ -382,5 +388,34 @@ mod tests {
     #[test]
     fn read_dsh_version_at_missing_dir_is_none() {
         assert_eq!(read_dsh_version_at(&p("C:/definitely/not/here")), None);
+    }
+
+    /// ★ TR-4 的**判别性**测试（上面那条对 TR-4 没有牙齿）。
+    ///
+    /// `read_dsh_version_at_missing_dir_is_none` 在 `shim_in(dir)?` 就提前返回了，
+    /// 命令根本没跑 —— 所以一个"经 PATH 解析"的错误实现照样能通过它（只要 PATH
+    /// 上没有 dsh）。它断言的内容没错，但**测不到 TR-4**。
+    ///
+    /// 本测试在临时目录里放一个真实可执行的 `dsh.cmd`，且该目录**不在 PATH 上**：
+    /// - 正确实现（执行该目录下的 shim）→ 拿到版本 ✓
+    /// - 错误实现（走 PATH 解析）→ 该目录不在 PATH，返回 None ✗
+    ///
+    /// 顺带覆盖 `.cmd` shim 的真实 spawn 路径 —— 既有的 run_cmd 测试用的都是 cmd.exe。
+    #[test]
+    fn tr4_read_dsh_version_at_executes_shim_in_that_directory() {
+        let dir = std::env::temp_dir().join(format!("dsh-mgr-shim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 一个最小但真实可执行的 .cmd shim
+        std::fs::write(dir.join("dsh.cmd"), "@echo 0.1.6-alpha.2\r\n").unwrap();
+
+        let got = read_dsh_version_at(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            got,
+            Some(v("0.1.6-alpha.2")),
+            "必须执行【该目录下】的 shim。返回 None 说明实现走了 PATH 解析（TR-4 违规）"
+        );
     }
 }
