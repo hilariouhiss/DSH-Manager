@@ -592,14 +592,13 @@ Pm 的命令表放在此处而非 pm.rs：它是纯常量映射，若放 pm.rs
 
 **Interfaces:**
 - Consumes: `model::*`
-- Produces:
+- Produces（**本任务只交付读取侧** —— 写入侧是 Task 4 的交付物，此处仅列出它们的最终签名以免接口漂移）:
   - `StateFile { preferred_port: Option<u16>, running_port: Option<u16> }`（`Default` + `Clone` + `Debug` + `PartialEq`）
   - `Loaded { Ok(StateFile), Missing, Corrupt(String), NoLocation }`
   - `state_path() -> Option<PathBuf>`
   - `load() -> Loaded`
-  - `save(&StateFile) -> Result<(), String>`
-  - `update(impl FnOnce(&mut StateFile)) -> Result<(), String>`
-  - **测试缝**：`load_from(Option<&Path>) -> Loaded` 与 `save_to(&Path, &StateFile) -> Result<(), String>`（供单元测试注入临时路径，避免污染真实 `%APPDATA%`）
+  - **测试缝**：`load_from(Option<&Path>) -> Loaded`
+  - ⏳ **Task 4 交付**（本任务只留 `todo!()` 占位）：`save(&StateFile)`、`update(impl FnOnce(&mut StateFile))`、`save_to(&Path, &StateFile) -> Result<(), String>`
 
 - [ ] **Step 1: 写失败测试**
 
