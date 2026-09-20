@@ -14,6 +14,85 @@
 
 > 执行者**必须同时阅读这两份文档**。本计划的任务从它们推导而来；当计划与 spec 冲突时以 spec 为准并上报。
 
+---
+
+## 进度状态
+
+| 项 | 值 |
+|---|---|
+| **完成度** | **8 / 20 个任务** |
+| 分支 | `feat/implementation`（自 `main` 的 `895fdc0` 分叉） |
+| 提交数 | 35（8 `feat` / 21 `fix` / 4 `docs` / 1 `test` / 1 `chore`） |
+| 代码规模 | 1386 行（`model` 297 / `pm` 455 / `txn` 324 / `config` 265 / `main` 34 / `app.slint` 11） |
+| 测试 | **39 个全绿**；`cargo build` 与 `cargo test` 均 **0 警告** |
+| 依赖 | **恰好 5 条**（GC-2 成立） |
+| 最后核验 | `git status` 干净（HEAD 见 `git log` —— 本进度段会随执行持续更新） |
+
+### 任务台账
+
+每个任务都走完「实现 → 独立评审 →（必要时）修复 → scoped 重评审」的闭环。
+提交范围取**该任务实际的起止提交**。
+
+| 任务 | 状态 | 提交范围 | 累计测试 | 备注 |
+|---|---|---|---|---|
+| Task 1 工具链骨架与空窗口 | ✅ | `08228e9..facb15e` | 0 | PE subsystem=2（GUI）/ 测试目标=3（CONSOLE）已实测 |
+| Task 2 `model.rs` 纯数据叶子层 | ✅ | `68e6be3..7488f8b` | 1 | **1 轮修复**：`NotesStatus` 重复定义（否则 Task 20 必失败）、allow 注释范围、命令表测试精确化 |
+| Task 3 `config.rs` 路径解析与读取 | ✅ | `324f50d..ed4f48e` | 6 | |
+| Task 4 `config.rs` 原子写入 | ✅ | `57fb1ac..4d376cf` | 12 | **1 轮修复**：原子写入原本零测试保护（变异证明），补判别性测试 |
+| Task 5 `pm.rs` 通道判定 | ✅ | `fe57fd8..5664f17` | 17 | |
+| Task 6 `pm.rs` owner 判定 | ✅ | `5664f17..4ce622d` | 24 | |
+| Task 7 `pm.rs` 命令执行与探测 | ✅ | `c89c805..57c3d44` | 32 | **2 轮修复**：S4 退出码不对称（结构性根治为 `version_from_shim`）、TR-4 测试原本不能判别 |
+| Task 8 `txn.rs` 类型 / `Backend` / 前置检查 | ✅ | `a66c961..81b6fb0` | 39 | **1 轮修复**：假 backend 的安装副作用在 Task 8 内零保护（变异证明） |
+| **Task 9 + 10 `txn.rs` 事务主流程与补偿** | ⏸ **下一个** | — | — | ⚠ **必须合并派发** —— 见下方 R3 |
+| Task 11 `dsh.rs` registry 拉取 | ⬜ | — | — | |
+| Task 12 `dsh.rs` 更新说明与预处理 | ⬜ | — | — | |
+| Task 13 `dsh.rs` 端口探测与进程定位 | ⬜ | — | — | |
+| Task 14 `dsh.rs` dsh web 进程监督 | ⬜ | — | — | |
+| Task 15 `app.slint` MainWindow | ⬜ | — | — | |
+| Task 16 `app.slint` AppTray | ⬜ | — | — | |
+| Task 17 `main.rs` AppState / Timer / project | ⬜ | — | — | |
+| Task 18 `main.rs` worker 与 Job 执行 | ⬜ | — | — | |
+| Task 19 `main.rs` 回调接线与退出语义 | ⬜ | — | — | |
+| Task 20 移除临时 lint 抑制 + 端到端验证 | ⬜ | — | — | **含强制步骤**：删除 `#![allow(dead_code)]` 并确认 `cargo build`/`cargo test` 双零警告 |
+
+### 与继续执行直接相关的裁决
+
+完整 40 条裁决记录在 SDD 工作区的 ledger 里
+（`.superpowers/sdd/IMPLEMENTATION-PLAN/progress.md`，gitignored）。以下几条已同步进本计划正文：
+
+| Ruling | 内容 |
+|---|---|
+| **R3** | **Task 9 与 Task 10 必须合并为一次派发。** Task 9 的简版 `compensate` 是脚手架，单独提交会留下一个已知错误的实现。 |
+| **R20** | 评审的 BASE 一律取**被评审提交的实际父提交**，不要用派发前记录的值 —— 执行期间控制器的 `fix(plan):` 提交会插进来，按字面取会把文档改动算成实现者的工作。 |
+| **R17** | `model.rs` **不得**再定义 `NotesStatus`（与 `app.slint` 生成的同名枚举冲突，glob 导入会被遮蔽而成为死代码）。 |
+| **R31** | `path_dirs()` **必须**过滤空 PATH 段（空段 join 出的是相对路径，会遮蔽后面真实的命中）。 |
+| **R35** | 两个版本读取器**共用** `version_from_shim`，不各自内联退出码守卫。 |
+| **R38** | `FakeBackend` 的安装/卸载**副作用必须保留**，且由 `fake_backend_semantics_are_modeled` 直接钉住。 |
+| **R39** | `is_safe_version` 与 `RejectReason::InvalidVersion` **保留**（NFR-6 是具名需求），尽管该分支从任何 `Target` 都不可达。 |
+
+### 续跑方式
+
+1. 加载 `superpowers:subagent-driven-development`，读 `.superpowers/sdd/IMPLEMENTATION-PLAN/progress.md`
+   —— ledger 含全部 40 条 `Ruling:` 行、每个任务的 brief / report / 评审包。
+2. 从 **Task 9 + 10 合并派发**继续。
+3. 每个任务的完成行、每轮修复、每条新裁决都追加进 ledger。
+4. **本工作区不得在计划完成前删除**；`finishing-a-development-branch` 在全部 20 个任务完成前不得调用。
+
+### 执行中累积、留给最终评审批量处理的项
+
+| 项 | 位置 | 说明 |
+|---|---|---|
+| **TR-2 与真实可用性不一致** | `src/txn.rs:48` vs `src/pm.rs:146-150` | TR-2 只拒 `Err`（命令没跑起来），而 `probe_pm` 还要求 `--version` 退出码为 0。最坏结果是"报错更晚更模糊"，仍安全。**需二选一：修 `precheck`，或澄清 SRS TR-2 的措辞 —— 不能悬着。** |
+| NFR-6 分支不可达 | `src/txn.rs:52-55` | `Version` 是 `semver::Version`，非法版本号不可表示，故该分支与 `precheck_rejects_unsafe_version` 均无保护。已裁决保留（见 R39），但需决定是否删除或改写测试。 |
+| 陈旧注释 | `src/pm.rs:404-406` | 仍是被实测推翻的旧推理（"目录不在 PATH 上所以返回 None"）；修正版在 brief 里。 |
+| `use` 注释措辞 | `src/txn.rs:11` | 仍写"下面三个"，实际只有两个被 gate；修正说明在其后 7 行。 |
+| 全仓 fmt / clippy 脏 | 多处 | `cargo fmt --check` 本就不干净；既有 clippy 警告 `model.rs:236`、`pm.rs:24`。**应作为独立任务** —— 它会同时改动多个任务的 verbatim 代码。 |
+| 重复断言 | `src/txn.rs:263` | `precheck_passes_for_valid_target` 与 `txn.rs:254` 同一断言，无独立信号。 |
+| 死代码 | `src/txn.rs:137, 160` | `let joined = …; let _ = joined;` 计算后从不使用。 |
+| `[profile.release]` 未编译 | `Cargo.toml` | `lto = true` 从未被编译过，首次打包时才验证。 |
+
+---
+
 ## Global Constraints
 
 以下约束适用于**每一个任务**，不再逐任务重复。数值均逐字取自 SRS。
