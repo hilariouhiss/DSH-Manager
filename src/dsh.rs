@@ -301,13 +301,18 @@ pub fn spawn_web(port: u16, tx: Sender<UiMsg>) -> Result<u32, String> {
     let h_out = spawn_reader(out, tx.clone());
     let h_err = spawn_reader(err, tx.clone());
 
-    // waiter 先 join 两个 reader 再 wait()：保证子进程退出时输出已被完整读取，
-    // 否则日志会截尾。
+    // waiter：**先 wait() 再 join** 两个 reader。
+    //
+    // 顺序理由：管道里已缓冲的字节在写端关闭后仍可读，而两个 reader 线程本来就
+    // 并发排空 —— 所以先 wait() 不会截尾日志。反之，若先 join 再 wait()，只要有孙
+    // 进程仍持有我们的 stdout/stderr 写句柄，reader 就永远读不到 EOF，wait() 便
+    // 永不执行：子进程不被回收、WebExited 永不发送，界面会一直停在"运行中"。
+    // 先 wait() 保证"回收 + 通知"一定发生，读者线程继续把日志排空。
     thread::spawn(move || {
-        let _ = h_out.join();
-        let _ = h_err.join();
         let code = child.wait().ok().and_then(|s| s.code());
         let _ = tx.send(UiMsg::WebExited { code });
+        let _ = h_out.join();
+        let _ = h_err.join();
     });
 
     Ok(pid)
@@ -362,18 +367,31 @@ pub fn stop_by_pid(pid: u32) -> Result<(), String> {
 }
 
 /// FR-20：在默认浏览器打开 URL。
-/// `start` 的第一个参数是窗口标题占位符，缺了它带引号的 URL 会被当成标题。
+///
+/// **不经 shell**：`cmd.exe /c start "" <url>` 会把 URL 交给 cmd 自己的解析器，
+/// 而 Rust 的参数编码**不会**转义 `& | ^ < > % !`（只对空格/制表/引号加引号）——
+/// 于是 `https://a/&calc.exe` 这类链接会被 cmd 拆成两条命令。这里的 URL 来自
+/// **网络**（release notes 里的链接），属信任边界，因此不能用 shell。
+/// `explorer.exe` + 单个参数没有 shell，也就没有可注入的解析层。
+///
+/// 协议白名单是必要的第二道：`explorer.exe` 对 `file:` 或裸可执行文件路径会
+/// **执行**它，而本程序只会打开 http/https。
 pub fn open_url(url: &str) -> Result<(), String> {
+    let lower = url.to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return Err(format!("拒绝打开非 http(s) 链接: {url}"));
+    }
+
     #[cfg(windows)]
     use std::os::windows::process::CommandExt;
 
-    let mut cmd = Command::new("cmd.exe");
-    cmd.args(["/c", "start", "", url])
+    let mut cmd = Command::new("explorer.exe"); // GC-7：全名；无 shell
+    cmd.arg(url)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     #[cfg(windows)]
-    cmd.creation_flags(pm::CREATE_NO_WINDOW);
+    cmd.creation_flags(pm::CREATE_NO_WINDOW); // GC-8
     cmd.spawn().map_err(|e| format!("打开浏览器失败: {e}"))?;
     Ok(())
 }
