@@ -151,7 +151,7 @@
 
 | 项 | 内容 |
 |---|---|
-| 改动 | `src/main.rs` 的 `spawn_worker`：worker 出队一个 `Job::FetchNotes` 时，用 `try_recv` 把**此刻已排队**的任务一次取空，交给纯函数 `model::coalesce_notes` 只保留**最后一个** `FetchNotes`，其余任务按原序放回队首逐个执行。保序保证（已写进 `coalesce_notes` 的文档与单测）：结果是原队列的**子序列** —— 除"已被更晚的同类请求取代"的 `FetchNotes` 外**一个任务都不丢**，相对顺序不变（存活的说明请求留在它原本的位置）。丢掉是安全的：`drain` 只采信**当前选中版本**的回复，被取代的请求即使回来也会被丢弃 —— 它们唯一的作用就是让 worker 再阻塞最长 15 秒并多烧一次 GitHub 配额。 |
+| 改动 | `src/main.rs` 的 `spawn_worker`：worker 出队一个 `Job::FetchNotes` 时，用 `try_recv` 把**此刻已排队**的任务一次取空，交给纯函数 `model::coalesce_notes` 只保留**最后一个** `FetchNotes`，其余任务按原序放回队首逐个执行。保序保证（已写进 `coalesce_notes` 的文档与单测）：结果是原队列的**子序列** —— 除"已被更晚的同类请求取代"的 `FetchNotes` 外**一个任务都不丢**，相对顺序不变（存活的说明请求就是**最后一次选择**那个，`coalesce_notes` 的"保留末位"因此要求交进去的批次按入队顺序＝旧→新排列：已出队的旧任务必须插到批次**队首**，`drained.push(job)` 会让最旧的那个占据末位）。丢掉是安全的：`drain` 只采信**当前选中版本**的回复，被取代的请求即使回来也会被丢弃 —— 它们唯一的作用就是让 worker 再阻塞最长 15 秒并多烧一次 GitHub 配额。 |
 | 实测（终修实测，A/B） | 判别依据是 **GitHub 自己的配额计数器**（未认证 60/小时，两个 `rate_limit` 探测之间的差值 − 1 = 应用真正发出的请求数），配合 6 次快速版本切换（UIA 聚焦下拉 + `SendKeys` 六次 `{DOWN}`，实测选中项确实移动了 6 步：`0.1.6-alpha.2 (alpha) ← 当前` → `0.1.3-alpha.2 (alpha)`）。**修复版**：60 → 58 ⇒ **应用只发了 1 个请求**（读回时说明区仍是 `更新说明 · 加载中…`，即那一个请求还在飞）。**对照版**（把合并块摘掉后另编的 `target/debug/dsh-manager-nofix.exe`，源码随即按 blob 哈希还原）：58 → 52 ⇒ **应用发了 5 个请求**。同一台机器、同一个夹具、同样的 6 次选择：**1 vs 5**。 |
 | 单测 | `model::tests::coalesce_notes_keeps_only_the_last_fetch`（3 个请求 → 只剩最后一个）、`coalesce_notes_preserves_every_other_job_in_order`（6 个任务 → 4 个，且结果是原队列的子序列）、`coalesce_notes_is_identity_without_fetch_notes`。 |
 

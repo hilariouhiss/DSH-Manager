@@ -304,20 +304,31 @@ pub fn is_node(pid: u32) -> bool {
 /// 泛型化是因为 `ChildStdout` 与 `ChildStderr` 是两个不同的类型 —— 它们都
 /// 实现了 `Read + Send + 'static`。
 ///
-/// ⚠ `filter_map(Result::ok)` 而**不是** `map_while(Result::ok)`（M-4）：后者在第一个
-/// 错误处就结束整个读取循环，于是一行非 UTF-8 字节（或任何一次瞬时读错误）会让
-/// **这个管道此后的全部日志消失** —— 对一个"日志面板是唯一出口"的 GUI 程序
-/// （GC-8：没有 stderr）等于静默失聪。`lines()` 在 `InvalidData` 后缓冲区已前移，
-/// 跳过坏行继续读是安全的；EOF 仍由 `read` 返回 0 长度表示，循环照常结束。
+/// ⚠ 坏行跳过，**其他错误一律结束**本管道的读取（M-4 的两半，缺一不可）：
+/// - `InvalidData`（一行里混了非 UTF-8 字节）只丢掉那一行：`lines()` 此时缓冲区已
+///   前移，继续读是安全的。这正是 `map_while(Result::ok)` 做不到的 —— 它会让一行
+///   坏字节导致**这个管道此后的全部日志消失**（GC-8：没有 stderr，日志面板是唯一
+///   出口，等于静默失聪）。
+/// - 其余读错误是**持久**的（管道已关 / 句柄失效……，每次都立即返回同一个错误），
+///   `filter_map(Result::ok)` 会把它们全吞掉、让循环空转 —— 所以这里仍然要退出循环。
+///   老代码里这层"任何错误即结束"的网是 `map_while` 顺带提供的，换成 filter_map 后
+///   必须显式写出来。
+/// EOF 仍由 `read` 返回 0 长度表示，循环照常结束。
 fn spawn_reader<R: Read + Send + 'static>(
     src: Option<R>,
     tx: Sender<UiMsg>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let Some(src) = src else { return };
-        for line in BufReader::new(src).lines().filter_map(Result::ok) {
-            if tx.send(UiMsg::Log(line)).is_err() {
-                break; // UI 侧已关闭
+        for line in BufReader::new(src).lines() {
+            match line {
+                Ok(line) => {
+                    if tx.send(UiMsg::Log(line)).is_err() {
+                        break; // UI 侧已关闭
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {}
+                Err(_) => break,
             }
         }
     })

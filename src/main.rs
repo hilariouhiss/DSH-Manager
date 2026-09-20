@@ -616,6 +616,14 @@ fn spawn_worker(rx: Receiver<Job>, tx: Sender<UiMsg>) {
             // 做法：把此刻已排队的任务一次取空（try_recv 非阻塞），交给纯函数合并 ——
             // 结果是原队列的子序列（非 notes 任务一个不丢、顺序不变，存活的说明请求
             // 留在原位），所以这里只是把合并后的批次按原序放回队首逐个执行。
+            //
+            // ⚠ 批次必须按**入队顺序（旧→新）**交给 `coalesce_notes`：它保留的是**末位**，
+            // 而"最新选择赢"要求末位正是最后那次选择。`job` 是这一批里**最早**出队的一个
+            // （`drained` 里全是它之后才入队的），所以只能插到队首 —— 写成
+            // `drained.push(job)` 会把最旧的那个顶到末位，于是活下来的说明请求属于
+            // **已被放弃**的版本；它的回复又因 `version != selected_version` 被丢弃，
+            // 而 `on_version_changed` 早已把面板重置成 Loading ⇒ 说明区永久停在"加载中"。
+            //
             // 出队时这个子队列本来就是空的，所以"没东西可合并"时直接执行当前任务，
             // 不绕一圈（否则 `pending` 会把同一个任务反复推回队首，空转）。
             if matches!(job, Job::FetchNotes { .. }) {
@@ -624,7 +632,7 @@ fn spawn_worker(rx: Receiver<Job>, tx: Sender<UiMsg>) {
                     drained.push(next);
                 }
                 if !drained.is_empty() {
-                    drained.push(job);
+                    drained.insert(0, job);
                     for j in model::coalesce_notes(drained).into_iter().rev() {
                         pending.push_front(j);
                     }
@@ -1053,6 +1061,10 @@ fn wire_callbacks(
                 return;
             }
             s.start_pending = true;
+            // ⚠ 必须一并置 dirty：这条路径**不发 Job**（`StartWeb` 要等 worker 腾出手，
+            // 积压时可达十几秒），而 tick 只在"排空到消息或 dirty"时投影 —— 不置 dirty
+            // 的话，`web-starting` 整整一个积压窗口都投影不出去，启动/安装按钮看起来仍可点。
+            s.dirty = true;
             let port = s.preferred_port;
             // ⚠ 端口必须与 `start_pending` 同时落账：退出路径要记的就是**这个**
             // 值，而不是退出那一刻的 `preferred_port`（Ruling 93）。
@@ -1147,6 +1159,7 @@ fn wire_callbacks(
                 return;
             }
             s.start_pending = true;
+            s.dirty = true; // 与窗口"启动"同理：不发 Job，不置 dirty 就投影不出 web-starting
             let port = s.preferred_port;
             // 与窗口"启动"同样要与 `start_pending` 同时落账（Ruling 93）。
             s.start_port = Some(port);
