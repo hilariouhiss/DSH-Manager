@@ -1599,7 +1599,10 @@ use crate::pm::CmdOut;
 use std::cell::RefCell;
 #[cfg(test)]
 use std::collections::HashMap;
-#[cfg(test)]
+// ⚠ `use crate::pm;` 【不能】加 #[cfg(test)] 门 ——
+// precheck 是生产代码，它调用 pm::same_dir（TR-3 的 PATH 检查）。
+// 早先把它 gate 掉会让 `cargo build` 直接 E0433（unresolved module）。
+// RefCell / HashMap 不同：它们确实只被 FakeBackend 使用，必须保留门。
 use crate::pm;
 
 pub trait Backend {
@@ -1787,7 +1790,8 @@ mod tests {
     #[test]
     fn precheck_rejects_pm_bin_not_on_path() {
         // TR-3：目标 PM 的 bin 不在 PATH 时【动手前拒绝】，零副作用
-        let b = FakeBackend::new();
+        // ⚠ 必须 `let mut b` —— bins 是普通 HashMap（不是 RefCell），就地插入需要可变绑定
+        let mut b = FakeBackend::new();
         b.bins.insert(Pm::Bun, PathBuf::from("C:/bun/bin"));
         // PATH 里没有 C:/bun/bin
         let t = Target { pm: Pm::Bun, version: v("0.1.6-alpha.2") };
@@ -1817,6 +1821,62 @@ mod tests {
         let b = FakeBackend::new();
         let t = Target { pm: Pm::Npm, version: v("0.1.6-alpha.2") };
         assert_eq!(precheck(&b, &t), None);
+    }
+
+    /// ★ 假 backend 的语义本身必须被钉住 —— 整张事务测试网都建在它上面。
+    ///
+    /// 实测依据（Task 8 实现者的变异测试）：把 `run` 里的安装副作用删掉
+    /// （即"安装返回成功但什么也没写" —— **正是本计划最初的那个 bug**），
+    /// Task 8 的其余 6 个测试**全部照样通过**。只有 Task 9 的
+    /// `cross_pm_migration_installs_then_uninstalls` 会变红。
+    ///
+    /// 这很危险：假 backend 若被后来者"简化"掉副作用，依赖它的**八个以上**
+    /// 事务测试会**集体变成空转**（`Committed` 这条成功路径更是永远走不到），
+    /// 而没有一个测试会报错。所以语义必须在这里直接断言，而不是靠下游间接覆盖。
+    #[test]
+    fn fake_backend_semantics_are_modeled() {
+        // 1) 安装成功 → 写入从包规格解析出的版本
+        let b = FakeBackend::new();
+        b.run(Pm::Pnpm, &Pm::Pnpm.install_args("9.9.9-tr4probe")).unwrap();
+        assert_eq!(
+            b.dsh_version_at(&PathBuf::from("C:/pnpm")),
+            Some(v("9.9.9-tr4probe")),
+            "安装成功后必须写入 installed —— 否则 S2 永远无法通过，Committed 路径不可测"
+        );
+
+        // 2) 卸载成功 → 清空
+        b.run(Pm::Pnpm, &Pm::Pnpm.uninstall_args()).unwrap();
+        assert_eq!(b.dsh_version_at(&PathBuf::from("C:/pnpm")), None, "卸载后必须清空");
+
+        // 3) install_noop：返回成功但什么也不写
+        let c = FakeBackend::new();
+        c.install_noop.borrow_mut().push(Pm::Pnpm);
+        let out = c.run(Pm::Pnpm, &Pm::Pnpm.install_args("9.9.9-tr4probe")).unwrap();
+        assert_eq!(out.code, 0, "install_noop 必须【成功】返回");
+        assert_eq!(c.dsh_version_at(&PathBuf::from("C:/pnpm")), None, "install_noop 不得写入");
+
+        // 4) fail_install：**Ok 但非零码**，且不写入。
+        //    注意是 Ok 不是 Err —— 这正是 TR-11 依赖的区分（命令跑起来了 vs 没跑起来）。
+        let d = FakeBackend::new();
+        d.fail_install.borrow_mut().push(Pm::Pnpm);
+        let out = d.run(Pm::Pnpm, &Pm::Pnpm.install_args("9.9.9-tr4probe")).unwrap();
+        assert_ne!(out.code, 0, "fail_install 必须以非零码返回");
+        assert_eq!(d.dsh_version_at(&PathBuf::from("C:/pnpm")), None, "失败不得写入");
+
+        // 5) path_override 只改 PATH 的答案，不影响目录读取 —— 这是 TR-4 唯一的判别构造
+        let e = FakeBackend::new();
+        *e.path_override.borrow_mut() = Some((Pm::Pnpm, v("9.9.9-tr4probe")));
+        assert_eq!(e.dsh_version_on_path(), Some((Pm::Pnpm, v("9.9.9-tr4probe"))));
+        assert_eq!(
+            e.dsh_version_at(&PathBuf::from("C:/pnpm")),
+            None,
+            "path_override 不得影响 dsh_version_at —— 否则 TR-4 的判别性就没了"
+        );
+
+        // 6) unavailable → Err（命令没跑起来），与"非零码"是两回事
+        let f = FakeBackend::new();
+        f.unavailable.borrow_mut().push(Pm::Pnpm);
+        assert!(f.run(Pm::Pnpm, &["--version".to_string()]).is_err(), "不可用必须是 Err");
     }
 }
 ```
@@ -1862,7 +1922,7 @@ pub fn precheck<B: Backend>(b: &B, target: &Target) -> Option<RejectReason> {
 - [ ] **Step 4: 运行测试，确认通过**
 
 Run: `cargo test txn`
-Expected: 6 passed
+Expected: **7 passed**
 
 - [ ] **Step 5: 提交**
 
