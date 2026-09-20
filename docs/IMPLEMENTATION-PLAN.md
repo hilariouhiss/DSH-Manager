@@ -1172,7 +1172,8 @@ git commit -m "feat(pm): 通道判定与通道内最新版（FR-7/FR-8）
 - [ ] **Step 2: 运行测试，确认失败**
 
 Run: `cargo test pm`
-Expected: 编译失败 —— `find_dsh_on_path` / `owner_of` / `same_dir` 未定义。
+Expected: 编译失败 —— `find_dsh_on_path` / `owner_of` 未定义。
+（**不会**出现 `same_dir`：没有任何测试直接调用它，它只被 `owner_of` 间接使用。）
 
 - [ ] **Step 3: 实现**
 
@@ -1231,8 +1232,10 @@ pub fn owner_of(shim: &Path, bins: &[PmInfo]) -> Option<Pm> {
 
 - [ ] **Step 4: 运行测试，确认通过**
 
-Run: `cargo test pm`
-Expected: 12 passed
+Run: `cargo test pm::tests`
+Expected: **12 passed**（Task 5 的 5 + 本任务的 7）。
+> ⚠ 不要用 `cargo test pm` 数个数 —— 子串过滤会连 `model::tests::pm_command_table_is_exact`
+> 一起匹配，显示 13。用 `pm::tests` 隔离本模块。
 
 - [ ] **Step 5: 提交**
 
