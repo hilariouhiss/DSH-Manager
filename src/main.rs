@@ -29,7 +29,7 @@ mod txn;
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
 use slint::{ComponentHandle, Model, ModelRc, Timer, TimerMode, VecModel};
@@ -55,6 +55,10 @@ struct AppState {
     /// dsh 的用户会在启动后的头几秒被明确告知"未检测到 dsh" —— 正是
     /// SRS:786 禁止的"未检测先下结论"。
     probed: bool,
+    /// §5.2 的"worker 已死"是否**已经报过**。见 `drain` 的 `Disconnected` 分支：
+    /// 该分支一旦可达就会每个 tick 重复进入，没有闩锁就会变成 12.5 Hz 的
+    /// 全量 `project()`（NFR-4 要求空闲接近零），并把之后的状态文案覆盖掉。
+    worker_dead: bool,
     catalog: Option<Catalog>,
     notes: NotesState,
     web: WebState,
@@ -86,6 +90,7 @@ impl AppState {
         Self {
             env: PmEnv::default(),
             probed: false,
+            worker_dead: false,
             catalog: None,
             notes: NotesState::default(),
             web: WebState::Stopped,
@@ -384,7 +389,19 @@ fn drain(rx: &Receiver<UiMsg>, state: &Rc<RefCell<AppState>>) -> bool {
             Err(mpsc::TryRecvError::Disconnected) => {
                 // §5.2：worker 已终止。必须明确告知，否则 UI 看起来正常
                 // 但所有操作都无响应 —— 这是最难排查的故障形态。
+                //
+                // ⚠ 闩锁（Ruling 77）：所有发送端都丢弃之后，`try_recv` **永远**
+                // 返回 Disconnected，所以本分支一旦可达就会**每个 tick** 重新进入。
+                // 返回 true 就是 12.5 Hz 的全量 `project()`（NFR-4 要求空闲时
+                // 接近零 CPU），还会把此后任何状态文案覆盖掉。只报一次。
+                //
+                // 没有这个闩锁，`drop(msg_tx)` 只是把"一条永不执行的安全网"
+                // 换成"一个每 80ms 烧一次 CPU 的循环"。
+                if state.borrow().worker_dead {
+                    break;
+                }
                 let mut s = state.borrow_mut();
+                s.worker_dead = true;
                 s.busy = false;
                 s.status = "后台工作线程已停止，请重启程序".into();
                 changed = true;
@@ -439,6 +456,207 @@ fn describe_outcome_log(o: &TxOutcome) -> Vec<String> {
     }
 }
 
+/// `txn::Backend` 的真实实现。单元测试用 `txn::FakeBackend`，
+/// 生产用这个 —— 这是全项目唯一使用 trait 的地方，理由见 ARCHITECTURE §4.2.2。
+struct SystemBackend;
+
+impl txn::Backend for SystemBackend {
+    fn run(&self, pm_kind: Pm, args: &[String]) -> Result<pm::CmdOut, String> {
+        pm::run_cmd(pm_kind.exe(), args)
+    }
+    fn bin_dir(&self, pm_kind: Pm) -> Result<std::path::PathBuf, String> {
+        pm::probe_pm(pm_kind)
+            .map(|i| i.bin_dir)
+            .ok_or_else(|| format!("{} 不可用", pm_kind.label()))
+    }
+    fn path_dirs(&self) -> Vec<std::path::PathBuf> {
+        pm::path_dirs()
+    }
+    /// TR-4：直接执行指定目录的 shim，**不走 PATH**。
+    fn dsh_version_at(&self, dir: &std::path::Path) -> Option<Version> {
+        pm::read_dsh_version_at(dir)
+    }
+    fn dsh_version_on_path(&self) -> Option<(Pm, Version)> {
+        pm::read_dsh_version_on_path()
+    }
+    fn log(&self, line: &str) {
+        // 事务引擎内的日志通过 UiMsg 走，这里不直接持有 Sender，
+        // 故由 execute() 在调用前后补充关键日志。
+        let _ = line;
+    }
+}
+
+/// 唯一的 worker 线程。**无状态** —— 它需要的一切都在 Job 载荷里。
+/// 串行执行天然满足 FR-15（禁止并发事务）。
+fn spawn_worker(rx: Receiver<Job>, tx: Sender<UiMsg>) {
+    std::thread::spawn(move || {
+        while let Ok(job) = rx.recv() {
+            execute(job, &tx);
+        }
+    });
+}
+
+fn execute(job: Job, tx: &Sender<UiMsg>) {
+    let send = |m: UiMsg| {
+        let _ = tx.send(m);
+    };
+    match job {
+        Job::Probe => match std::panic::catch_unwind(pm::probe_env) {
+            Ok(env) => send(UiMsg::Probed(env)),
+            Err(_) => send(UiMsg::Failed { context: "环境探测", message: "内部错误".into() }),
+        },
+
+        Job::FetchCatalog => match dsh::fetch_catalog() {
+            Ok(c) => send(UiMsg::Catalog(c)),
+            Err(e) => send(UiMsg::Failed { context: "版本列表拉取", message: e }),
+        },
+
+        Job::FetchNotes { version } => {
+            let result = dsh::fetch_notes(&version);
+            send(UiMsg::Notes { version, result });
+        }
+
+        Job::Transact { origin, target, port } => {
+            send(UiMsg::Log(format!(
+                "事务开始：{} {} → {} {}",
+                origin.pm.label(), origin.version,
+                target.pm.label(), target.version
+            )));
+
+            // TR-1 前置：dsh web 必须已停止（避开 Windows 文件锁）。
+            // 这一步放在事务引擎【之外】—— 停止可能需要与用户交互，
+            // 而事务引擎必须保持纯逻辑无 UI 依赖（ARCHITECTURE §4.2.5）。
+            let was_running = dsh::port_in_use(port);
+            if was_running {
+                send(UiMsg::Log("事务前停止 dsh web".into()));
+                match dsh::find_listener_pid(port) {
+                    Ok(pid) if dsh::is_node(pid) => {
+                        if let Err(e) = dsh::stop_by_pid(pid) {
+                            send(UiMsg::Failed { context: "停止 dsh web", message: e });
+                            return;
+                        }
+                        let _ = config::update(|f| f.running_port = None);
+
+                        // 等端口【真正释放】再开始事务 —— 停止只是发了 taskkill，
+                        // 进程退出、句柄释放、端口关闭都需要时间。抢跑会撞上
+                        // Windows 文件锁，正是 TR-1 要避开的东西。
+                        //
+                        // ⚠ 不能用 wait_port_ready —— 那个函数检测的是"端口变成
+                        // 被占用"，方向正好相反（它内部 alive 回调的语义也不同）。
+                        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                        while dsh::port_in_use(port) && std::time::Instant::now() < deadline {
+                            std::thread::sleep(Duration::from_millis(200));
+                        }
+                        if dsh::port_in_use(port) {
+                            send(UiMsg::Failed {
+                                context: "停止 dsh web",
+                                message: format!("端口 {port} 在 10 秒内未释放，已放弃本次变更"),
+                            });
+                            return;
+                        }
+                    }
+                    Ok(_) => {
+                        send(UiMsg::Failed {
+                            context: "停止 dsh web",
+                            message: format!("端口 {port} 被非 node 进程占用，拒绝操作"),
+                        });
+                        return;
+                    }
+                    Err(e) => {
+                        send(UiMsg::Failed { context: "定位 dsh web", message: e });
+                        return;
+                    }
+                }
+            }
+
+            send(UiMsg::TxProgress(TxStep::S1Install));
+            let outcome = txn::run(&SystemBackend, origin, target);
+            send(UiMsg::TxDone(outcome));
+
+            // TR-7：事务后重新探测（owner PM 可能已改变）
+            send(UiMsg::Log("事务结束，重新探测环境".into()));
+            if let Ok(env) = std::panic::catch_unwind(pm::probe_env) {
+                send(UiMsg::Probed(env));
+            }
+
+            // 事务前在运行 → 重新启动
+            if was_running {
+                send(UiMsg::Log("事务前 dsh web 在运行，重新启动".into()));
+                start_web(port, tx);
+            }
+        }
+
+        Job::StartWeb { port } => start_web(port, tx),
+
+        Job::StopWeb { pid } => {
+            match dsh::stop_by_pid(pid) {
+                Ok(()) => {
+                    // FR-31：停止后清除运行态端口。全部停止路径都汇聚到这里。
+                    let _ = config::update(|f| f.running_port = None);
+                    send(UiMsg::WebState(WebState::Stopped));
+                }
+                Err(e) => send(UiMsg::Failed { context: "停止 dsh web", message: e }),
+            }
+        }
+
+        Job::OpenUrl { url } => {
+            if let Err(e) = dsh::open_url(&url) {
+                send(UiMsg::Failed { context: "打开网页", message: e });
+            }
+        }
+    }
+}
+
+/// FR-16 / FR-17。启动流程抽成函数，供 StartWeb 与事务后重启复用。
+fn start_web(port: u16, tx: &Sender<UiMsg>) {
+    let send = |m: UiMsg| {
+        let _ = tx.send(m);
+    };
+    send(UiMsg::WebState(WebState::Starting { port }));
+
+    // FR-17：启动前端口探测
+    if dsh::port_in_use(port) {
+        match dsh::find_listener_pid(port) {
+            Ok(pid) if dsh::is_node(pid) => {
+                // 是 dsh web，但不是我们启的
+                send(UiMsg::Log(format!("端口 {port} 已被外部 dsh web 占用（pid {pid}）")));
+                let _ = config::update(|f| f.running_port = Some(port));
+                send(UiMsg::WebState(WebState::External { port }));
+            }
+            Ok(pid) => {
+                send(UiMsg::Failed {
+                    context: "启动 dsh web",
+                    message: format!("端口 {port} 被非 node 进程占用（pid {pid}）"),
+                });
+                send(UiMsg::WebState(WebState::Failed { reason: "端口被占用".into() }));
+            }
+            Err(e) => {
+                send(UiMsg::Failed { context: "启动 dsh web", message: e });
+                send(UiMsg::WebState(WebState::Stopped));
+            }
+        }
+        return;
+    }
+
+    match dsh::spawn_web(port, tx.clone()) {
+        Ok(pid) => {
+            // 就绪确认后才写运行态端口（FR-31）
+            if dsh::wait_port_ready(port, || true, Duration::from_secs(20)) {
+                let _ = config::update(|f| f.running_port = Some(port));
+                send(UiMsg::WebState(WebState::Running { port, pid }));
+                send(UiMsg::Log(format!("dsh web 已就绪：http://127.0.0.1:{port}")));
+            } else {
+                send(UiMsg::WebState(WebState::Failed { reason: "启动超时".into() }));
+                let _ = dsh::stop_by_pid(pid);
+            }
+        }
+        Err(e) => {
+            send(UiMsg::Failed { context: "启动 dsh web", message: e });
+            send(UiMsg::WebState(WebState::Failed { reason: "启动失败".into() }));
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // §3.8 / FR-30：启动时读取持久化的偏好端口
     //
@@ -475,8 +693,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 未探测完时 project() 必定渲染"检测中…"，探测完成后才可能出现结论。
     project(&state.borrow(), &win, &tray);
 
-    let (_job_tx, _job_rx) = mpsc::channel::<Job>(); // Task 18 接上
-    let (_msg_tx, msg_rx) = mpsc::channel::<UiMsg>(); // Task 18 接上
+    let (job_tx, job_rx) = mpsc::channel::<Job>();
+    let (msg_tx, msg_rx) = mpsc::channel::<UiMsg>();
+    spawn_worker(job_rx, msg_tx.clone());
 
     // 决策 3：80ms Timer 排空。实测 timer 精度 ±1.2ms，未被节流。
     // ⚠ GC-15：timer 必须存活到事件循环结束，且其捕获的 Rc 永不离开 UI 线程。
@@ -493,6 +712,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
+
+    // 启动时的初始任务（Q-3：每次启动查询一次更新，不做后台轮询）
+    let _ = job_tx.send(Job::Probe);
+    let _ = job_tx.send(Job::FetchCatalog);
+
+    // FR-31：若上次有未清除的运行态端口，探测它 —— 这正是 FR-22 的
+    // 孤儿恢复机制入口。若无占用则视为过期，静默清除。
+    //
+    // ⚠ **不要**加 "仅当 rp != preferred_port 才探测" 之类的守卫。
+    // 那个方向是反的：用户通常**不会**改端口，所以孤儿最常出现在
+    // **偏好端口**上；而启动时没有任何其他路径探测该端口
+    // （`Job::Probe` 只做 PM 探测，不碰 web 端口）。加了守卫就变成
+    // "只在少见情况下能发现孤儿" —— 恰恰与 FR-22 的意图相反。
+    if let config::Loaded::Ok(s) = config::load() {
+        if let Some(rp) = s.running_port {
+            push_log(&state.borrow(), format!("上次的运行端口为 {rp}，探测中…"));
+            let tx = msg_tx.clone();
+            std::thread::spawn(move || {
+                if dsh::port_in_use(rp) {
+                    if let Ok(pid) = dsh::find_listener_pid(rp) {
+                        if dsh::is_node(pid) {
+                            let _ = tx.send(UiMsg::Log(
+                                format!("检测到外部 dsh web 运行在端口 {rp}（pid {pid}）"),
+                            ));
+                            let _ = tx.send(UiMsg::WebState(WebState::External { port: rp }));
+                            return;
+                        }
+                    }
+                }
+                // 过期：清除并回落到偏好端口
+                let _ = config::update(|f| f.running_port = None);
+                let _ = tx.send(UiMsg::Log("上次的运行端口已空闲，状态已清除".into()));
+            });
+        }
+    }
+
+    // ⚠ Ruling 77：这个发送端必须在这里丢弃。
+    //
+    // `try_recv` 只有在**所有**发送端都丢弃之后才返回 `Disconnected`。`msg_tx`
+    // 若活到 `main` 结束，`drain` 里那个"worker 已死"的分支（§5.2 的崩溃检测）
+    // 就**永远不可达** —— 一条只在提交信息里存在的安全网。
+    //
+    // 位置是刻意的：必须在上面那段孤儿探测【之后】—— 那段自己 clone 了一个
+    // 发送端（此刻它还活着，正在后台探测）；此处之后 main 只发 `Job`，不再需要它。
+    // 配套的 `worker_dead` 闩锁在 `AppState` 里，否则这条分支一旦可达就会
+    // 每个 tick 重复触发。
+    drop(msg_tx);
 
     // ⚠ 简报漏了这一行（Task 16 的临时 main 里有，Task 17/19 的简报里都没有）。
     // `slint::run_event_loop_until_quit()` **不会** show 任何窗口 —— 只有
