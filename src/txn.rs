@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use crate::model::*;
 use crate::pm::CmdOut;
 
-// ⚠ 下面三个只被 `#[cfg(test)]` 的 FakeBackend 使用。不加 gate 的话，
+// ⚠ 下面【两个】只被 `#[cfg(test)]` 的 FakeBackend 使用。不加 gate 的话，
 // `cargo build`（非 test 构建）会因它们未被引用而报 unused_imports ——
 // 那是独立 lint，`allow(dead_code)` 不覆盖它。
 #[cfg(test)]
@@ -134,7 +134,6 @@ impl Backend for FakeBackend {
             return Err(format!("{pm:?} 不可用"));
         }
 
-        let joined = args.join(" ");
         let is_install = args.iter().any(|a| a == "install" || a == "add");
         let is_uninstall = args.iter().any(|a| a == "uninstall" || a == "remove");
 
@@ -157,7 +156,6 @@ impl Backend for FakeBackend {
             self.installed.borrow_mut().insert(pm, None);
         }
 
-        let _ = joined;
         Ok(CmdOut { code: 0, stdout: String::new(), stderr: String::new() })
     }
     fn bin_dir(&self, pm: Pm) -> Result<PathBuf, String> {

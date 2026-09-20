@@ -1,5 +1,8 @@
 //! 版本拉取、更新说明与 `dsh web` 进程监督。
 
+// ⚠ 只有 `parse_catalog` 里那段被 `#[cfg(test)]` 门住的 dist-tags 解析用它
+// （见那里的说明）—— 不加门的话 `cargo build` 会报 unused_imports。
+#[cfg(test)]
 use std::collections::BTreeMap;
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
@@ -51,7 +54,13 @@ pub fn parse_catalog(body: &str) -> Result<Catalog, String> {
         }
     }
 
+    // dist-tags：**只有测试读它** —— 生产代码刻意不读（GC-14：绝不拿 registry 的
+    // tag 当"最新版本"，FR-8 要的是通道内最新）。唯一消费者是下面的 GC-14 回归，
+    // 它需要真实的 tag 数据才能证明"标签在场也不会被采用"。因此整段解析与
+    // `Catalog::tags` 字段一起加了 `#[cfg(test)]` 门；去掉门就是死代码。
+    #[cfg(test)]
     let mut tags: BTreeMap<String, Version> = BTreeMap::new();
+    #[cfg(test)]
     if let Some(obj) = v.get("dist-tags").and_then(|x| x.as_object()) {
         for (key, val) in obj {
             if let Some(s) = val.as_str() {
@@ -62,7 +71,11 @@ pub fn parse_catalog(body: &str) -> Result<Catalog, String> {
         }
     }
 
-    Ok(Catalog { versions: pm::sorted_desc(versions), tags })
+    Ok(Catalog {
+        versions: pm::sorted_desc(versions),
+        #[cfg(test)]
+        tags,
+    })
 }
 
 /// FR-6。精简 packument 请求头可显著减小响应体积 —— 本需求只需要
@@ -411,13 +424,15 @@ pub fn stop_by_pid(pid: u32) -> Result<(), String> {
 /// FR-20：在默认浏览器打开 URL。
 ///
 /// **不经 shell**：`cmd.exe /c start "" <url>` 会把 URL 交给 cmd 自己的解析器，
-/// 而 Rust 的参数编码**不会**转义 `& | ^ < > % !`（只对空格/制表/引号加引号）——
+/// 而 Rust 的参数编码**不会**转义 `& | ^ < > % !` —— 它只在参数含空格、制表符或
+/// 为空时才加引号（引号本身触发的是反斜杠转义，不是加引号）——
 /// 于是 `https://a/&calc.exe` 这类链接会被 cmd 拆成两条命令。这里的 URL 来自
 /// **网络**（release notes 里的链接），属信任边界，因此不能用 shell。
 /// `explorer.exe` + 单个参数没有 shell，也就没有可注入的解析层。
 ///
-/// 协议白名单是必要的第二道：`explorer.exe` 对 `file:` 或裸可执行文件路径会
-/// **执行**它，而本程序只会打开 http/https。
+/// 协议白名单是**防御性**的第二道：本程序只打开 http/https，其它 scheme
+/// （`file:`、裸可执行文件路径等）一律在 spawn 之前就拒绝 —— 不给
+/// `explorer.exe` 任何机会去解释一个非 Web 的目标。
 pub fn open_url(url: &str) -> Result<(), String> {
     let lower = url.to_ascii_lowercase();
     if !(lower.starts_with("http://") || lower.starts_with("https://")) {

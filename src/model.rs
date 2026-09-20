@@ -4,6 +4,9 @@
 //! 命令表（impl Pm）也放在这里：它是纯常量映射，无 I/O。若放到 pm.rs，
 //! model.rs 就会为 Pm 类型反向依赖 pm.rs，破坏叶子性质。
 
+// ⚠ 只有 `Catalog::tags` 用它，而那个字段只在测试构建里存在（理由见 `Catalog`）——
+// 不加门的话 `cargo build` 会报 unused_imports（那是独立 lint）。
+#[cfg(test)]
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -87,7 +90,6 @@ pub enum Channel {
 #[derive(Clone, Debug)]
 pub struct PmInfo {
     pub kind: Pm,
-    pub version: String,
     pub bin_dir: PathBuf,
 }
 
@@ -102,6 +104,15 @@ pub struct PmEnv {
 #[derive(Clone, Debug, Default)]
 pub struct Catalog {
     pub versions: Vec<Version>,
+    /// dist-tags（`latest` / `next` / `alpha`）。
+    ///
+    /// ⚠ **只在测试构建里存在**，这不是笔误：生产代码**刻意不读**它 ——
+    /// GC-14 的全部意义就是"绝不拿 registry 的 tag 当最新版本"
+    /// （`AppState::newest_in_channel` 只从 `versions` 里取通道内最新）。
+    /// 唯一消费者是 dsh.rs 的 GC-14 回归测试：它需要**真实的** tag 数据才能
+    /// 证明"标签在场也不会被采用"。因此字段与它的解析都加了 `#[cfg(test)]` ——
+    /// 去掉门就是死代码，而加回 `allow(dead_code)` 会把真实死代码一起盖住。
+    #[cfg(test)]
     pub tags: BTreeMap<String, Version>,
 }
 
@@ -117,41 +128,48 @@ pub struct Target {
     pub version: Version,
 }
 
+/// 事务步骤。
+///
+/// ⚠ 这里【只有主流程】的四个步骤（Ruling 53）。早先还有 `Precheck` 与四个补偿
+/// 步骤（`C1Probe` / `C2Restore` / `C2Cleanup` / `C3Confirm`），它们全仓**零构造点**：
+/// - `Degraded.failed` / `RolledBack.failed` 在 UI 里渲染成「在「X」阶段失败」，
+///   语义是**主流程**在哪一步失败（补偿失败的原因由 `reason` 承载）。
+///   把补偿步骤塞进 `failed` 会显示成"降级：在「确认已恢复」阶段失败"，语义错位。
+/// - 补偿进度**结构上无法上报**：`UiMsg::TxProgress` 只能由 `main.rs` 发送，
+///   而 `main.rs` 看不到 `compensate` 内部。
+/// 为骗过 lint 而补构造点是本末倒置，所以删除。
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum TxStep {
-    Precheck,
     S1Install,
     S2Verify,
     S3Uninstall,
     S4VerifyFinal,
-    C1Probe,
-    C2Restore,
-    C2Cleanup,
-    C3Confirm,
 }
 
 impl TxStep {
     pub fn label(self) -> &'static str {
         match self {
-            TxStep::Precheck => "前置检查",
             TxStep::S1Install => "安装新版本",
             TxStep::S2Verify => "验证新安装",
             TxStep::S3Uninstall => "卸载旧版本",
             TxStep::S4VerifyFinal => "最终验证",
-            TxStep::C1Probe => "探测原状态",
-            TxStep::C2Restore => "恢复原版本",
-            TxStep::C2Cleanup => "清理残留",
-            TxStep::C3Confirm => "确认已恢复",
         }
     }
 }
 
+/// 前置检查的拒绝原因。
+///
+/// ⚠ 没有 `NoOriginInstalled` 变体（Task 20 删除）：那一条从**未被构造过** ——
+/// "未检测到已安装的 dsh"在 UI 层就被拦下了（`on_install_clicked` 拿不到
+/// `owner`/`installed` 时直接写状态并返回，不派发 `Job::Transact`），
+/// 事务引擎根本走不到那里。留一个永不构造的变体只会让匹配臂看起来像在兜底。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RejectReason {
     PmUnavailable(Pm),
     BinNotOnPath { pm: Pm, dir: PathBuf },
+    /// NFR-6 的具名实现。`precheck` 里**有**构造点（只是运行期不可达）——
+    /// 按已记录在案的裁决（Ruling 39）保留，与那批零构造点的变体不同。
     InvalidVersion(String),
-    NoOriginInstalled,
 }
 
 #[derive(Clone, Debug)]
@@ -172,7 +190,12 @@ pub enum WebState {
     Starting { port: u16, pid: u32 },
     Running { port: u16, pid: u32 },
     External { port: u16 },
-    Failed { reason: String },
+    /// 启动失败（端口被非 node 进程占用 / 启动超时 / spawn 失败）。
+    ///
+    /// ⚠ 曾是 `Failed { reason: String }`，那个字段**从未被读过**（Task 20 删除）：
+    /// 三个构造点旁边都另发了一条更具体的 `UiMsg::Failed`，界面渲染的是那一条
+    /// （状态栏 + 日志面板），这里的信息只是重复。`app.slint` 也没有承载它的属性。
+    Failed,
 }
 
 impl WebState {

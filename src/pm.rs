@@ -143,6 +143,10 @@ pub fn path_dirs() -> Vec<PathBuf> {
 }
 
 /// FR-1 + FR-2：探测单个 PM。未安装返回 None。
+///
+/// ⚠ `--version` 这一跑**不是为了版本号** —— `PmInfo` 里已经没有 `version` 字段了
+/// （Task 20 删除：全仓零读取）。它在这里的作用是 TR-2 的可用性判据：
+/// 命令跑不起来或退出码非零，即视为该 PM 不可用。
 pub fn probe_pm(pm: Pm) -> Option<PmInfo> {
     let ver = run_cmd(pm.exe(), &["--version".to_string()]).ok()?;
     if ver.code != 0 {
@@ -156,11 +160,7 @@ pub fn probe_pm(pm: Pm) -> Option<PmInfo> {
     if dir.code != 0 {
         return None;
     }
-    Some(PmInfo {
-        kind: pm,
-        version: ver.stdout.trim().to_string(),
-        bin_dir: PathBuf::from(dir.stdout.trim()),
-    })
+    Some(PmInfo { kind: pm, bin_dir: PathBuf::from(dir.stdout.trim()) })
 }
 
 /// FR-4 + TR-4：直接执行**指定目录下**的 dsh shim 读版本，**不经 PATH**。
@@ -303,8 +303,8 @@ mod tests {
     #[test]
     fn owner_of_matches_by_parent_directory() {
         let bins = vec![
-            PmInfo { kind: Pm::Npm, version: "1".into(), bin_dir: p("C:/Users/x/AppData/Roaming/npm") },
-            PmInfo { kind: Pm::Pnpm, version: "1".into(), bin_dir: p("C:/Users/x/AppData/Local/pnpm/bin") },
+            PmInfo { kind: Pm::Npm, bin_dir: p("C:/Users/x/AppData/Roaming/npm") },
+            PmInfo { kind: Pm::Pnpm, bin_dir: p("C:/Users/x/AppData/Local/pnpm/bin") },
         ];
         assert_eq!(
             owner_of(&p("C:/Users/x/AppData/Roaming/npm/dsh.cmd"), &bins),
@@ -321,7 +321,6 @@ mod tests {
         // Windows 路径大小写不敏感，必须归一化比较
         let bins = vec![PmInfo {
             kind: Pm::Npm,
-            version: "1".into(),
             bin_dir: p("C:/Users/X/AppData/Roaming/NPM"),
         }];
         assert_eq!(
@@ -334,7 +333,6 @@ mod tests {
     fn owner_of_tolerates_trailing_separator() {
         let bins = vec![PmInfo {
             kind: Pm::Npm,
-            version: "1".into(),
             bin_dir: p("C:/npm/"),
         }];
         assert_eq!(owner_of(&p("C:/npm/dsh.cmd"), &bins), Some(Pm::Npm));
@@ -342,7 +340,7 @@ mod tests {
 
     #[test]
     fn owner_of_returns_none_for_unknown_location() {
-        let bins = vec![PmInfo { kind: Pm::Npm, version: "1".into(), bin_dir: p("C:/npm") }];
+        let bins = vec![PmInfo { kind: Pm::Npm, bin_dir: p("C:/npm") }];
         assert_eq!(owner_of(&p("D:/elsewhere/dsh.cmd"), &bins), None);
     }
 
@@ -401,9 +399,16 @@ mod tests {
     /// 命令根本没跑 —— 所以一个"经 PATH 解析"的错误实现照样能通过它（只要 PATH
     /// 上没有 dsh）。它断言的内容没错，但**测不到 TR-4**。
     ///
-    /// 本测试在临时目录里放一个真实可执行的 `dsh.cmd`，且该目录**不在 PATH 上**：
-    /// - 正确实现（执行该目录下的 shim）→ 拿到版本 ✓
-    /// - 错误实现（走 PATH 解析）→ 该目录不在 PATH，返回 None ✗
+    /// 本测试在临时目录里放一个真实可执行的 `dsh.cmd`（内容是 `@echo 9.9.9-tr4probe`）：
+    /// - 正确实现（执行该目录下的 shim）→ 拿到 `9.9.9-tr4probe` ✓
+    /// - 错误实现（忽略 `dir`、走 PATH 解析）→ 拿到 **PATH 上那份真实 dsh 的版本**
+    ///   （本机实测为 `0.1.6-alpha.2`）✗
+    ///
+    /// ⚠ 判别依据是**版本值**，不是"返回 None"。早先这里写的是"该目录不在 PATH，
+    /// 所以错误实现返回 None" —— 那是**实测证伪的**：本机 dsh 确实在 PATH 上，
+    /// 一个走 PATH 的实现会正常返回 `0.1.6-alpha.2`，断言同样失败，但失败方式不同。
+    /// 真正让本测试有牙齿的是夹具里的 `9.9.9-tr4probe` 这个不可能撞上的版本号 ——
+    /// 它让"读了哪个目录"变成可观测的差别。断言消息里两种失败都已点明。
     ///
     /// 顺带覆盖 `.cmd` shim 的真实 spawn 路径 —— 既有的 run_cmd 测试用的都是 cmd.exe。
     #[test]

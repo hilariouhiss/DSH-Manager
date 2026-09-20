@@ -3,24 +3,6 @@
 // 测试输出。Task 2 的 Step 2 会验证这个写法确实让 `cargo test` 有输出。
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
-// ⚠ 临时（Task 2 ~ Task 16 期间存在）
-//
-// 各模块按依赖顺序逐步落地，先定义的类型/函数要到很晚才被消费。
-// 在【二进制 crate】中未使用的 pub 项会触发 dead_code 警告 ——
-// 实测确认：bin crate 不会因为是 pub 就豁免这个 lint。
-//
-// 受影响的不止 model.rs：pm.rs 的 sorted_desc 要到 Task 11 才被消费、
-// probe_env 要到 Task 18；dsh.rs 的 fetch_catalog 要到 Task 18；
-// txn.rs 的 run 要到 Task 18。因此抑制必须是 crate 级的 ——
-// 单独给 `mod model;` 加属性解决不了其余模块。
-//
-// 若不抑制，Task 2~16 的构建输出会持续带着十几个无关警告 ——
-// 既让"输出必须干净"的检查失效，也会掩盖真实警告。
-//
-// 【Task 20 必须删除本行，并确认 cargo build 与 cargo test 都零警告】
-// 本行会掩盖真实死代码（它覆盖面很宽），只应短期存在。
-#![allow(dead_code)]
-
 mod config;
 mod dsh;
 mod model;
@@ -74,9 +56,17 @@ struct AppState {
     /// `StartWeb` 之后；届时第一份已占住端口，第二次的预检便把**我们自己的**实例
     /// 判成"外部 dsh web" → `web_pid` 被清空 → 退出不再停止我们自己启动的子进程
     /// （FR-21），且该进程死掉时状态会卡在 `External`。这个标志把窗口关掉：
-    /// 接受时置真，`drain` 每见到一条 `WebState`/`Failed`（worker 每次启动必有其一）
-    /// 就清掉。
+    /// 接受时置真，直到 worker 回报**这次启动**的结果才清掉（见 `drain`：
+    /// 任一 `WebState`，或语境为启动的 `Failed`）。
     start_pending: bool,
+    /// 被接受的那次启动所用的端口（与 `start_pending` 同生共死）。
+    ///
+    /// ⚠ 必须在**接受启动时**记下来，不能等退出时再读 `preferred_port`：
+    /// 队列可能积压好几秒（端口预检 = 300ms 连接 + 一次 netstat，worker 忙时更久），
+    /// 用户完全来得及在这期间改端口输入框。退出时读到的是**新**端口，而 worker
+    /// 真正 spawn 的是**旧**端口上的子进程 —— 记错端口等于没记，孤儿依旧失联
+    /// （FR-22 / FR-31 同时失效）。评审轮 5 的 Ruling 93。
+    start_port: Option<u16>,
     catalog: Option<Catalog>,
     notes: NotesState,
     web: WebState,
@@ -111,6 +101,7 @@ impl AppState {
             worker_dead: false,
             dirty: false,
             start_pending: false,
+            start_port: None,
             catalog: None,
             notes: NotesState::default(),
             web: WebState::Stopped,
@@ -415,7 +406,9 @@ fn drain(rx: &Receiver<UiMsg>, state: &Rc<RefCell<AppState>>) -> bool {
                         };
                         // worker 对每次启动都必回一条 WebState —— 收到它就说明
                         // `start_pending` 这一段已经走完，守卫恢复看状态。
+                        // `start_port` 与它同生共死（见字段说明）。
                         s.start_pending = false;
+                        s.start_port = None;
                         s.web = ws;
                     }
                     UiMsg::WebExited { pid, code } => {
@@ -440,8 +433,22 @@ fn drain(rx: &Receiver<UiMsg>, state: &Rc<RefCell<AppState>>) -> bool {
                         if context == "环境探测" {
                             s.probed = true;
                         }
-                        // 启动失败也是 worker 对一次启动的回报，窗口到此结束。
-                        s.start_pending = false;
+                        // ⚠ Ruling 93：**只有启动语境**的 `Failed` 才算这次启动结束。
+                        //
+                        // `Failed` 还承载版本列表拉取 / 环境探测 / 停止 web / 打开网页
+                        // 等**与启动无关**的失败。原先无条件清除 `start_pending`，
+                        // 于是：刷新 → 启动（排队）→ 版本列表拉取失败 → 守卫提前打开，
+                        // 而队列里的 `StartWeb` 还在；第二次点"启动"被接受并排在它后面，
+                        // 第一份已占住端口 → 第二份把我们**自己**的实例判成外部
+                        // → `web_pid` 被清空 → 退出不再停自己的子进程（FR-21）。
+                        //
+                        // "任务执行" 也必须算：`start_web` 内部 panic 时 worker 外层
+                        // 守卫发的是它，而那条路径**不会**产生任何 WebState ——
+                        // 不认它就永远卡在 start_pending，启动按钮直到重启都点不动。
+                        if context == "启动 dsh web" || context == "任务执行" {
+                            s.start_pending = false;
+                            s.start_port = None;
+                        }
                         s.busy = false;
                         s.busy_label.clear();
                         s.status = format!("{context}失败");
@@ -496,7 +503,6 @@ fn describe_reject(r: &RejectReason) -> String {
             dir.display()
         ),
         RejectReason::InvalidVersion(v) => format!("版本号非法：{v}"),
-        RejectReason::NoOriginInstalled => "未检测到已安装的 dsh".into(),
     }
 }
 
@@ -782,7 +788,7 @@ fn start_web(port: u16, tx: &Sender<UiMsg>) {
                     context: "启动 dsh web",
                     message: format!("端口 {port} 被非 node 进程占用（pid {pid}）"),
                 });
-                send(UiMsg::WebState(WebState::Failed { reason: "端口被占用".into() }));
+                send(UiMsg::WebState(WebState::Failed));
             }
             Err(e) => {
                 send(UiMsg::Failed { context: "启动 dsh web", message: e });
@@ -807,13 +813,13 @@ fn start_web(port: u16, tx: &Sender<UiMsg>) {
                 send(UiMsg::Log(format!("dsh web 已就绪：http://127.0.0.1:{port}")));
             } else {
                 // ⚠ 光发 WebState::Failed 是**看不见的**：界面只把 web-running 渲染成
-                // "已停止"，reason 没有任何属性承载 —— 于是用户等了整整 20 秒却什么
-                // 提示都没有。补一条 UiMsg::Failed，让它落到状态栏与日志面板。
+                // "已停止"，这个变体也没有任何字段可承载原因 —— 于是用户等了整整
+                // 20 秒却什么提示都没有。补一条 UiMsg::Failed，让它落到状态栏与日志面板。
                 send(UiMsg::Failed {
                     context: "启动 dsh web",
                     message: "启动超时：端口未在 20 秒内就绪".into(),
                 });
-                send(UiMsg::WebState(WebState::Failed { reason: "启动超时".into() }));
+                send(UiMsg::WebState(WebState::Failed));
                 // ⚠ 半启动的子进程若**杀不掉**，而 `running_port` 又只在就绪后才写，
                 // 这个进程就成了谁都找不回的孤儿 —— 下次启动的孤儿探测没有记录可查
                 // （FR-22/FR-31 同时失效）。所以失败时补记端口：探测按端口进行，
@@ -828,7 +834,7 @@ fn start_web(port: u16, tx: &Sender<UiMsg>) {
         }
         Err(e) => {
             send(UiMsg::Failed { context: "启动 dsh web", message: e });
-            send(UiMsg::WebState(WebState::Failed { reason: "启动失败".into() }));
+            send(UiMsg::WebState(WebState::Failed));
         }
     }
 }
@@ -967,7 +973,7 @@ fn wire_callbacks(
             //  - 状态检查：已在启动/运行中时拒绝。`is_running()` 只认 Running/External，
             //    所以 Starting 期间 web-running 仍是 false，而这里也不设 busy ——
             //    "启动"按钮在整个就绪窗口（正常约 2 秒，超时路径最长 20 秒）里都可点。
-            if s.start_pending || !matches!(s.web, WebState::Stopped | WebState::Failed { .. }) {
+            if s.start_pending || !matches!(s.web, WebState::Stopped | WebState::Failed) {
                 s.status = "已在启动或运行中，忽略重复的启动请求".into();
                 s.dirty = true; // 状态栏也要看得见，不能只进日志
                 push_log(&s, "dsh web 已在启动或运行中，忽略重复的启动请求");
@@ -975,6 +981,9 @@ fn wire_callbacks(
             }
             s.start_pending = true;
             let port = s.preferred_port;
+            // ⚠ 端口必须与 `start_pending` 同时落账：退出路径要记的就是**这个**
+            // 值，而不是退出那一刻的 `preferred_port`（Ruling 93）。
+            s.start_port = Some(port);
             drop(s);
             send(Job::StartWeb { port });
         });
@@ -1058,7 +1067,7 @@ fn wire_callbacks(
             // （菜单的 enabled 绑定只看 web-running/busy，二者此时都为假），
             // 所以这里同样必须挡住重复启动，否则绕开窗口按钮就能造出第二个子进程。
             // `start_pending` 的理由见 `on_start_web`。
-            if s.start_pending || !matches!(s.web, WebState::Stopped | WebState::Failed { .. }) {
+            if s.start_pending || !matches!(s.web, WebState::Stopped | WebState::Failed) {
                 s.status = "已在启动或运行中，忽略重复的启动请求".into();
                 s.dirty = true;
                 push_log(&s, "dsh web 已在启动或运行中，忽略重复的启动请求");
@@ -1066,6 +1075,8 @@ fn wire_callbacks(
             }
             s.start_pending = true;
             let port = s.preferred_port;
+            // 与窗口"启动"同样要与 `start_pending` 同时落账（Ruling 93）。
+            s.start_port = Some(port);
             drop(s);
             send(Job::StartWeb { port });
         });
@@ -1257,8 +1268,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Rc::new(move || {
             let s = state.borrow();
             let pid = s.web_pid;
-            let pending = s.start_pending;
-            let port = s.preferred_port;
+            // ⚠ Ruling 93：读的是**接受启动时**记下的端口，不是此刻的 `preferred_port`。
+            // 排队期间用户改了端口输入框的话，后者指向一个 worker 根本不会用的端口 ——
+            // 记录就白记了，真正被 spawn 的实例依旧失联（FR-31 的全部意义）。
+            let pending_port = s.start_port;
             drop(s);
             if let Some(pid) = pid {
                 // ⚠ 只有**确知已停**才清 running_port（评审轮 1）。无条件清除的话，
@@ -1280,12 +1293,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ),
                     ),
                 }
-            } else if pending {
+            } else if let Some(port) = pending_port {
                 // ⚠ 队列里还有 StartWeb（或它正在跑）时退出：worker 可能在我们退出
                 // **之后**才真正 spawn 出子进程，而那时界面已经没了 pid —— 于是留下
                 // 一个既不认识（quit 只认 web_pid）又找不回（state.json 里没有
                 // running_port）的孤儿。pid 在 UI 线程上无从得知，但端口可以记下来，
                 // 让 FR-31 下次启动认出它。
+                //
+                // 分支条件用 `start_port` 而不是 `start_pending`：两者同生共死
+                // （见字段说明），而这里需要的恰恰是端口本身。
                 let _ = config::update(|f| f.running_port = Some(port));
                 push_log(
                     &state.borrow(),

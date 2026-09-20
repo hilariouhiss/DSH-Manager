@@ -112,6 +112,12 @@ pub fn update(f: impl FnOnce(&mut StateFile)) -> Result<(), String> {
 }
 
 /// 读—改—写的测试缝。
+///
+/// ⚠ `#[cfg(test)]` 是 Task 20 加的：本函数**确实只有测试调用**（生产路径一律走
+/// `update`，它自己带 `UPDATE_LOCK`；task-18-report 已把"本函数故意不加锁、只作
+/// 测试缝"记录在案）。没有这个门，`cargo build` 会报 dead_code —— 而按本任务的
+/// 要求，真实死代码只能删除或接线，**不得**恢复 `allow`。
+#[cfg(test)]
 pub fn update_at(path: &Path, f: impl FnOnce(&mut StateFile)) -> Result<(), String> {
     let mut s = match load_from(Some(path)) {
         Loaded::Ok(s) => s,
