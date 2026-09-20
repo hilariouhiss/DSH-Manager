@@ -2742,8 +2742,12 @@ pub fn fetch_catalog() -> Result<Catalog, String> {
 
 - [ ] **Step 4: 运行测试，确认通过**
 
-Run: `cargo test dsh`
+Run: `cargo test dsh::tests`
 Expected: 6 passed
+
+> ⚠ **不要用 `cargo test dsh` 数个数** —— 那是**子串过滤**，会连 `pm` 模块里 5 条名字含 `dsh` 的测试
+> （`find_dsh_*` / `read_dsh_version*`）一起匹配，显示 11。用 `dsh::tests` 隔离本模块（同 Task 6 的
+> `cargo test pm::tests`）。
 
 - [ ] **Step 5: 手动验证真实网络拉取**
 
@@ -2993,8 +2997,10 @@ pub fn fetch_notes(version: &Version) -> Result<String, NotesError> {
 
 - [ ] **Step 4: 运行测试，确认通过**
 
-Run: `cargo test dsh`
+Run: `cargo test dsh::tests`
 Expected: 13 passed
+
+> ⚠ 同 Task 11：用 `dsh::tests` 隔离，**不要**用 `cargo test dsh`（子串过滤会多算 5 条 `pm` 的测试）。
 
 - [ ] **Step 5: 手动验证真实拉取**
 
@@ -3166,8 +3172,10 @@ pub fn is_node(pid: u32) -> bool {
 
 - [ ] **Step 4: 运行测试，确认通过**
 
-Run: `cargo test dsh`
+Run: `cargo test dsh::tests`
 Expected: 18 passed
+
+> ⚠ 同 Task 11：用 `dsh::tests` 隔离，**不要**用 `cargo test dsh`（子串过滤会多算 5 条 `pm` 的测试）。
 
 - [ ] **Step 5: 提交**
 
