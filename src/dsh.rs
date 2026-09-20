@@ -1,6 +1,7 @@
 //! 版本拉取、更新说明与 `dsh web` 进程监督。
 
 use std::collections::BTreeMap;
+use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
 use crate::model::*;
@@ -170,6 +171,63 @@ pub fn fetch_notes(version: &Version) -> Result<String, NotesError> {
     parse_release_body(&body)
 }
 
+/// FR-17：端口占用探测。stdlib 实现，无依赖。
+pub fn port_in_use(port: u16) -> bool {
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
+}
+
+/// 解析 `netstat -ano`，找出监听指定端口的 PID。纯函数。
+///
+/// 三个必须处理的细节：
+/// 1. 必须用 LISTENING 过滤 —— TIME_WAIT 行也含该端口，但其 PID 列是 0
+/// 2. 必须按 ':' 切分比较端口末段 —— 否则 ":3080" 会匹配 ":13080"
+/// 3. 本地地址可能是 `127.0.0.1:3080` 或 `[::]:3080`，都按末段处理
+pub fn parse_netstat_pid(text: &str, port: u16) -> Option<u32> {
+    let target = port.to_string();
+    for line in text.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 5 {
+            continue;
+        }
+        if !cols[0].eq_ignore_ascii_case("TCP") {
+            continue;
+        }
+        if !cols[3].eq_ignore_ascii_case("LISTENING") {
+            continue;
+        }
+        if cols[1].rsplit(':').next() != Some(target.as_str()) {
+            continue;
+        }
+        if let Ok(pid) = cols[4].parse::<u32>() {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+/// FR-19：定位监听指定端口的进程。
+pub fn find_listener_pid(port: u16) -> Result<u32, String> {
+    let out = pm::run_cmd("netstat.exe", &["-ano".to_string()])?;
+    parse_netstat_pid(&out.stdout, port)
+        .ok_or_else(|| format!("未找到监听端口 {port} 的进程"))
+}
+
+/// NFR-7：终止前必须校验进程名，避免误杀占用同端口的其他程序。
+pub fn is_node(pid: u32) -> bool {
+    let args = vec![
+        "/FI".to_string(),
+        format!("PID eq {pid}"),
+        "/FO".to_string(),
+        "CSV".to_string(),
+        "/NH".to_string(),
+    ];
+    match pm::run_cmd("tasklist.exe", &args) {
+        Ok(out) => out.stdout.to_ascii_lowercase().contains("node.exe"),
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,8 +345,9 @@ mod tests {
 
     #[test]
     fn parse_release_body_extracts_body_field() {
-        // 不能写成 r#"..."#：JSON 里 `"## 标题` 紧跟的 "# 会提前终止 raw string
-        // （Rust 2024 又禁用了 r##"）。原文与断言均保持 brief 给定的形状。
+        // 不能写成 r#"..."#：JSON 里 `"## 标题` 的 "# 会提前终止 raw string。
+        // 升到 r##"..."## 也没用 —— 内容里恰好也有它的终止序列 "##（实测在
+        // edition 2021 与 2024 下同样编译失败，与 edition 无关）。故拆成 concat! 拼接。
         let json = concat!(
             r#"{"tag_name":"dsh-v0.1.6-alpha.2","body":""#,
             "## 标题\\n内容",
@@ -302,5 +361,42 @@ mod tests {
         // 有些 release 的 body 是 null
         let json = r#"{"tag_name":"dsh-v0.0.1-rc.1","body":null}"#;
         assert!(matches!(parse_release_body(json), Err(NotesError::Missing)));
+    }
+
+    // TIME_WAIT 行必须排在 LISTENING 之前 —— 否则"不做 LISTENING 过滤"的错误实现照样会先命中 LISTENING 行并返回 13432，该测试永远不能失败。
+    /// 取自 `netstat -ano` 的真实输出形状（本机实测 3080 被 dsh web 占用）
+    const NETSTAT: &str = "\
+  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       1768
+  TCP    127.0.0.1:3080         127.0.0.1:1716         TIME_WAIT       0
+  TCP    127.0.0.1:3080         0.0.0.0:0              LISTENING       13432
+  TCP    [::]:445                [::]:0                 LISTENING       4
+";
+
+    #[test]
+    fn parse_netstat_finds_listening_pid() {
+        assert_eq!(parse_netstat_pid(NETSTAT, 3080), Some(13432));
+    }
+
+    #[test]
+    fn parse_netstat_ignores_time_wait_rows() {
+        // TIME_WAIT 那行的 PID 是 0，必须靠 LISTENING 过滤掉
+        assert_ne!(parse_netstat_pid(NETSTAT, 3080), Some(0));
+    }
+
+    #[test]
+    fn parse_netstat_does_not_match_port_suffix() {
+        // ":3080" 不得匹配 ":13080" —— 必须按 ':' 切分后比较末段
+        let text = "  TCP    127.0.0.1:13080        0.0.0.0:0              LISTENING       999\n";
+        assert_eq!(parse_netstat_pid(text, 3080), None);
+    }
+
+    #[test]
+    fn parse_netstat_returns_none_when_absent() {
+        assert_eq!(parse_netstat_pid(NETSTAT, 9999), None);
+    }
+
+    #[test]
+    fn parse_netstat_handles_empty_input() {
+        assert_eq!(parse_netstat_pid("", 3080), None);
     }
 }
