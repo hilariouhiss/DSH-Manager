@@ -4732,7 +4732,9 @@ Expected:
 1. 约 1 秒内界面显示"已安装 0.1.6-alpha.2"、"alpha 通道"、"✓ 已是最新"
 2. 包管理器下拉显示 `npm · dsh 安装于此` 与 `pnpm`
 3. 版本下拉展开有 **22 项**，降序，带通道标注，当前版本带 `← 当前`
-4. 日志区出现"环境探测完成"等行
+4. **底部状态栏**出现"环境探测完成"（它是 FR-15 的进度/状态位，**不是**日志行 —— FR-28 的日志清单是
+   命令原文/子进程输出/事务步骤结果/错误与恢复命令）。日志区此时应有启动行与**事务命令**行
+   （命令原文由 Ruling 82 接通）。
 
 > 若第 1 条显示"未检测到 dsh"：检查 `pm::read_dsh_version_on_path()`。本机实测 `where dsh` 应解析到 `C:\Users\xueyu\AppData\Roaming\npm\dsh.cmd`。
 
@@ -4763,6 +4765,29 @@ git commit -m "feat(main): worker 线程、Job 执行与 SystemBackend
 **Interfaces:**
 - Consumes: Task 18 的 `job_tx` / `spawn_worker` / `start_web`
 - Produces: 完整的 `wire_callbacks(...)` 与 `main` 收尾
+
+> ### ⚠ 本任务的前置改动（控制器裁决；由本任务一并落地，评审者应看到）
+>
+> 1. **`Job::StopWeb` 的载荷改为 `{ port: u16, own_pid: Option<u32> }`**（改 `src/model.rs` 与 Task 18 的
+>    `execute` 分支）。理由有两条，且都来自 Task 18 的评审：
+>    - **GC-16**：原设计让 UI 回调自己调 `dsh::find_listener_pid`（跑 `netstat.exe`）与
+>      `dsh::is_node`（跑 `tasklist.exe`）—— 这是**在 UI 线程上起子进程**，而 GC-16 明确禁止
+>      "UI 线程出现可感知阻塞"。改后回调只发一个 `Job`，定位与校验都发生在 worker 线程。
+>    - **NFR-7**：原设计把"是不是 node 进程"的守卫放在**调用方**（两个回调各写一遍），
+>      等于把不变量与危险动作分开。改后守卫紧挨着 `stop_by_pid`，任何未来的发送方都无法绕过。
+>    - 随之：两个回调各缩成一行 `Job::StopWeb { port, own_pid: state.borrow().web_pid }`；
+>      `execute` 的 StopWeb 分支里 `own_pid` 优先，否则现场 `find_listener_pid` + `is_node`，
+>      非 node 或定位失败时发 `UiMsg::Failed` 并**不**停止任何进程。
+> 2. **`dsh::port_in_use` 要区分"连接被拒"与"连接超时"**（改 `src/dsh.rs`）。
+>    依据（Task 18 实现者**实测撞到**的假阴性）：监听者的 accept 队列被塞满时，回环连接会**超时**而非被拒，
+>    于是原来的实现把"有人在监听"判成"端口空闲" —— 后果是**把凭这条判断清掉的 `running_port` 记录丢掉**
+>    （FR-22 的孤儿失联），并可能让 `wait_port_ready` 在慢机器上误报"启动超时"。
+>    修法：`Ok(_) => true`；`Err(e) => e.kind() == std::io::ErrorKind::TimedOut`
+>    （回环上没有防火墙，"超时"只可能来自"有监听者但没 accept"）。
+> 3. **worker 的 panic 载荷要带进日志**（改 `src/main.rs` 的 `catch_unwind` 分支）。
+>    现在只报"内部错误，请查看日志"，而日志里没有 panic 的具体信息 —— 本进程是 GUI 子系统（GC-8），
+>    默认 panic 输出去了空的 stderr，于是**第一次崩溃将完全无法诊断**。从 payload 里
+>    `downcast_ref::<&str>()` / `<String>()` 取一句消息写进 `UiMsg::Log` 即可。
 
 - [ ] **Step 1: 实现回调接线**
 
