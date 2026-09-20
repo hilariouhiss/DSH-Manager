@@ -185,14 +185,12 @@ impl WebState {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum NotesStatus {
-    Loading,
-    Ok,
-    Missing,
-    Failed,
-}
-
+// ⚠ `NotesStatus` 【刻意不在此处定义】。
+// app.slint 的 `export enum NotesStatus` 会让 Slint 在 crate 根生成同名的
+// Rust 枚举，那才是唯一使用者（`NotesState.status` 与 `set_notes_status`）。
+// 若此处也定义一份，main.rs 的 `use model::*` 是【glob 导入】，会被 crate 根
+// 的本地定义遮蔽 —— 结果是这份副本永远没有消费者，Task 20 删除
+// `#![allow(dead_code)]` 后必然报 dead_code。
 #[derive(Clone, Debug)]
 pub enum NotesError {
     Missing,
@@ -227,12 +225,73 @@ pub enum UiMsg {
 mod tests {
     use super::*;
 
+    /// FR-14 / FR-2 / GC-7 的**精确**断言。
+    ///
+    /// ⚠ 必须断言确切的参数序列，**不能只断言"非空"**。只查非空的话，
+    /// 把安装子命令误写成 `uninstall`、或写错 `-g` 的位置，测试仍会通过 ——
+    /// 而那恰恰是这张表唯一可能出错的方式。FR-14 的全部价值就在这些确切
+    /// 字符串上，断言必须钉到同一粒度。
     #[test]
-    fn pm_command_table_is_complete() {
-        for pm in Pm::ALL {
-            assert!(!pm.exe().is_empty(), "{pm:?} 缺少 exe");
-            assert!(!pm.install_args("1.2.3").is_empty(), "{pm:?} 缺少安装命令");
-            assert!(!pm.uninstall_args().is_empty(), "{pm:?} 缺少卸载命令");
+    fn pm_command_table_is_exact() {
+        let cases: [(Pm, &str, Vec<&str>, Vec<&str>, Vec<&str>); 4] = [
+            (
+                Pm::Npm,
+                "npm.cmd",
+                vec!["prefix", "-g"],
+                vec!["install", "-g", "@deepseek-ai/dsh@1.2.3"],
+                vec!["uninstall", "-g", "@deepseek-ai/dsh"],
+            ),
+            (
+                Pm::Pnpm,
+                "pnpm.cmd",
+                vec!["bin", "-g"],
+                vec!["add", "-g", "@deepseek-ai/dsh@1.2.3"],
+                vec!["remove", "-g", "@deepseek-ai/dsh"],
+            ),
+            (
+                Pm::Bun,
+                "bun.exe",
+                vec!["pm", "bin", "-g"],
+                vec!["add", "-g", "@deepseek-ai/dsh@1.2.3"],
+                vec!["remove", "-g", "@deepseek-ai/dsh"],
+            ),
+            (
+                Pm::Yarn,
+                "yarn.cmd",
+                vec!["global", "bin"],
+                vec!["global", "add", "@deepseek-ai/dsh@1.2.3"],
+                vec!["global", "remove", "@deepseek-ai/dsh"],
+            ),
+        ];
+
+        assert_eq!(
+            cases.len(),
+            Pm::ALL.len(),
+            "每个 Pm 变体都必须有断言用例（新增变体时同步更新）"
+        );
+
+        for (pm, exe, bin_dir, install, uninstall) in cases {
+            assert_eq!(pm.exe(), exe, "{pm:?} 的 exe 名不对（GC-7）");
+
+            assert_eq!(
+                pm.bin_dir_args().to_vec(),
+                bin_dir,
+                "{pm:?} 的全局 bin 目录参数不对（FR-2）"
+            );
+
+            let got: Vec<String> = pm.install_args("1.2.3");
+            let want: Vec<String> = install.iter().map(|s| s.to_string()).collect();
+            assert_eq!(got, want, "{pm:?} 的安装命令不对（FR-14）");
+
+            let got = pm.uninstall_args();
+            let want: Vec<String> = uninstall.iter().map(|s| s.to_string()).collect();
+            assert_eq!(got, want, "{pm:?} 的卸载命令不对（FR-14）");
         }
+
+        // label() 被 UI 与日志使用，一并钉住
+        assert_eq!(Pm::Npm.label(), "npm");
+        assert_eq!(Pm::Pnpm.label(), "pnpm");
+        assert_eq!(Pm::Bun.label(), "bun");
+        assert_eq!(Pm::Yarn.label(), "yarn");
     }
 }
