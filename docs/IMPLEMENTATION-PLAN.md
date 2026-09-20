@@ -1592,9 +1592,10 @@ use std::path::{Path, PathBuf};
 use crate::model::*;
 use crate::pm::CmdOut;
 
-// ⚠ 下面三个只被 `#[cfg(test)]` 的 FakeBackend 使用。不加 gate 的话，
-// `cargo build`（非 test 构建）会因它们未被引用而报 unused_imports ——
-// 那是独立 lint，`allow(dead_code)` 不覆盖它。
+// ⚠ 下面【两个】（RefCell / HashMap）只被 `#[cfg(test)]` 的 FakeBackend 使用。
+// 不加 gate 的话，`cargo build`（非 test 构建）会因它们未被引用而报
+// unused_imports —— 那是独立 lint，`allow(dead_code)` 不覆盖它。
+// 注意 `use crate::pm;` 【不在其列】，它由生产代码 precheck 使用（见下）。
 #[cfg(test)]
 use std::cell::RefCell;
 #[cfg(test)]
