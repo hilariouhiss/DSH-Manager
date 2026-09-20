@@ -78,6 +78,125 @@ pub fn owner_of(shim: &Path, bins: &[PmInfo]) -> Option<Pm> {
         .map(|info| info.kind)
 }
 
+use std::process::{Command, Stdio};
+
+/// CREATE_NO_WINDOW —— GC-8。缺了它每次调外部命令都会闪一个黑窗口。
+pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+#[derive(Clone, Debug)]
+pub struct CmdOut {
+    pub code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// 执行外部命令。**参数以数组传递，绝不拼接 shell 字符串**（GC-9）。
+///
+/// 返回 `Err` 只表示"命令没能跑起来"（可执行文件不存在、权限不足等）。
+/// **退出码非零是 `Ok`** —— 这个区分是必需的：SRS TR-11 要求补偿流程
+/// 能识别"对不存在的包执行卸载"这类非零退出，若把它当成执行失败，
+/// 就会误判为补偿失败并错误报告 Degraded。
+pub fn run_cmd(exe: &str, args: &[String]) -> Result<CmdOut, String> {
+    #[cfg(windows)]
+    use std::os::windows::process::CommandExt;
+
+    let mut cmd = Command::new(exe);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    let out = cmd
+        .output()
+        .map_err(|e| format!("无法执行 {exe}: {e}"))?;
+    Ok(CmdOut {
+        code: out.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    })
+}
+
+/// 解析 PATH 变量值，**丢弃空段**。纯函数，可单测。
+///
+/// ⚠ 为什么必须丢空段：`std::env::split_paths` 对 `PATH` 里的空条目
+/// （`;;`、或以 `;` 开头/结尾）会产出一个空 `PathBuf`。于是
+/// `空目录.join("dsh.cmd")` 得到**相对路径** `"dsh.cmd"` —— 它相对于当前
+/// 工作目录解析，一旦 CWD 下恰好有同名文件就会被 `is_file()` 判为真，并因
+/// `find_dsh_on_path` 的提前 return 而**遮蔽后面真实的 PATH 命中**。随后
+/// `owner_of` 拿到 `parent() == Some("")` 返回 `None`，owner 判定直接失败。
+///
+/// 抽成独立函数是为了可测：`path_dirs()` 直接读环境变量，在并行测试里
+/// 改 PATH 既不可靠也会干扰其他用例。见 `parse_path_var_drops_empty_segments`。
+pub fn parse_path_var(v: &std::ffi::OsStr) -> Vec<PathBuf> {
+    std::env::split_paths(v)
+        .filter(|p| !p.as_os_str().is_empty())
+        .collect()
+}
+
+/// 当前进程的 PATH 目录序列，保持顺序（顺序即语义，见 `find_dsh_on_path`）。
+pub fn path_dirs() -> Vec<PathBuf> {
+    std::env::var_os("PATH")
+        .map(|v| parse_path_var(&v))
+        .unwrap_or_default()
+}
+
+/// FR-1 + FR-2：探测单个 PM。未安装返回 None。
+pub fn probe_pm(pm: Pm) -> Option<PmInfo> {
+    let ver = run_cmd(pm.exe(), &["--version".to_string()]).ok()?;
+    if ver.code != 0 {
+        return None;
+    }
+    let args: Vec<String> = pm.bin_dir_args().iter().map(|s| s.to_string()).collect();
+    let dir = run_cmd(pm.exe(), &args).ok()?;
+    if dir.code != 0 {
+        return None;
+    }
+    Some(PmInfo {
+        kind: pm,
+        version: ver.stdout.trim().to_string(),
+        bin_dir: PathBuf::from(dir.stdout.trim()),
+    })
+}
+
+/// FR-4 + TR-4：直接执行**指定目录下**的 dsh shim 读版本，**不经 PATH**。
+///
+/// TR-4 的强制要求：迁移验证绝不能用 PATH 解析。本机实测 PATH 中
+/// pnpm\bin 排在 npm 之前，`pnpm → npm` 迁移时装完 npm 那份后
+/// `where dsh` 仍指向 pnpm 的旧文件，验证会【假通过】。
+pub fn read_dsh_version_at(dir: &Path) -> Option<Version> {
+    let shim = shim_in(dir)?;
+    let out = run_cmd(&shim.to_string_lossy(), &["--version".to_string()]).ok()?;
+    if out.code != 0 {
+        return None;
+    }
+    out.stdout.trim().parse().ok()
+}
+
+/// 经 PATH 解析后读版本。**仅用于事务的 S4 最终验证**。
+pub fn read_dsh_version_on_path() -> Option<(Pm, Version)> {
+    let shim = find_dsh_on_path(&path_dirs(), &|p| p.is_file())?;
+    let ver: Version = run_cmd(&shim.to_string_lossy(), &["--version".to_string()])
+        .ok()?
+        .stdout
+        .trim()
+        .parse()
+        .ok()?;
+    let bins: Vec<PmInfo> = Pm::ALL.iter().filter_map(|pm| probe_pm(*pm)).collect();
+    let owner = owner_of(&shim, &bins)?;
+    Some((owner, ver))
+}
+
+/// FR-1 ~ FR-5：完整环境探测。
+pub fn probe_env() -> PmEnv {
+    let available: Vec<PmInfo> = Pm::ALL.iter().filter_map(|pm| probe_pm(*pm)).collect();
+    let dsh_path = find_dsh_on_path(&path_dirs(), &|p| p.is_file());
+    let owner = dsh_path.as_deref().and_then(|s| owner_of(s, &available));
+    let installed = read_dsh_version_on_path().map(|(_, v)| v);
+    PmEnv { available, owner, installed, dsh_path }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,5 +333,54 @@ mod tests {
     fn owner_of_returns_none_for_unknown_location() {
         let bins = vec![PmInfo { kind: Pm::Npm, version: "1".into(), bin_dir: p("C:/npm") }];
         assert_eq!(owner_of(&p("D:/elsewhere/dsh.cmd"), &bins), None);
+    }
+
+    #[test]
+    fn path_dirs_is_nonempty_on_windows() {
+        let dirs = path_dirs();
+        assert!(!dirs.is_empty(), "PATH 不应为空");
+        assert!(dirs.iter().all(|d| !d.as_os_str().is_empty()));
+    }
+
+    /// 空段必须被丢弃 —— 完整理由见 `parse_path_var` 的文档注释。
+    #[test]
+    fn parse_path_var_drops_empty_segments() {
+        let v = std::ffi::OsString::from("C:/a;;C:/b;");
+        assert_eq!(parse_path_var(&v), vec![p("C:/a"), p("C:/b")]);
+
+        // 全空 → 全丢，不得留下一个空目录
+        let only_seps = std::ffi::OsString::from(";;");
+        assert!(parse_path_var(&only_seps).is_empty());
+
+        // 单个正常项应原样保留（顺序也保留）
+        let one = std::ffi::OsString::from("C:/only");
+        assert_eq!(parse_path_var(&one), vec![p("C:/only")]);
+    }
+
+    #[test]
+    fn run_cmd_reports_nonzero_exit_without_erroring() {
+        // 退出码非零是【正常结果】而不是 Err —— 事务补偿依赖这个区分
+        // （SRS TR-11：对不存在的包执行卸载会非零退出，不该当成执行失败）
+        let out = run_cmd("cmd.exe", &["/c".into(), "exit 3".into()]);
+        assert!(out.is_ok(), "非零退出不应返回 Err");
+        assert_eq!(out.unwrap().code, 3);
+    }
+
+    #[test]
+    fn run_cmd_errors_only_when_exe_missing() {
+        let out = run_cmd("definitely-not-a-real-exe-xyz.exe", &[]);
+        assert!(out.is_err(), "可执行文件不存在才应是 Err");
+    }
+
+    #[test]
+    fn run_cmd_captures_stdout() {
+        let out = run_cmd("cmd.exe", &["/c".into(), "echo hello".into()]).unwrap();
+        assert_eq!(out.code, 0);
+        assert!(out.stdout.contains("hello"));
+    }
+
+    #[test]
+    fn read_dsh_version_at_missing_dir_is_none() {
+        assert_eq!(read_dsh_version_at(&p("C:/definitely/not/here")), None);
     }
 }
