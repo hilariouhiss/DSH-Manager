@@ -4225,30 +4225,32 @@ fn start_web(port: u16, tx: &Sender<UiMsg>) {
 
     // FR-31：若上次有未清除的运行态端口，探测它 —— 这正是 FR-22 的
     // 孤儿恢复机制入口。若无占用则视为过期，静默清除。
+    //
+    // ⚠ **不要**加 "仅当 rp != preferred_port 才探测" 之类的守卫。
+    // 那个方向是反的：用户通常**不会**改端口，所以孤儿最常出现在
+    // **偏好端口**上；而启动时没有任何其他路径探测该端口
+    // （`Job::Probe` 只做 PM 探测，不碰 web 端口）。加了守卫就变成
+    // "只在少见情况下能发现孤儿" —— 恰恰与 FR-22 的意图相反。
     if let config::Loaded::Ok(s) = config::load() {
         if let Some(rp) = s.running_port {
-            if rp != preferred_port {
-                push_log(&state.borrow(), format!("上次的运行端口为 {rp}，探测中…"));
-                let tx = msg_tx.clone();
-                let job_tx2 = job_tx.clone();
-                std::thread::spawn(move || {
-                    if dsh::port_in_use(rp) {
-                        if let Ok(pid) = dsh::find_listener_pid(rp) {
-                            if dsh::is_node(pid) {
-                                let _ = tx.send(UiMsg::Log(
-                                    format!("检测到外部 dsh web 运行在端口 {rp}（pid {pid}）"),
-                                ));
-                                let _ = tx.send(UiMsg::WebState(WebState::External { port: rp }));
-                                return;
-                            }
+            push_log(&state.borrow(), format!("上次的运行端口为 {rp}，探测中…"));
+            let tx = msg_tx.clone();
+            std::thread::spawn(move || {
+                if dsh::port_in_use(rp) {
+                    if let Ok(pid) = dsh::find_listener_pid(rp) {
+                        if dsh::is_node(pid) {
+                            let _ = tx.send(UiMsg::Log(
+                                format!("检测到外部 dsh web 运行在端口 {rp}（pid {pid}）"),
+                            ));
+                            let _ = tx.send(UiMsg::WebState(WebState::External { port: rp }));
+                            return;
                         }
                     }
-                    // 过期：清除并回落到偏好端口
-                    let _ = config::update(|f| f.running_port = None);
-                    let _ = tx.send(UiMsg::Log("上次的运行端口已空闲，状态已清除".into()));
-                    let _ = job_tx2;
-                });
-            }
+                }
+                // 过期：清除并回落到偏好端口
+                let _ = config::update(|f| f.running_port = None);
+                let _ = tx.send(UiMsg::Log("上次的运行端口已空闲，状态已清除".into()));
+            });
         }
     }
 ```
