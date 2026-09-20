@@ -3130,7 +3130,8 @@ pub fn port_in_use(port: u16) -> bool {
 /// 三个必须处理的细节：
 /// 1. 必须用 LISTENING 过滤 —— TIME_WAIT 行也含该端口，但其 PID 列是 0
 /// 2. 必须按 ':' 切到末段后**整体**比较 —— 否则 "3080" 会命中 ":13080" 的端口数字后缀
-///    （注意：带 ':' 锚点的 contains(":3080") 并不会误匹配 —— 真正的危险是无锚的末段匹配）
+///    （注意：带 ':' 锚点的 contains(":3080") 不会误匹配本测试里的 ":13080"；
+///    真正的危险是无锚的末段匹配）
 /// 3. 本地地址可能是 `127.0.0.1:3080` 或 `[::]:3080`，都按末段处理
 pub fn parse_netstat_pid(text: &str, port: u16) -> Option<u32> {
     let target = port.to_string();
@@ -3293,13 +3294,18 @@ pub fn spawn_web(port: u16, tx: Sender<UiMsg>) -> Result<u32, String> {
     let h_out = spawn_reader(out, tx.clone());
     let h_err = spawn_reader(err, tx.clone());
 
-    // waiter 先 join 两个 reader 再 wait()：保证子进程退出时输出已被完整读取，
-    // 否则日志会截尾。
+    // waiter：**先 wait() 再 join** 两个 reader。
+    //
+    // 顺序理由：管道里已缓冲的字节在写端关闭后仍可读，而两个 reader 线程本来就
+    // 并发排空 —— 所以先 wait() 不会截尾日志。反之，若先 join 再 wait()，只要有孙
+    // 进程仍持有我们的 stdout/stderr 写句柄，reader 就永远读不到 EOF，wait() 便
+    // 永不执行：子进程不被回收、WebExited 永不发送，界面会一直停在"运行中"。
+    // 先 wait() 保证"回收 + 通知"一定发生，读者线程继续把日志排空。
     thread::spawn(move || {
-        let _ = h_out.join();
-        let _ = h_err.join();
         let code = child.wait().ok().and_then(|s| s.code());
         let _ = tx.send(UiMsg::WebExited { code });
+        let _ = h_out.join();
+        let _ = h_err.join();
     });
 
     Ok(pid)
@@ -3432,8 +3438,9 @@ Child 句柄被 move 进 waiter 线程，不跨线程共享 —— 因此无锁�
 因此合并成同一条路径。
 
 两个管道必须独立线程读：单线程串行读时，先读的管道阻塞会让另一个
-管道缓冲区写满，子进程卡死（经典死锁）。waiter 先 join 两个 reader
-再 wait()，否则日志会截尾。
+管道缓冲区写满，子进程卡死（经典死锁）。waiter 先 wait() 再 join 两个
+reader：管道缓冲在写端关闭后仍可读，故不会截尾日志；反之若先 join，
+一旦孙进程持有写句柄，wait() 就永不执行 —— 子进程不回收、WebExited 不发。
 
 不传 --no-open，让 dsh web 自己开浏览器，零代码实现 FR-20。"
 ```
@@ -4806,12 +4813,29 @@ fn wire_callbacks(
         win.on_stop_web(move || {
             let s = state.borrow();
             if let Some(port) = s.web.port() {
+                let own_pid = s.web_pid;
                 drop(s);
-                // 停止需要 pid：自己启的从状态拿，外部的现场查
-                let pid = state
-                    .borrow()
-                    .web_pid
-                    .or_else(|| dsh::find_listener_pid(port).ok());
+                // 停止需要 pid，两种来源的校验要求不同：
+                // - web_pid：本程序自己启动的实例，pid 就是我们的子进程，无需校验；
+                // - 现场查端口：可能是外部 dsh web，**也可能端口已被别的程序接管** ——
+                //   后者必须由 is_node 挡住，否则 /T /F 会把无辜进程连同其子进程一起
+                //   杀掉，而这正是 NFR-7 存在的全部理由。
+                let pid = match own_pid {
+                    Some(pid) => Some(pid),
+                    None => match dsh::find_listener_pid(port) {
+                        Ok(pid) if dsh::is_node(pid) => Some(pid),
+                        Ok(pid) => {
+                            let mut s = state.borrow_mut();
+                            s.status = format!("端口 {port} 被非 node 进程占用（pid {pid}），拒绝停止");
+                            None
+                        }
+                        Err(e) => {
+                            let mut s = state.borrow_mut();
+                            s.status = format!("定位 dsh web 失败：{e}");
+                            None
+                        }
+                    },
+                };
                 if let Some(pid) = pid {
                     send(Job::StopWeb { pid });
                 }
@@ -4871,9 +4895,23 @@ fn wire_callbacks(
         let send = send.clone();
         let state = state.clone();
         tray.on_stop_web(move || {
-            if let Some(port) = state.borrow().web.port() {
-                if let Ok(pid) = dsh::find_listener_pid(port) {
-                    send(Job::StopWeb { pid });
+            let s = state.borrow();
+            let port = s.web.port();
+            drop(s);
+            if let Some(port) = port {
+                // 托盘不区分"自启/外部"，一律现场查端口。查到的若是我们自己启动的实例，
+                // 拿到的也是真正的监听者 node.exe（is_node 为真），故同一守卫照样适用。
+                // 但端口可能已被**别的程序**接管 —— 必须挡住（NFR-7）。
+                match dsh::find_listener_pid(port) {
+                    Ok(pid) if dsh::is_node(pid) => send(Job::StopWeb { pid }),
+                    Ok(pid) => {
+                        let mut s = state.borrow_mut();
+                        s.status = format!("端口 {port} 被非 node 进程占用（pid {pid}），拒绝停止");
+                    }
+                    Err(e) => {
+                        let mut s = state.borrow_mut();
+                        s.status = format!("定位 dsh web 失败：{e}");
+                    }
                 }
             }
         });
