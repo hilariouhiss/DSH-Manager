@@ -2864,7 +2864,14 @@ packument —— 只需 versions 键集合与 dist-tags。"
 
     #[test]
     fn parse_release_body_extracts_body_field() {
-        let json = r#"{"tag_name":"dsh-v0.1.6-alpha.2","body":"## 标题\n内容"}"#;
+        // 不能写成 r#"..."#：JSON 里 `"## 标题` 的 "# 会提前终止 raw string。
+        // 升到 r##"..."## 也没用 —— 内容里恰好也有它的终止序列 "##（实测在
+        // edition 2021 与 2024 下同样编译失败，与 edition 无关）。故拆成 concat! 拼接。
+        let json = concat!(
+            r#"{"tag_name":"dsh-v0.1.6-alpha.2","body":""#,
+            "## 标题\\n内容",
+            r#""}"#
+        );
         assert_eq!(parse_release_body(json).unwrap(), "## 标题\n内容");
     }
 
@@ -3008,11 +3015,11 @@ Expected: 13 passed
 
 ```rust
 fn main() {
-    let v: dsh::Version = "0.1.6-alpha.2".parse().unwrap();
+    let v: model::Version = "0.1.6-alpha.2".parse().unwrap();
     println!("--- 有说明的版本 ---");
     println!("{:?}", dsh::fetch_notes(&v).map(|s| s.chars().take(120).collect::<String>()));
 
-    let missing: dsh::Version = "0.0.1-rc.1".parse().unwrap();
+    let missing: model::Version = "0.0.1-rc.1".parse().unwrap();
     println!("--- 无说明的版本（SRS §2.2.6 的 6 个之一）---");
     println!("{:?}", dsh::fetch_notes(&missing));
 }
