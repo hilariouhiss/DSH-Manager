@@ -1283,6 +1283,21 @@ pnpm\\bin 排在 npm 之前，所以这个顺序是真有影响的。
         assert!(dirs.iter().all(|d| !d.as_os_str().is_empty()));
     }
 
+    /// 空段必须被丢弃 —— 完整理由见 `parse_path_var` 的文档注释。
+    #[test]
+    fn parse_path_var_drops_empty_segments() {
+        let v = std::ffi::OsString::from("C:/a;;C:/b;");
+        assert_eq!(parse_path_var(&v), vec![p("C:/a"), p("C:/b")]);
+
+        // 全空 → 全丢，不得留下一个空目录
+        let only_seps = std::ffi::OsString::from(";;");
+        assert!(parse_path_var(&only_seps).is_empty());
+
+        // 单个正常项应原样保留（顺序也保留）
+        let one = std::ffi::OsString::from("C:/only");
+        assert_eq!(parse_path_var(&one), vec![p("C:/only")]);
+    }
+
     #[test]
     fn run_cmd_reports_nonzero_exit_without_erroring() {
         // 退出码非零是【正常结果】而不是 Err —— 事务补偿依赖这个区分
@@ -1361,10 +1376,27 @@ pub fn run_cmd(exe: &str, args: &[String]) -> Result<CmdOut, String> {
     })
 }
 
-/// 当前进程的 PATH 目录序列，保持顺序（顺序即语义，见 find_dsh_on_path）。
+/// 解析 PATH 变量值，**丢弃空段**。纯函数，可单测。
+///
+/// ⚠ 为什么必须丢空段：`std::env::split_paths` 对 `PATH` 里的空条目
+/// （`;;`、或以 `;` 开头/结尾）会产出一个空 `PathBuf`。于是
+/// `空目录.join("dsh.cmd")` 得到**相对路径** `"dsh.cmd"` —— 它相对于当前
+/// 工作目录解析，一旦 CWD 下恰好有同名文件就会被 `is_file()` 判为真，并因
+/// `find_dsh_on_path` 的提前 return 而**遮蔽后面真实的 PATH 命中**。随后
+/// `owner_of` 拿到 `parent() == Some("")` 返回 `None`，owner 判定直接失败。
+///
+/// 抽成独立函数是为了可测：`path_dirs()` 直接读环境变量，在并行测试里
+/// 改 PATH 既不可靠也会干扰其他用例。见 `parse_path_var_drops_empty_segments`。
+pub fn parse_path_var(v: &std::ffi::OsStr) -> Vec<PathBuf> {
+    std::env::split_paths(v)
+        .filter(|p| !p.as_os_str().is_empty())
+        .collect()
+}
+
+/// 当前进程的 PATH 目录序列，保持顺序（顺序即语义，见 `find_dsh_on_path`）。
 pub fn path_dirs() -> Vec<PathBuf> {
     std::env::var_os("PATH")
-        .map(|v| std::env::split_paths(&v).collect())
+        .map(|v| parse_path_var(&v))
         .unwrap_or_default()
 }
 
