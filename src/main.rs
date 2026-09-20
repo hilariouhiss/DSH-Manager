@@ -920,7 +920,19 @@ fn wire_callbacks(
         let send = send.clone();
         let state = state.clone();
         win.on_start_web(move || {
-            let port = state.borrow().preferred_port;
+            let s = state.borrow();
+            // ⚠ 已在启动/运行中时拒绝重复启动。`is_running()` 只认 Running/External，
+            // 所以 Starting 期间 web-running 仍是 false；而这里也不设 busy —— 于是
+            // "启动"按钮在整个就绪窗口（正常约 2 秒，超时路径最长 20 秒）里都可点。
+            // 第二次点击会再派一个 StartWeb，而 start_web 的端口探测在第一份还没
+            // 绑定时会判为"空闲" → 起第二个子进程，落选的那个就没人认领了
+            // （FR-21/FR-22 要防的孤儿）。
+            if !matches!(s.web, WebState::Stopped | WebState::Failed { .. }) {
+                push_log(&s, "dsh web 已在启动或运行中，忽略重复的启动请求");
+                return;
+            }
+            let port = s.preferred_port;
+            drop(s);
             send(Job::StartWeb { port });
         });
     }
@@ -998,7 +1010,16 @@ fn wire_callbacks(
         let send = send.clone();
         let state = state.clone();
         tray.on_start_web(move || {
-            let port = state.borrow().preferred_port;
+            let s = state.borrow();
+            // ⚠ 与窗口"启动"同一道守卫：托盘菜单项在 Starting 期间**仍是可用的**
+            // （菜单的 enabled 绑定只看 web-running/busy，二者此时都为假），
+            // 所以这里同样必须挡住重复启动，否则绕开窗口按钮就能造出第二个子进程。
+            if !matches!(s.web, WebState::Stopped | WebState::Failed { .. }) {
+                push_log(&s, "dsh web 已在启动或运行中，忽略重复的启动请求");
+                return;
+            }
+            let port = s.preferred_port;
+            drop(s);
             send(Job::StartWeb { port });
         });
     }
