@@ -315,6 +315,10 @@ export component AppTray inherits SystemTrayIcon {
     callback start-web();
     callback stop-web();
     callback quit-app();
+    /// 左键单击托盘图标。⚠ 名字**不能**叫 `clicked` —— Slint 1.18 不把
+    /// `SystemTrayIcon.clicked` 这个**内建**回调暴露到生成的 Rust API 上
+    /// （同理 `MainWindow` 也拿不到 `close-requested`），只能在组件体内转出去。
+    callback tray-clicked();
 
     Menu {
         MenuItem {
@@ -343,4 +347,6 @@ export component AppTray inherits SystemTrayIcon {
             activated => { quit-app(); }
         }
     }
+
+    clicked => { root.tray-clicked(); }
 }
