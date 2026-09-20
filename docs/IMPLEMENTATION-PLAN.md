@@ -460,7 +460,7 @@ pub enum UiMsg {
 在 `src/main.rs` 的 `#![cfg_attr(...)]` 行**之后**、`slint::include_modules!();` **之前**插入：
 
 ```rust
-// ⚠ 临时（Task 2 ~ Task 16 期间存在）
+// ⚠ 临时 —— 【Task 20 移除本行】，契约见下方。
 //
 // 各模块按依赖顺序逐步落地，先定义的类型/函数要到很晚才被消费。
 // 在【二进制 crate】中未使用的 pub 项会触发 dead_code 警告 ——
@@ -3661,7 +3661,14 @@ fn project(state: &AppState, win: &MainWindow, tray: &AppTray) {
     win.set_port_text(state.preferred_port.to_string().into());
 
     win.set_notes_status(state.notes_status());
-    win.set_notes_text(slint::StyledText::from_markdown(&state.notes.body));
+    // ⚠ `from_markdown` 返回 `Result<StyledText, StyledTextFromMarkdownError>`，
+    // 不是 `StyledText`（签名已核实）。必须处理。
+    // 解析失败时降级为**纯文本而不是空** —— 否则会出现"状态显示 ok 但说明区一片空白"
+    // 的矛盾。`from_plain_text` 不返回 Result（同样已核实）。
+    win.set_notes_text(
+        slint::StyledText::from_markdown(&state.notes.body)
+            .unwrap_or_else(|_| slint::StyledText::from_plain_text(&state.notes.body)),
+    );
 
     win.set_log_lines(ModelRc::from(state.log.clone()));
     win.set_busy(state.busy);
@@ -3809,16 +3816,15 @@ fn describe_outcome_log(o: &TxOutcome) -> Vec<String> {
 ```rust
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // §3.8 / FR-30：启动时读取持久化的偏好端口
-    let (preferred_port, had_state) = match config::load() {
-        config::Loaded::Ok(s) => (s.preferred_port.unwrap_or(3080), true),
-        config::Loaded::Missing => (3080, false),
+    let preferred_port = match config::load() {
+        config::Loaded::Ok(s) => s.preferred_port.unwrap_or(3080),
+        config::Loaded::Missing => 3080,
         config::Loaded::Corrupt(e) => {
             eprintln!("state.json 损坏，使用缺省端口：{e}"); // FR-32：记日志但不阻止启动
-            (3080, false)
+            3080
         }
-        config::Loaded::NoLocation => (3080, false),
+        config::Loaded::NoLocation => 3080,
     };
-    let _ = had_state;
 
     let win = MainWindow::new()?;
     let tray = AppTray::new()?;
@@ -3989,11 +3995,24 @@ fn execute(job: Job, tx: &Sender<UiMsg>) {
                             return;
                         }
                         let _ = config::update(|f| f.running_port = None);
-                        // 等端口真正释放
-                        let freed = dsh::wait_port_ready(
-                            port, || false, Duration::from_secs(10),
-                        );
-                        let _ = freed;
+
+                        // 等端口【真正释放】再开始事务 —— 停止只是发了 taskkill，
+                        // 进程退出、句柄释放、端口关闭都需要时间。抢跑会撞上
+                        // Windows 文件锁，正是 TR-1 要避开的东西。
+                        //
+                        // ⚠ 不能用 wait_port_ready —— 那个函数检测的是"端口变成
+                        // 被占用"，方向正好相反（它内部 alive 回调的语义也不同）。
+                        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                        while dsh::port_in_use(port) && std::time::Instant::now() < deadline {
+                            std::thread::sleep(Duration::from_millis(200));
+                        }
+                        if dsh::port_in_use(port) {
+                            send(UiMsg::Failed {
+                                context: "停止 dsh web",
+                                message: format!("端口 {port} 在 10 秒内未释放，已放弃本次变更"),
+                            });
+                            return;
+                        }
                     }
                     Ok(_) => {
                         send(UiMsg::Failed {
@@ -4554,7 +4573,7 @@ Expected:
 
 Task 2 在 `src/main.rs` 加了一行临时的 `#![allow(dead_code)]`，用于抑制"类型已定义但尚未被消费"的警告。到本任务时全部模块都已接线，那行必须删除：
 
-1. 删除 `src/main.rs` 中的 `#![allow(dead_code)]` 及其上方 4 行说明注释
+1. 删除 `src/main.rs` 中的 `#![allow(dead_code)]` 及其**上方整个说明注释块**（不要只删第一行；那块的每一行都是为这行属性而写的）
 2. 运行 `cargo build`，**确认零警告**
 3. 运行 `cargo test`，**确认零警告**
 
