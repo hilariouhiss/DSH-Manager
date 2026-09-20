@@ -4249,7 +4249,11 @@ fn wire_callbacks(
                 return;
             };
             let target_pm = s.selected_pm.unwrap_or(owner);
-            let port = s.preferred_port;
+            // ⚠ 必须传【实际在运行】的端口（若有），而不是偏好端口。
+            // 若 dsh web 跑在非偏好端口上（例如上次用了 8080、偏好仍是 3080），
+            // 传偏好端口会让 TR-1 去停一个空端口 —— 真正持锁的实例还在，
+            // 事务照样撞上 Windows 文件锁，TR-1 就形同虚设。
+            let port = s.web.port().unwrap_or(s.preferred_port);
             s.busy = true;
             s.busy_label = "准备中…".into();
             drop(s);
@@ -4353,6 +4357,9 @@ fn wire_callbacks(
 
     {
         let state = state.clone();
+        // ⚠ 必须先 clone：`win_weak` 是本函数的参数，直接 move 进这个闭包后，
+        // 下面托盘块的 `win_weak.clone()` 就会编译失败（use of moved value）。
+        let win_weak = win_weak.clone();
         win.on_hide_to_tray(move || {
             if let Some(w) = win_weak.upgrade() {
                 let _ = w.hide();
