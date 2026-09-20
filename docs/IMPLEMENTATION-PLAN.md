@@ -1258,7 +1258,7 @@ pnpm\\bin 排在 npm 之前，所以这个顺序是真有影响的。
 
 **Files:**
 - Modify: `src/pm.rs`
-- Create: `src/dsh.rs`（仅 `shim_in` 相关的版本读取部分；完整实现在 Task 11）
+- Modify: `src/pm.rs`（**全部本任务代码都落在此文件**；`src/dsh.rs` 由 Task 11 创建 —— 早期版本的 Files 块在此处误写了 `Create: src/dsh.rs`，见 Ruling 2）
 
 **Interfaces:**
 - Consumes: Task 6 的 `shim_in`、`find_dsh_on_path`、`owner_of`；`model::{Pm, PmInfo, PmEnv, Version}`
