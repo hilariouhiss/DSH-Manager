@@ -457,13 +457,29 @@ pub enum UiMsg {
 }
 ```
 
-- [ ] **Step 2: 在 `src/main.rs` 顶部加模块声明并验证测试输出**
+- [ ] **Step 2: 在 `src/main.rs` 中加 crate 属性与模块声明**
 
-在 `src/main.rs` 的 `slint::include_modules!();` 之前插入：
+在 `src/main.rs` 的 `#![cfg_attr(...)]` 行**之后**、`slint::include_modules!();` **之前**插入：
 
 ```rust
+// ⚠ 临时（Task 2 ~ Task 16 期间存在）
+//
+// 各模块按依赖顺序逐步落地，先定义的类型/函数要到很晚才被消费
+// （model.rs 的类型直到 Task 17 才接上 UI），在【二进制 crate】中
+// 未使用的 pub 项会触发 dead_code 警告。实测确认：bin crate 不会
+// 因为是 pub 就豁免这个 lint。
+//
+// 若不抑制，Task 2~16 的构建输出会持续带着十几个无关警告 ——
+// 既让"输出必须干净"的检查失效，也会掩盖真实警告。
+//
+// 【Task 20 必须删除本行，并确认 cargo build 零警告】
+// 本行会掩盖真实死代码，只应短期存在。
+#![allow(dead_code)]
+
 mod model;
 ```
+
+> **`mod model;` 的插入位置**：必须在 `slint::include_modules!()` **之前**。`include_modules!` 展开为一个模块，放它会打乱顶层声明顺序（虽不报错但不清晰）。
 
 然后加一个**临时**冒烟测试，确认 `cfg_attr(not(test), windows_subsystem)` 没有吞掉测试输出。把下面这段**追加到 `src/model.rs` 末尾**：
 
@@ -531,8 +547,6 @@ Pm 的命令表放在此处而非 pm.rs：它是纯常量映射，若放 pm.rs
 //! 只做 I/O，**不含"何时该写"的决策** —— 写入时机由调用方决定。
 
 use std::path::{Path, PathBuf};
-
-use crate::model::*;
 
 #[derive(Default, Clone, Debug, PartialEq)]
 pub struct StateFile {
@@ -2530,7 +2544,6 @@ GitHub 只有 18 个 release，6 个版本本就无说明。"
   - `parse_netstat_pid(text: &str, port: u16) -> Option<u32>` —— 纯函数
   - `find_listener_pid(port: u16) -> Result<u32, String>`
   - `is_node(pid: u32) -> bool`
-  - `shim_in(dir: &Path) -> Option<PathBuf>` —— 转调 `pm::shim_in`
 
 - [ ] **Step 1: 写失败测试**
 
@@ -2585,11 +2598,6 @@ Expected: 编译失败 —— `parse_netstat_pid` 未定义。
 
 ```rust
 use std::net::{SocketAddr, TcpStream};
-
-/// 在目录中查找 dsh 的可执行 shim（转调 pm 的实现）。
-pub fn shim_in(dir: &Path) -> Option<PathBuf> {
-    pm::shim_in(dir)
-}
 
 /// FR-17：端口占用探测。stdlib 实现，无依赖。
 pub fn port_in_use(port: u16) -> bool {
@@ -4472,7 +4480,21 @@ Expected:
 
 **验证完请迁回 npm**（切换回 npm 再点安装），以免影响后续工作。
 
-- [ ] **Step 3: 写验证记录 `docs/VERIFICATION.md`**
+- [ ] **Step 3: 移除临时 lint 抑制并确认零警告**
+
+Task 2 在 `src/main.rs` 加了一行临时的 `#![allow(dead_code)]`，用于抑制"类型已定义但尚未被消费"的警告。到本任务时全部模块都已接线，那行必须删除：
+
+1. 删除 `src/main.rs` 中的 `#![allow(dead_code)]` 及其上方 4 行说明注释
+2. 运行 `cargo build`，**确认零警告**
+3. 运行 `cargo test`，**确认零警告**
+
+**若出现任何 `dead_code` 警告**：那是真实死代码，**必须删除对应项，不得恢复抑制**。逐个判断：
+- 从来没有消费者的项 → 删掉
+- 只是尚未接线的项 → 说明 Task 17~19 有遗漏，回到对应任务补上
+
+> 这一步的存在意义：那行 allow 会掩盖真实死代码。没有这一步，它会永久留在代码里。
+
+- [ ] **Step 4: 写验证记录 `docs/VERIFICATION.md`**
 
 ```markdown
 # DSH Manager 验证记录
@@ -4520,13 +4542,13 @@ Expected:
 | | | |
 ```
 
-- [ ] **Step 4: 逐条执行 §8.2 / §8.3 并填写记录**
+- [ ] **Step 5: 逐条执行 §8.2 / §8.3 并填写记录**
 
 Run: 按 SRS §8.2 与 §8.3 的表格逐条执行，把实际结果填入 `docs/VERIFICATION.md`。
 
 **任何一条不通过都必须记录，不得留空或跳过。**
 
-- [ ] **Step 5: 提交**
+- [ ] **Step 6: 提交**
 
 ```bash
 git add docs/VERIFICATION.md
