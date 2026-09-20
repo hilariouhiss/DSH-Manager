@@ -377,6 +377,11 @@ fn drain(rx: &Receiver<UiMsg>, state: &Rc<RefCell<AppState>>) -> bool {
                     UiMsg::WebExited { code } => {
                         push_log(&s, format!("dsh web 已退出，退出码 {code:?}"));
                         s.web = WebState::Stopped;
+                        // ⚠ 本臂直接写 `s.web`（不经上面的 WebState 臂），所以必须自己
+                        // 清 `web_pid`：否则子进程自行退出后残留一个**已死的 pid**，
+                        // 退出路径的 `stop_by_pid` 会拿着它 taskkill —— 而 pid 是会被
+                        // 系统复用的，复用到无辜进程上就是误杀（正是 NFR-7 要防的事）。
+                        s.web_pid = None;
                         let _ = config::update(|f| f.running_port = None);
                     }
                     UiMsg::Failed { context, message } => {
