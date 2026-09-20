@@ -47,6 +47,14 @@ const LOG_CAP: usize = 2000;
 /// "消息传递正确性"问题。
 struct AppState {
     env: PmEnv,
+    /// 首批探测数据是否已到达；未到达时界面**必须**显示"检测中…"，
+    /// 不得给出"未检测到"这类结论（SRS §6.1.1 / SRS:786）。
+    ///
+    /// ⚠ 这个空窗不是毫秒级：`pm::probe_env` 要探测四个 PM、每个两次，
+    /// 约九个真实 shim 进程，实测是**秒级**。没有这个标志时，一个明明装了
+    /// dsh 的用户会在启动后的头几秒被明确告知"未检测到 dsh" —— 正是
+    /// SRS:786 禁止的"未检测先下结论"。
+    probed: bool,
     catalog: Option<Catalog>,
     notes: NotesState,
     web: WebState,
@@ -77,6 +85,7 @@ impl AppState {
     fn new(preferred_port: u16) -> Self {
         Self {
             env: PmEnv::default(),
+            probed: false,
             catalog: None,
             notes: NotesState::default(),
             web: WebState::Stopped,
@@ -124,9 +133,16 @@ impl AppState {
         pm::latest_in(&catalog.versions, ch).cloned()
     }
 
+    /// 是否"已是最新"。判据是**通道内最新已知，且不严格新于已安装版本**。
+    ///
+    /// ⚠ 原先写成 `*cur == newest`：装了目录里没有的版本时（刚发布的版本、
+    /// 或 `Channel::Other` 的非 alpha/rc 预发布版）`==` 为假，UI 会把**更旧**
+    /// 的版本说成"↓ 可更新" —— 那正是 GC-14 存在的意义（防止把用户往下带）。
+    /// 现在只有"严格更新"才提示可更新；目录缺项时宁可不提示，也不指错方向。
+    /// `newest_in_channel()` 本身不动 —— 它是对的，问题只在这个比较。
     fn is_up_to_date(&self) -> bool {
         match (self.env.installed.as_ref(), self.newest_in_channel()) {
-            (Some(cur), Some(newest)) => *cur == newest,
+            (Some(cur), Some(newest)) => *cur >= newest,
             _ => false,
         }
     }
@@ -191,13 +207,20 @@ fn push_log(state: &AppState, line: impl Into<String>) {
 fn project(state: &AppState, win: &MainWindow, tray: &AppTray) {
     // ── 推给窗口 ──
     win.set_installed_version(
-        state
-            .env
-            .installed
-            .as_ref()
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "未检测到 dsh".into())
-            .into(),
+        if !state.probed {
+            // SRS:786：探测未完成时不得下结论。首帧的 project() 就发生在
+            // win.show() 之前，所以用户看到的第一个画面就是这一帧 ——
+            // 它必须是"检测中…"（与 ui/app.slint:22 的默认值一致）。
+            "检测中…".into()
+        } else {
+            state
+                .env
+                .installed
+                .as_ref()
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "未检测到 dsh".into())
+                .into()
+        },
     );
     win.set_installed_channel(
         state
@@ -211,7 +234,9 @@ fn project(state: &AppState, win: &MainWindow, tray: &AppTray) {
             .unwrap_or("")
             .into(),
     );
-    win.set_version_known(state.catalog.is_some() && state.env.installed.is_some());
+    win.set_version_known(
+        state.probed && state.env.installed.is_some() && state.newest_in_channel().is_some(),
+    );
     win.set_latest_version(
         state
             .newest_in_channel()
@@ -287,6 +312,7 @@ fn drain(rx: &Receiver<UiMsg>, state: &Rc<RefCell<AppState>>) -> bool {
                 let mut s = state.borrow_mut();
                 match msg {
                     UiMsg::Probed(env) => {
+                        s.probed = true;
                         s.env = env;
                         s.status = "环境探测完成".into();
                         // 首次探测后，默认选中当前通道的最新版
@@ -341,6 +367,12 @@ fn drain(rx: &Receiver<UiMsg>, state: &Rc<RefCell<AppState>>) -> bool {
                         let _ = config::update(|f| f.running_port = None);
                     }
                     UiMsg::Failed { context, message } => {
+                        // 探测失败也必须置真：否则界面会永远停在"检测中…"，
+                        // 那只是把一种错误结论换成另一种更难排查的。
+                        // 上下文串按 Task 18 的实际取值（task-18-brief.md:71）。
+                        if context == "环境探测" {
+                            s.probed = true;
+                        }
                         s.busy = false;
                         s.busy_label.clear();
                         s.status = format!("{context}失败");
@@ -409,14 +441,21 @@ fn describe_outcome_log(o: &TxOutcome) -> Vec<String> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // §3.8 / FR-30：启动时读取持久化的偏好端口
-    let preferred_port = match config::load() {
-        config::Loaded::Ok(s) => s.preferred_port.unwrap_or(3080),
-        config::Loaded::Missing => 3080,
-        config::Loaded::Corrupt(e) => {
-            eprintln!("state.json 损坏，使用缺省端口：{e}"); // FR-32：记日志但不阻止启动
-            3080
-        }
-        config::Loaded::NoLocation => 3080,
+    //
+    // ⚠ FR-32/V-26 要的"记日志"**不能**用 eprintln!：本进程是
+    // windows_subsystem="windows"（GC-8），GetStdHandle(STD_ERROR_HANDLE) 返回
+    // NULL，std 把写失败直接吞掉 —— eprintln! 在这里是**空操作**，消息无影无踪。
+    // 日志面板是本程序唯一的日志出口，所以把话带出 match，等 state 建好再 push_log。
+    // （别用 `cargo run` 验证这条：它会给子进程一个继承来的控制台，从而假通过。）
+    let (preferred_port, startup_note) = match config::load() {
+        config::Loaded::Ok(s) => (s.preferred_port.unwrap_or(3080), None),
+        config::Loaded::Missing => (3080, None),
+        // FR-32：记日志但不阻止启动 —— 端口回落缺省值
+        config::Loaded::Corrupt(e) => (
+            3080,
+            Some(format!("state.json 损坏，使用缺省端口 3080：{e}")),
+        ),
+        config::Loaded::NoLocation => (3080, None),
     };
 
     let win = MainWindow::new()?;
@@ -424,9 +463,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = Rc::new(RefCell::new(AppState::new(preferred_port)));
     push_log(&state.borrow(), "DSH Manager 启动");
+    if let Some(note) = startup_note {
+        push_log(&state.borrow(), note);
+    }
 
-    // 首帧：显示加载态，而不是误导性的"未检测到"
-    // （§6.1.1：事件循环启动到首批数据到达之间有约 290ms 空窗期）
+    // 首帧：显示加载态，而不是误导性的"未检测到"。
+    // ⚠ 这里原先写"约 290ms 空窗期"是**错的**：290ms（SRS:782）是 80ms timer
+    // 回调首次跑到的里程碑，不是数据到达时间。第一条 UiMsg::Probed 要等
+    // pm::probe_env 跑完（四个 PM 各探两次、约九个 shim 进程，秒级）。
+    // 本函数不依赖任何耗时假设：画什么由 AppState::probed 决定 ——
+    // 未探测完时 project() 必定渲染"检测中…"，探测完成后才可能出现结论。
     project(&state.borrow(), &win, &tray);
 
     let (_job_tx, _job_rx) = mpsc::channel::<Job>(); // Task 18 接上
