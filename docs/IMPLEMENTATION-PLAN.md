@@ -481,7 +481,7 @@ mod model;
 
 > **`mod model;` 的插入位置**：必须在 `slint::include_modules!()` **之前**。`include_modules!` 展开为一个模块，放它会打乱顶层声明顺序（虽不报错但不清晰）。
 
-然后加一个**临时**冒烟测试，确认 `cfg_attr(not(test), windows_subsystem)` 没有吞掉测试输出。把下面这段**追加到 `src/model.rs` 末尾**：
+然后加一个测试，**永久保留**（它的本职是覆盖 FR-14 的命令表完整性，顺带确认 `cfg_attr(not(test), windows_subsystem)` 没有吞掉测试输出）。把下面这段**追加到 `src/model.rs` 末尾**：
 
 ```rust
 #[cfg(test)]
