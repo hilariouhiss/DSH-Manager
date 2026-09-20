@@ -59,6 +59,13 @@ struct AppState {
     /// 该分支一旦可达就会每个 tick 重复进入，没有闩锁就会变成 12.5 Hz 的
     /// 全量 `project()`（NFR-4 要求空闲接近零），并把之后的状态文案覆盖掉。
     worker_dead: bool,
+    /// UI 回调**直接改了状态、却没有任何 `Job`/消息**时要置真。
+    ///
+    /// ⚠ 这是必须的：`project()` 原先只在 `drain()` 返回 true 时跑，而
+    /// `on_install_clicked` 的两条拒绝路径（"未检测到已安装的 dsh"、
+    /// "请先选择一个目标版本"）只写 `status` 就 `return` —— 稳态下没有任何消息
+    /// 可排空，于是提示永远停在状态里，**界面上看不到**，按钮点起来像坏的。
+    dirty: bool,
     catalog: Option<Catalog>,
     notes: NotesState,
     web: WebState,
@@ -91,6 +98,7 @@ impl AppState {
             env: PmEnv::default(),
             probed: false,
             worker_dead: false,
+            dirty: false,
             catalog: None,
             notes: NotesState::default(),
             web: WebState::Stopped,
@@ -203,6 +211,14 @@ fn push_log(state: &AppState, line: impl Into<String>) {
     while model.row_count() > LOG_CAP {
         model.remove(0);
     }
+}
+
+/// 取出并清除"回调改过状态"标志。
+///
+/// 与 `drain` 并列：`drain` 负责"worker 说了什么"，本函数负责"回调自己改了什么"。
+/// 两者任一为真都必须 `project()`，否则会出现"状态里有、界面上没有"的静默失败。
+fn take_dirty(state: &Rc<RefCell<AppState>>) -> bool {
+    std::mem::take(&mut state.borrow_mut().dirty)
 }
 
 /// 唯一的状态投影点。**所有** UI 更新必须经过此函数。
@@ -334,20 +350,27 @@ fn drain(rx: &Receiver<UiMsg>, state: &Rc<RefCell<AppState>>) -> bool {
                         }
                     }
                     UiMsg::Notes { version, result } => {
-                        s.notes.version = Some(version);
-                        match result {
-                            Ok(body) => {
-                                s.notes.body = dsh::preprocess_notes(&body);
-                                s.notes.status = Some(NotesStatus::Ok);
-                            }
-                            Err(NotesError::Missing) => {
-                                s.notes.body.clear();
-                                s.notes.status = Some(NotesStatus::Missing);
-                            }
-                            Err(NotesError::Net(e)) => {
-                                s.notes.body.clear();
-                                s.notes.status = Some(NotesStatus::Failed);
-                                push_log(&s, format!("更新说明拉取失败: {e}"));
+                        // ⚠ 只认【当前选中】版本的回复（评审轮 1 裁决）：worker 是串行
+                        // FIFO，连续切换版本时队列里会积压好几个请求，迟到的回复若被
+                        // 无条件采信，说明区就会显示**另一个版本**的正文/状态 —— 而说明区
+                        // 没有任何版本标签，看起来同样权威（正是 FR-26 要避免的误报）。
+                        // 规则：最新选择赢，旧回复一律丢弃。
+                        if s.selected_version.as_ref() == Some(&version) {
+                            s.notes.version = Some(version);
+                            match result {
+                                Ok(body) => {
+                                    s.notes.body = dsh::preprocess_notes(&body);
+                                    s.notes.status = Some(NotesStatus::Ok);
+                                }
+                                Err(NotesError::Missing) => {
+                                    s.notes.body.clear();
+                                    s.notes.status = Some(NotesStatus::Missing);
+                                }
+                                Err(NotesError::Net(e)) => {
+                                    s.notes.body.clear();
+                                    s.notes.status = Some(NotesStatus::Failed);
+                                    push_log(&s, format!("更新说明拉取失败: {e}"));
+                                }
                             }
                         }
                     }
@@ -368,21 +391,32 @@ fn drain(rx: &Receiver<UiMsg>, state: &Rc<RefCell<AppState>>) -> bool {
                         // 单一投影点在这里 —— 所有 WebState 变更都经过本臂，
                         // 于是状态与 pid 不可能不同步（例如 External/Stopped 必须清空，
                         // 否则退出时会去 taskkill 一个早已不属于我们的 pid）。
+                        //
+                        // ⚠ `Starting` 也必须写入 pid（评审轮 1）：从 `spawn_web`
+                        // 成功到就绪为止（最长 20 秒超时窗口）只有它持有子进程 pid，
+                        // 漏掉就会出现"启动后 2 秒内点退出 → 静默孤儿"（FR-21）。
                         s.web_pid = match &ws {
-                            WebState::Running { pid, .. } => Some(*pid),
+                            WebState::Starting { pid, .. } | WebState::Running { pid, .. } => {
+                                Some(*pid)
+                            }
                             _ => None,
                         };
                         s.web = ws;
                     }
-                    UiMsg::WebExited { code } => {
-                        push_log(&s, format!("dsh web 已退出，退出码 {code:?}"));
-                        s.web = WebState::Stopped;
-                        // ⚠ 本臂直接写 `s.web`（不经上面的 WebState 臂），所以必须自己
-                        // 清 `web_pid`：否则子进程自行退出后残留一个**已死的 pid**，
-                        // 退出路径的 `stop_by_pid` 会拿着它 taskkill —— 而 pid 是会被
-                        // 系统复用的，复用到无辜进程上就是误杀（正是 NFR-7 要防的事）。
-                        s.web_pid = None;
-                        let _ = config::update(|f| f.running_port = None);
+                    UiMsg::WebExited { pid, code } => {
+                        push_log(&s, format!("dsh web（pid {pid}）已退出，退出码 {code:?}"));
+                        // ⚠ 只有它**确实是当前实例**时才改状态。worker 虽串行，但旧实例的
+                        // 退出通知可能迟到到新实例已经开始之后；无条件采信就会清掉新实例的
+                        // `web_pid`（退出路径随即拿不到 pid → 孤儿），或者把新实例的
+                        // "运行中"改成"已停止"。pid 就是这里唯一的身份凭证。
+                        //
+                        // 日志行**不**受此限制：退出事件本身始终值得记录，
+                        // 只是它不改变状态（正常停止路径下状态早已由 Job::StopWeb 置好）。
+                        if s.web_pid == Some(pid) {
+                            s.web = WebState::Stopped;
+                            s.web_pid = None;
+                            let _ = config::update(|f| f.running_port = None);
+                        }
                     }
                     UiMsg::Failed { context, message } => {
                         // 探测失败也必须置真：否则界面会永远停在"检测中…"，
@@ -511,6 +545,20 @@ impl txn::Backend for SystemBackend {
     }
 }
 
+/// 从 `catch_unwind` 的载荷里取一句可读消息。
+///
+/// ⚠ 三处守卫（worker 外层、`Job::Probe`、事务后重新探测）都必须用它：本进程是
+/// GUI 子系统（GC-8），默认 panic hook 的输出去了 NULL 的 stderr，载荷**不取出来
+/// 写进日志就等于什么都没留下**，第一次崩溃完全无法诊断。
+/// 载荷只可能是 `&str` 或 `String` 两种具体类型。
+fn panic_detail(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "未知 panic（载荷不是字符串）".into())
+}
+
 /// 唯一的 worker 线程。**无状态** —— 它需要的一切都在 Job 载荷里。
 /// 串行执行天然满足 FR-15（禁止并发事务）。
 fn spawn_worker(rx: Receiver<Job>, tx: Sender<UiMsg>) {
@@ -532,15 +580,7 @@ fn spawn_worker(rx: Receiver<Job>, tx: Sender<UiMsg>) {
             let result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| execute(job, &tx)));
             if let Err(payload) = result {
-                // ⚠ 必须把 panic 载荷**本身**写进日志。原先只说"内部错误，请查看日志"，
-                // 而日志里根本没有具体信息 —— 本进程是 GUI 子系统（GC-8），默认 panic
-                // hook 的输出去了 NULL 的 stderr，于是第一次崩溃完全无法诊断。
-                // 载荷是 `Box<dyn Any + Send>`，只有两种可能的具体类型（&str / String）。
-                let detail = payload
-                    .downcast_ref::<&str>()
-                    .map(|s| s.to_string())
-                    .or_else(|| payload.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "未知 panic（载荷不是字符串）".into());
+                let detail = panic_detail(&*payload);
                 let _ = tx.send(UiMsg::Log(format!("任务执行时发生 panic：{detail}")));
                 let _ = tx.send(UiMsg::Failed {
                     context: "任务执行",
@@ -558,7 +598,16 @@ fn execute(job: Job, tx: &Sender<UiMsg>) {
     match job {
         Job::Probe => match std::panic::catch_unwind(pm::probe_env) {
             Ok(env) => send(UiMsg::Probed(env)),
-            Err(_) => send(UiMsg::Failed { context: "环境探测", message: "内部错误".into() }),
+            // ⚠ 与 worker 外层守卫同理（GC-8）：载荷必须取出来写进日志，
+            // 否则"探测崩了"和"探测返回空"在界面上完全一样，无法诊断。
+            Err(payload) => {
+                let detail = panic_detail(&*payload);
+                send(UiMsg::Log(format!("环境探测发生 panic：{detail}")));
+                send(UiMsg::Failed {
+                    context: "环境探测",
+                    message: format!("内部错误：{detail}"),
+                });
+            }
         },
 
         Job::FetchCatalog => match dsh::fetch_catalog() {
@@ -631,8 +680,15 @@ fn execute(job: Job, tx: &Sender<UiMsg>) {
 
             // TR-7：事务后重新探测（owner PM 可能已改变）
             send(UiMsg::Log("事务结束，重新探测环境".into()));
-            if let Ok(env) = std::panic::catch_unwind(pm::probe_env) {
-                send(UiMsg::Probed(env));
+            match std::panic::catch_unwind(pm::probe_env) {
+                Ok(env) => send(UiMsg::Probed(env)),
+                // 同样地，载荷进日志而不是被丢掉（GC-8：没有 stderr）。
+                Err(payload) => {
+                    send(UiMsg::Log(format!(
+                        "事务后重新探测发生 panic：{}",
+                        panic_detail(&*payload)
+                    )));
+                }
             }
 
             // 事务前在运行 → 重新启动
@@ -691,7 +747,9 @@ fn start_web(port: u16, tx: &Sender<UiMsg>) {
     let send = |m: UiMsg| {
         let _ = tx.send(m);
     };
-    send(UiMsg::WebState(WebState::Starting { port }));
+    // ⚠ `Starting` 不再在这之前发（它现在必须带 pid，而 pid 要 `spawn_web` 成功才有）。
+    // 前置探测只要几百毫秒，界面在此期间保持原状态（已停止）即可 —— 反过来，
+    // 先发一个没有 pid 的 Starting 就等于在 20 秒超时窗口里给 FR-21 留了个洞。
 
     // FR-17：启动前端口探测
     if dsh::port_in_use(port) {
@@ -719,6 +777,12 @@ fn start_web(port: u16, tx: &Sender<UiMsg>) {
 
     match dsh::spawn_web(port, tx.clone()) {
         Ok(pid) => {
+            // ⚠ FR-21：子进程一存在就必须让 UI 侧拿到它的 pid —— 就绪可能要等
+            // 20 秒（`wait_port_ready` 超时），这段时间里退出若不带上 pid，
+            // 子进程就没人认领（没有 job object 兜底，`running_port` 也还没写，
+            // FR-31 同样救不回来）。
+            send(UiMsg::WebState(WebState::Starting { port, pid }));
+
             // 就绪确认后才写运行态端口（FR-31）
             if dsh::wait_port_ready(port, || true, Duration::from_secs(20)) {
                 let _ = config::update(|f| f.running_port = Some(port));
@@ -764,6 +828,9 @@ fn wire_callbacks(
             let mut s = state.borrow_mut();
             let (Some(owner), Some(installed)) = (s.env.owner, s.env.installed.clone()) else {
                 s.status = "未检测到已安装的 dsh，无法执行变更".into();
+                // ⚠ 必须置 dirty：本条拒绝**不发 Job**，稳态下没有任何消息可排空，
+                // 只写 status 的话 timer 永远不会投影，用户看不到提示（按钮像坏的）。
+                s.dirty = true;
                 return;
             };
             // ⚠ 目标必须来自【用户的选择】。不能取 catalog.versions.first()
@@ -771,6 +838,7 @@ fn wire_callbacks(
             // （用户可能在下拉里切到了别的 PM）。
             let Some(target_version) = s.selected_version.clone() else {
                 s.status = "请先选择一个目标版本".into();
+                s.dirty = true; // 同上：这条路径也没有 Job
                 return;
             };
             let target_pm = s.selected_pm.unwrap_or(owner);
@@ -823,6 +891,11 @@ fn wire_callbacks(
                     .as_ref()
                     .and_then(|c| c.versions.get(idx as usize).cloned());
                 s.selected_version = picked.clone();
+                // ⚠ 立刻把说明区退回 Loading 并清空正文（评审轮 1）：否则在新版本的
+                // 回复到达前，面板会**继续显示上一个版本**的正文/状态 —— 而面板没有
+                // 版本标签，看起来同样权威。配合 drain 里"只认当前选择"的过滤，
+                // 面板要么是 Loading，要么就是当前版本的内容。
+                s.notes = NotesState::default();
                 picked
             };
             if let Some(v) = picked {
@@ -1007,7 +1080,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let tray_w = tray.as_weak();
         let state = state.clone();
         timer.start(TimerMode::Repeated, Duration::from_millis(80), move || {
-            if drain(&msg_rx, &state) {
+            // ⚠ 两个来源都要看：除了排空消息，**回调也可能直接改了状态而没有消息**
+            // （`on_install_clicked` 的两条拒绝路径就是这样）。只看 drain 的话，
+            // 那些提示会写进 AppState 却永远不投影 —— 界面上看不到，按钮像坏的。
+            // 不能写成 `drain(..) || take_dirty(..)`：`||` 会短路，drain 为真时
+            // dirty 残留，下一 tick 白投影一次。所以先把标志取出来。
+            let dirty = take_dirty(&state);
+            if drain(&msg_rx, &state) || dirty {
                 if let (Some(w), Some(t)) = (win_w.upgrade(), tray_w.upgrade()) {
                     project(&state.borrow(), &w, &t);
                 }
@@ -1099,8 +1178,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // FR-21：退出必须先停掉本程序启动的 dsh web，不留孤儿 node 进程。
-    // ⚠ 用 AppState.web_pid（由 drain 的 WebState 臂维护）而**不是**
-    // find_listener_pid：后者会拿到外部实例的 pid，退出时把它一起杀掉。
+    // ⚠ 用 AppState.web_pid（由 drain 的 WebState 臂维护：Starting 与 Running 都带
+    // pid）而**不是** find_listener_pid：后者会拿到外部实例的 pid，退出时把它一起杀掉。
     // ⚠ 这里的 stop_by_pid 是同步的子进程调用，落在 UI 线程上 —— 它是
     // 【关机路径】上的有界动作（一次 taskkill），且必须在 quit_event_loop()
     // 之前完成；改成 worker 往返需要一个"停完再退"的握手，与收益不成比例。
@@ -1110,8 +1189,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Rc::new(move || {
             let pid = state.borrow().web_pid;
             if let Some(pid) = pid {
-                let _ = dsh::stop_by_pid(pid);
-                let _ = config::update(|f| f.running_port = None);
+                // ⚠ 只有**确知已停**才清 running_port（评审轮 1）。无条件清除的话，
+                // taskkill 失败时孤儿还活着、而它唯一的恢复信号（FR-31 的运行态端口）
+                // 已经被抹掉 —— FR-22 的孤儿恢复与 FR-31 会同时失效，下次启动再也
+                // 认不出这个进程。worker 的 Job::StopWeb 臂也正是这么写的（Ok 才清）。
+                match dsh::stop_by_pid(pid) {
+                    Ok(()) => {
+                        let _ = config::update(|f| f.running_port = None);
+                        push_log(
+                            &state.borrow(),
+                            format!("退出前已停止本程序启动的 dsh web（pid {pid}）"),
+                        );
+                    }
+                    Err(e) => push_log(
+                        &state.borrow(),
+                        format!(
+                            "退出前停止 dsh web（pid {pid}）失败：{e}；保留运行态记录，下次启动会重新探测"
+                        ),
+                    ),
+                }
             }
             let _ = job_tx; // 不再接受新任务
             slint::quit_event_loop().ok();

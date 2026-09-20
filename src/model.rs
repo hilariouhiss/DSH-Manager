@@ -165,7 +165,11 @@ pub enum TxOutcome {
 #[derive(Clone, Debug)]
 pub enum WebState {
     Stopped,
-    Starting { port: u16 },
+    /// ⚠ `pid` 不是装饰：从 `spawn_web` 成功到就绪为止（最长 `wait_port_ready`
+    /// 的 20 秒超时窗口）这是**唯一**持有子进程 pid 的地方。带上它，退出路径才能
+    /// 在这段时间里把子进程收掉 —— 否则就是 FR-21 的静默孤儿（没有 job object
+    /// 兜底，而 `running_port` 要就绪后才写，FR-31 同样恢复不了）。
+    Starting { port: u16, pid: u32 },
     Running { port: u16, pid: u32 },
     External { port: u16 },
     Failed { reason: String },
@@ -177,7 +181,7 @@ impl WebState {
     }
     pub fn port(&self) -> Option<u16> {
         match self {
-            WebState::Starting { port }
+            WebState::Starting { port, .. }
             | WebState::Running { port, .. }
             | WebState::External { port } => Some(*port),
             _ => None,
@@ -222,7 +226,11 @@ pub enum UiMsg {
     TxProgress(TxStep),
     TxDone(TxOutcome),
     WebState(WebState),
-    WebExited { code: Option<i32> },
+    /// ⚠ 必须带 `pid`：worker 是串行 FIFO，但旧实例的退出通知可能**迟到**到新实例
+    /// 已经开始之后。没有身份就无法区分"当前实例退出了"与"上一个实例的迟到消息"，
+    /// 后者会把新实例的 `web_pid` 清掉 —— 退出路径随即拿不到 pid（孤儿），
+    /// 或者更糟：拿着被系统复用的旧 pid 去 taskkill。
+    WebExited { pid: u32, code: Option<i32> },
     Failed { context: &'static str, message: String },
 }
 

@@ -18,6 +18,17 @@ pub const GITHUB_REPO: &str = "deepseek-ai/deepseek-harness";
 /// GC-5：只允许 registry.npmjs.org 与 api.github.com。github.com 实测不可达。
 pub const USER_AGENT: &str = "dsh-manager";
 
+/// 出网失败时挂给用户的**自我解释**提示（控制器裁决）。
+///
+/// 依据（评审轮 1 实测）：`ureq` 的默认 feature 集**不做系统代理发现**
+/// （它只读 `HTTP_PROXY`/`HTTPS_PROXY` 环境变量），而 GC-2 禁止为此引入
+/// 读注册表 / WinINET 的依赖。本机就撞上了这个组合：直连 api.github.com 得到
+/// HTTP 403（`X-RateLimit-Remaining: 0`，本机出口 IP 的小时配额），而系统代理
+/// `127.0.0.1:12450`（HKCU ProxyServer）返回 200 —— 于是**只有本程序**失败，
+/// 用户完全无从判断原因。既然不能自动发现代理，失败信息就必须自己说清楚。
+pub const PROXY_HINT: &str =
+    "（若本机仅允许通过系统代理出网，请设置 HTTPS_PROXY 后重启本程序）";
+
 /// NFR-3：全局超时上限，超时后进入失败路径而非无限等待。
 pub fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
@@ -62,7 +73,7 @@ pub fn fetch_catalog() -> Result<Catalog, String> {
         .header("Accept", "application/vnd.npm.install-v1+json")
         .header("User-Agent", USER_AGENT)
         .call()
-        .map_err(|e| format!("registry 请求失败: {e}"))?
+        .map_err(|e| format!("registry 请求失败: {e}{PROXY_HINT}"))?
         .body_mut()
         .read_to_string()
         .map_err(|e| format!("registry 响应读取失败: {e}"))?;
@@ -168,7 +179,8 @@ pub fn fetch_notes(version: &Version) -> Result<String, NotesError> {
         Ok(r) => r,
         // ureq 3 默认把 4xx/5xx 变成 Err(StatusCode)
         Err(ureq::Error::StatusCode(404)) => return Err(NotesError::Missing),
-        Err(e) => return Err(NotesError::Net(e.to_string())),
+        // ⚠ 403 既可能是"配额用尽"也可能是"只有系统代理能出网" —— 后者见 PROXY_HINT。
+        Err(e) => return Err(NotesError::Net(format!("{e}{PROXY_HINT}"))),
     };
     let body = resp
         .body_mut()
@@ -336,9 +348,11 @@ pub fn spawn_web(port: u16, tx: Sender<UiMsg>) -> Result<u32, String> {
     // 进程仍持有我们的 stdout/stderr 写句柄，reader 就永远读不到 EOF，wait() 便
     // 永不执行：子进程不被回收、WebExited 永不发送，界面会一直停在"运行中"。
     // 先 wait() 保证"回收 + 通知"一定发生，读者线程继续把日志排空。
+    // ⚠ 通知必须带上 `pid`：它是 UI 侧判断"这是当前实例还是上一个实例的迟到消息"
+    // 的唯一依据（迟到消息若无条件被采信，会清掉新实例的 `web_pid` —— FR-21 的孤儿）。
     thread::spawn(move || {
         let code = child.wait().ok().and_then(|s| s.code());
-        let _ = tx.send(UiMsg::WebExited { code });
+        let _ = tx.send(UiMsg::WebExited { pid, code });
         let _ = h_out.join();
         let _ = h_err.join();
     });
