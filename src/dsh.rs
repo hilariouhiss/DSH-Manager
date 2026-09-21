@@ -150,9 +150,14 @@ fn is_html_heading(line: &str) -> bool {
 /// **Other HTML tags**。而 DSH 的 release notes 通篇是 `### 新增功能` 这类 ATX
 /// 标题，且混有 `<h3 id="...">` 裸 HTML。不预处理就会原样显示成垃圾文本。
 ///
-/// 只做两件事：剥离 HTML 标签、标题降级为粗体。
+/// 只做三件事：剥离 HTML 标签、标题降级为粗体、**在标题前补一个空行**。
 /// 其余语法（粗体 / 斜体 / 行内代码 / **链接** / 列表）由 StyledText 原生支持，
 /// **不做干预** —— 尤其不要破坏链接。
+///
+/// 为什么补空行：`StyledText` 没有段落间距属性，但**空行**确实会渲染成一个约
+/// 14px 的段间距（实测：同样 9 行内容，紧凑排 143px、空行分隔 253px）。标题是
+/// 天然的分节边界，给它前面留一口气，长说明才读得下去；而列表项之间**不补** ——
+/// 那样每条之间多 14px，30 条的说明会凭空多出 400px 滚动量。
 pub fn preprocess_notes(md: &str) -> String {
     let mut out = String::with_capacity(md.len() + 32);
     for line in md.lines() {
@@ -166,6 +171,11 @@ pub fn preprocess_notes(md: &str) -> String {
         };
         match heading {
             Some(text) if !text.is_empty() => {
+                // ⚠ 只在这个标题**不是文首**、且上一行不是空行时补 —— 否则开头会
+                // 多出一条 14px 的空白，而连续两个标题之间会叠出 28px。
+                if !out.is_empty() && !out.ends_with("\n\n") {
+                    out.push('\n');
+                }
                 out.push_str("**");
                 out.push_str(text);
                 out.push_str("**\n");
@@ -679,6 +689,25 @@ mod tests {
     #[test]
     fn preprocess_handles_empty_input() {
         assert_eq!(preprocess_notes(""), "");
+    }
+
+    /// 分节空行：标题前补**恰好一个**空行，且不落在文首、不在连续标题间叠加。
+    ///
+    /// 判别性：这条钉住的是"阅读体验"那部分改动 —— 漏了它，长说明里所有小节会
+    /// 糊成一整块（实测空行能渲染出约 14px 段间距，而没有空行就完全没有间隔）。
+    #[test]
+    fn preprocess_puts_exactly_one_blank_line_before_headings() {
+        let out = preprocess_notes("### 甲\n- 一条\n### 乙\n- 两条\n");
+        assert_eq!(out, "**甲**\n- 一条\n\n**乙**\n- 两条\n", "标题前应有且仅有一个空行");
+        assert!(!out.starts_with('\n'), "文首不该多出空行");
+
+        // 连续两个标题：不能叠成两个空行
+        let out2 = preprocess_notes("### 甲\n### 乙\n");
+        assert_eq!(out2, "**甲**\n\n**乙**\n");
+
+        // 标题前本来就有空行时，也不该再补一个
+        let out3 = preprocess_notes("- 一条\n\n### 乙\n");
+        assert_eq!(out3, "- 一条\n\n**乙**\n");
     }
 
     #[test]

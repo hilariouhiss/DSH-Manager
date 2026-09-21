@@ -1059,14 +1059,23 @@ export component MainWindow inherits Window {
 
                 // 日志（FR-28）：最大的一块地，因为 npm install 可能跑 30 秒以上，
                 // 这段时间里它是唯一的进度反馈。
-                // ⚠ 表头（"输出" + "x 行" + "尚无输出…"）已按要求整条去掉：面板自己
-                // 会滚动，行数没人看；空状态那句提示也随之消失（要的话可以放回面板内）。
-                // 去掉后日志面板与左栏第一张卡片同高起头，右栏反而多出 30px。
+                // ⚠ 标题在面板**内部**顶部居中（原先那行表头在面板外侧，还带个"x 行"
+                // 计数器与空状态提示）—— 计数器与提示确实去掉了，但标题本身回到它
+                // 描述的那块区域里，与下方"更新说明"同一种做法。
                 Bezel {
                     vertical-stretch: 1.6;
                     // ⚠ 必须有下限：ListView 的最小高度是 0，窗口不够高时
                     // 它会被压缩到只剩一条缝（实测 660px 窗口下日志区塌成 0）。
                     min-height: 150px;
+                    HorizontalLayout {
+                        height: 30px;
+                        alignment: center;
+                        Eyebrow {
+                            text: "输出";
+                            // 居中：即使这一格被布局撑宽，字形也留在格子中间
+                            horizontal-alignment: center;
+                        }
+                    }
                     // ⚠ 【不要】用 ScrollView 包 ListView。ListView 自己就会滚动；
                     // 套一层 ScrollView 会让它按内容全高布局，从而破坏虚拟化 ——
                     // 日志上限 2000 行（GC-12），那就等于一次渲染 2000 个 Text。
@@ -1090,33 +1099,42 @@ export component MainWindow inherits Window {
                 Rectangle { height: 14px; }
 
                 // 更新说明（FR-27）
-                HorizontalLayout {
-                    height: 30px;
-                    spacing: 8px;
-                    alignment: center;
-                    Eyebrow {
-                        text: "更新说明" + (
-                            root.notes-status == NotesStatus.missing ? " · 该版本无更新说明" :
-                            root.notes-status == NotesStatus.loading ? " · 加载中…" :
-                            root.notes-status == NotesStatus.failed  ? " · 加载失败" : ""
-                        );
-                    }
-                    Rectangle { horizontal-stretch: 1; }
-                    Text {
-                        visible: root.has-notes;
-                        text: root.version-index >= 0 && root.version-index < root.version-options.length
-                            ? root.version-options[root.version-index] : "";
-                        color: Tokens.ink-4;
-                        font-family: Font.mono;
-                        font-size: 10px;
-                        vertical-alignment: center;
-                    }
-                }
-
+                // ⚠ 标题移进面板**内部**顶部居中（原先在面板外侧单独占一行）。
+                // 版本号与标题**同一个居中簇**：它是元数据但不是标题，紧跟在标题后面
+                // 读起来像副标题。⚠ 不要用"左右两格夹住标题"那种写法 —— 实测空格子
+                // 不会被撑开，标题会贴在左边（Slint 布局分配富余宽度的行为与直觉不同）。
                 Bezel {
                     vertical-stretch: 1;
                     min-height: 130px;
-                    ScrollView {
+                    HorizontalLayout {
+                        height: 30px;
+                        spacing: 8px;
+                        alignment: center;
+                        Eyebrow {
+                            text: "更新说明" + (
+                                root.notes-status == NotesStatus.missing ? " · 该版本无更新说明" :
+                                root.notes-status == NotesStatus.loading ? " · 加载中…" :
+                                root.notes-status == NotesStatus.failed  ? " · 加载失败" : ""
+                            );
+                        }
+                        Text {
+                            visible: root.has-notes;
+                            text: root.version-index >= 0 && root.version-index < root.version-options.length
+                                ? root.version-options[root.version-index] : "";
+                            color: Tokens.ink-4;
+                            font-family: Font.mono;
+                            font-size: 10px;
+                            vertical-alignment: center;
+                        }
+                    }
+                    // ⚠ 这三段内容必须用 `if` 而不是 `visible:` —— Slint 里**不可见的元素
+                    // 照样占布局位置**：骨架屏（4 行 × 11px + 3 × 9px 间距 ≈ 71px）与空状态
+                    // 即使 visible: false，也会先把高度从 Bezel 的内胎里吃掉，ScrollView
+                    // 的视口因此被砍短近百像素 —— 表现就是"正文被提前遮住、下面留一条黑带、
+                    // 还得滚动才看得全"（实测：说明区最后一行文字在 y=667，而面板底边在
+                    // y≈789，空掉 122px）。同一条坑在 PillButton 里也踩过：只隐藏不消失，
+                    // 位置照样留着。`if` 是"根本不存在"。
+                    if root.notes-status == NotesStatus.ok : ScrollView {
                         vertical-stretch: 1;
                         // ⚠ StyledText 必须由布局托管，不能直接当 Flickable 的子元素。
                         // 隐式尺寸的非布局子元素会被 Slint 在父元素里居中
@@ -1129,14 +1147,24 @@ export component MainWindow inherits Window {
                             padding-right: 4px;
                             StyledText {
                                 text: root.notes-text;
-                                default-font-size: 12px;
+                                // ── 阅读体验 ──
+                                // 字号 12 → 12.5px，字体与全应用一致（不写就跟 Window 默认，
+                                // 与界面其余部分不是同一支字）。
+                                default-font-family: Font.text;
+                                default-font-size: 12.5px;
+                                // 正文颜色：不写时 Slint 用主题前景色 —— 实测是接近纯白的
+                                // (226,226,226)，长文读起来发涩，也跟界面其余部分不一致。
+                                // 用 Tokens.ink-2（正文色，对比度约 7:1）与别处统一。
+                                default-color: Tokens.ink-2;
+                                // 链接色：Slint 的默认是纯蓝 #00f，落在近黑底上很刺眼，
+                                // 换成设计里那支信息蓝。
+                                link-color: Tokens.good;
                                 link-clicked(link) => { root.link-clicked(link); }
                             }
                         }
                     }
                     // 骨架屏：形状与正文一致，比转圈的 spinner 更少突兀
-                    VerticalLayout {
-                        visible: root.notes-loading;
+                    if root.notes-loading : VerticalLayout {
                         padding-left: 4px;
                         spacing: 9px;
                         Rectangle { height: 11px; width: 62%; border-radius: 5px; background: Tokens.hairline-soft; }
@@ -1145,9 +1173,8 @@ export component MainWindow inherits Window {
                         Rectangle { height: 11px; width: 41%; border-radius: 5px; background: Tokens.hairline-soft; }
                     }
                     // 空状态：该版本没有说明，说清楚而不是留一片白
-                    VerticalLayout {
-                        visible: root.notes-status == NotesStatus.missing
-                              || root.notes-status == NotesStatus.failed;
+                    if root.notes-status == NotesStatus.missing
+                    || root.notes-status == NotesStatus.failed : VerticalLayout {
                         alignment: center;
                         Text {
                             text: root.notes-status == NotesStatus.missing
