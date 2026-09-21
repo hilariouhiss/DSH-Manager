@@ -71,6 +71,9 @@ struct AppState {
     start_port: Option<u16>,
     catalog: Option<Catalog>,
     notes: NotesState,
+    /// 已经派发出去、还没收到回复的那次"取更新说明"。见 `request_notes`：
+    /// 探测与目录两个消息都会试着补说明，没有它就会为同一个版本发两次请求。
+    notes_inflight: Option<Version>,
     web: WebState,
     busy: bool,
     busy_label: String,
@@ -109,6 +112,7 @@ impl AppState {
             start_port: None,
             catalog: None,
             notes: NotesState::default(),
+            notes_inflight: None,
             web: WebState::Stopped,
             busy: false,
             busy_label: String::new(),
@@ -169,26 +173,38 @@ impl AppState {
         }
     }
 
+    /// 下拉里只放 PM 名字。归属标记**不在这里**：它现在由行尾那句"DSH 在此！"
+    /// 承担（见 ui/app.slint 的包管理行），塞进选项文字会把下拉撑得很长，
+    /// 而且只有选中 owner 时才有意义。
     fn pm_labels(&self) -> Vec<slint::SharedString> {
         self.env
             .available
             .iter()
-            .map(|info| {
-                let mark = if self.env.owner == Some(info.kind) {
-                    "  ·  dsh 安装于此"
-                } else {
-                    ""
-                };
-                slint::SharedString::from(format!("{}{mark}", info.kind.label()))
-            })
+            .map(|info| slint::SharedString::from(info.kind.label()))
             .collect()
+    }
+
+    /// 行尾那个"当前"的判据：下拉里选中的版本是不是本机已装的那个。
+    /// ⚠ 与版本卡上的"已是最新"不是一回事：那个问的是"通道内还有没有更新的"，
+    /// 这个问的是"我选中的是不是现在装着的"（选了旧版本时它就不亮）。
+    fn version_is_current(&self) -> bool {
+        match (self.selected_version.as_ref(), self.env.installed.as_ref()) {
+            (Some(sel), Some(cur)) => sel == cur,
+            _ => false,
+        }
+    }
+
+    /// 行尾那句"DSH 在此！"的判据：当前选中的 PM 是不是 owner。
+    /// 还没选过时下标回落到 owner（见 `selected_pm_index`），所以也算命中。
+    fn pm_is_owner(&self) -> bool {
+        let Some(owner) = self.env.owner else { return false };
+        self.selected_pm.unwrap_or(owner) == owner
     }
 
     fn version_labels(&self) -> Vec<slint::SharedString> {
         let Some(catalog) = self.catalog.as_ref() else {
             return vec![];
         };
-        let cur = self.env.installed.clone();
         catalog
             .versions
             .iter()
@@ -199,8 +215,10 @@ impl AppState {
                     Channel::Alpha => "alpha",
                     Channel::Other => "other",
                 };
-                let here = if cur.as_ref() == Some(v) { "  ← 当前" } else { "" };
-                slint::SharedString::from(format!("{v}  ({ch}){here}"))
+                // ⚠ 这里**不再**拼 "← 当前"：那个标记已经移到行尾（见 app.slint 的
+                // 目标版本行）。留在选项文字里会把下拉撑长，而且它描述的是
+                // "本机装的是哪个"，跟"我要装哪个"混在同一句话里。
+                slint::SharedString::from(format!("{v}  ({ch})"))
             })
             .collect()
     }
@@ -280,8 +298,10 @@ fn project(state: &AppState, win: &MainWindow, tray: &AppTray) {
     // ⚠ 必须反映【用户的选择】，不能硬编码 owner 下标 —— 否则用户切到
     // pnpm 后界面会被下一帧弹回 npm。
     win.set_pm_index(state.selected_pm_index());
+    win.set_pm_is_owner(state.pm_is_owner());
     win.set_version_options(ModelRc::from(Rc::new(VecModel::from(state.version_labels()))));
     win.set_version_index(state.selected_version_index());
+    win.set_version_is_current(state.version_is_current());
 
     win.set_web_running(state.web.is_running());
     // ⚠ I-2：`web-running` 只认 Running/External，而 `Starting`（正常约 2 秒，超时路径
@@ -344,9 +364,15 @@ fn project(state: &AppState, win: &MainWindow, tray: &AppTray) {
 }
 
 /// 排空 worker 消息。返回是否发生了状态变化（决定要不要 project）。
-fn drain(rx: &Receiver<UiMsg>, state: &Rc<RefCell<AppState>>) -> bool {
+///
+/// `tx` 用于一个内部例外：目录到达后要**主动**去取当前选中版本的更新说明
+/// （否则没人点下拉就永远停在"加载中"，见 `request_notes`）。
+fn drain(rx: &Receiver<UiMsg>, state: &Rc<RefCell<AppState>>, tx: &Sender<Job>) -> bool {
     let mut changed = false;
     loop {
+        // 本轮是否需要补一次"取说明"。⚠ 必须在 `s`（RefMut）**释放之后**再动作：
+        // request_notes 自己要 borrow，带着可变借用调它会 panic。
+        let mut want_notes: Option<Version> = None;
         match rx.try_recv() {
             Ok(msg) => {
                 changed = true;
@@ -361,6 +387,9 @@ fn drain(rx: &Receiver<UiMsg>, state: &Rc<RefCell<AppState>>) -> bool {
                         if s.selected_version.is_none() {
                             s.selected_version = newest;
                         }
+                        // 探测与目录谁先到不一定，两边都要试着补说明（重复由
+                        // request_notes 的"同一版本正在飞就不重发"挡掉）。
+                        want_notes = s.selected_version.clone();
                     }
                     UiMsg::Catalog(c) => {
                         s.catalog = Some(c);
@@ -368,17 +397,27 @@ fn drain(rx: &Receiver<UiMsg>, state: &Rc<RefCell<AppState>>) -> bool {
                         if s.selected_version.is_none() {
                             s.selected_version = newest;
                         }
+                        want_notes = s.selected_version.clone();
                     }
                     UiMsg::Notes { version, result } => {
+                        if s.notes_inflight.as_ref() == Some(&version) {
+                            s.notes_inflight = None;
+                        }
                         // ⚠ 只认【当前选中】版本的回复（评审轮 1 裁决）：worker 是串行
                         // FIFO，连续切换版本时队列里会积压好几个请求，迟到的回复若被
                         // 无条件采信，说明区就会显示**另一个版本**的正文/状态 —— 而说明区
                         // 没有任何版本标签，看起来同样权威（正是 FR-26 要避免的误报）。
                         // 规则：最新选择赢，旧回复一律丢弃。
                         if s.selected_version.as_ref() == Some(&version) {
-                            s.notes.version = Some(version);
+                            s.notes.version = Some(version.clone());
                             match result {
                                 Ok(body) => {
+                                    // 拉到的正文进缓存（原样存，读的时候再预处理）——
+                                    // 这就是"同一版本一周内不再联网"的全部实现。
+                                    if let Err(e) = config::store_notes(&version.to_string(), &body)
+                                    {
+                                        push_log(&s, format!("更新说明缓存写入失败（不影响本次显示）：{e}"));
+                                    }
                                     s.notes.body = dsh::preprocess_notes(&body);
                                     s.notes.status = Some(NotesStatus::Ok);
                                 }
@@ -496,8 +535,39 @@ fn drain(rx: &Receiver<UiMsg>, state: &Rc<RefCell<AppState>>) -> bool {
                 break;
             }
         }
+        // `s` 已在本轮结束处释放（它的作用域就是上面那个 match 块）。
+        if let Some(v) = want_notes {
+            request_notes(state, |j| {
+                let _ = tx.send(j);
+            }, v);
+        }
     }
     changed
+}
+
+/// 取某个版本的更新说明：**先看缓存**，只有没缓存或已过期（一周）才联网。
+///
+/// 需求（FR-27 修订）：同一个版本的说明只拉一次，一周内不再联网。
+/// 缓存写在 config::load_notes / store_notes（notes-cache.json），这里是唯一的
+/// "什么时候该拉"的决策点 —— 与 config.rs 只做 I/O 的分工一致。
+fn request_notes(state: &Rc<RefCell<AppState>>, send: impl Fn(Job), version: Version) {
+    if let Some(body) = config::load_notes(&version.to_string()) {
+        let mut s = state.borrow_mut();
+        s.notes.version = Some(version);
+        s.notes.body = dsh::preprocess_notes(&body);
+        s.notes.status = Some(NotesStatus::Ok);
+        // ⚠ 这条路径**不发任何消息**：不置 dirty 的话，说明区会一直停在
+        // Loading（回调已经把 notes 重置过了），缓存等于没命中。
+        s.dirty = true;
+        return;
+    }
+    // 同一版本已经有一个请求在飞时不要重发：探测与目录谁先到不一定，
+    // 两边都会试着补说明；重复请求会白跑一次网络（NFR-3 的 15 秒超时也在排队）。
+    if state.borrow().notes_inflight.as_ref() == Some(&version) {
+        return;
+    }
+    state.borrow_mut().notes_inflight = Some(version.clone());
+    send(Job::FetchNotes { version });
 }
 
 fn describe_outcome(o: &TxOutcome) -> String {
@@ -1032,7 +1102,9 @@ fn wire_callbacks(
                 picked
             };
             if let Some(v) = picked {
-                send(Job::FetchNotes { version: v });
+                // ⚠ 走 request_notes 而不是直接发 Job：一周内看过的版本直接从
+                // notes-cache.json 读回来，不联网（FR-27 修订）。
+                request_notes(&state, |j| send(j), v);
             }
         });
     }
@@ -1350,6 +1422,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let win_w = win.as_weak();
         let tray_w = tray.as_weak();
         let state = state.clone();
+        let job_tx = job_tx.clone();
         timer.start(TimerMode::Repeated, Duration::from_millis(80), move || {
             // ⚠ 两个来源都要看：除了排空消息，**回调也可能直接改了状态而没有消息**
             // （`on_install_clicked` 的两条拒绝路径就是这样）。只看 drain 的话，
@@ -1357,7 +1430,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // 不能写成 `drain(..) || take_dirty(..)`：`||` 会短路，drain 为真时
             // dirty 残留，下一 tick 白投影一次。所以先把标志取出来。
             let dirty = take_dirty(&state);
-            if drain(&msg_rx, &state) || dirty {
+            if drain(&msg_rx, &state, &job_tx) || dirty {
                 if let (Some(w), Some(t)) = (win_w.upgrade(), tray_w.upgrade()) {
                     project(&state.borrow(), &w, &t);
                 }

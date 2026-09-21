@@ -596,6 +596,14 @@ export component MainWindow inherits Window {
     in property <[string]> version-options: [];
     in-out property <int>    version-index: 0;
 
+    /// 当前选中的包管理器是不是 dsh 的 owner（"DSH 在此！"只看这一件事）。
+    /// 由 project() 推：`selected_pm` 还没选过时 = owner 本身。
+    in property <bool> pm-is-owner: false;
+    /// 目标版本下拉里选的是不是**本机已装**的那个版本（行尾"当前"只看这一件事）。
+    /// 同样是 project() 推 —— 它和版本卡上的"已是最新/可更新"是两个不同的问题：
+    /// 这个说的是"选中的就是现在装着的"。
+    in property <bool> version-is-current: false;
+
     // ── dsh web（FR-18）──
     in property <bool>   web-running: false;
     // I-2：`web-running` 在 `Starting` 期间是 false（那时还没有监听者），
@@ -821,10 +829,13 @@ export component MainWindow inherits Window {
                     core-padding: 16px;
                     spacing: 8px;
 
+                    // ⚠ 这两行都**不能**写 alignment: center：那样每行会各自把自己那组
+                    // 居中，而两行的内容宽度不同（下拉里选中的文字长短不一），于是两个
+                    // 标签的左边距对不齐 —— 看着就是"错位"。用默认对齐 + 标签写死 62px，
+                    // 两行左边缘就都从同一条线开始（下拉吃掉剩下的宽度）。
                     HorizontalLayout {
                         spacing: 10px;
-                        alignment: center;
-                        Eyebrow { text: "包管理器"; width: 62px; }
+                        Eyebrow { text: "包管理"; width: 62px; }
                         // ⚠ 必须钉死高度与最小宽度：Fluent ComboBox 自带
                         // `min-width: max(160px, layout.min-height)` 与
                         // `min-height: max(32px, …)`，实测它渲染成 62px 高、
@@ -838,10 +849,21 @@ export component MainWindow inherits Window {
                             enabled: !root.busy;
                             selected(v) => { root.pm-changed(self.current-index); }
                         }
+                        // "dsh 装在这台机器的哪个 PM 上"原先挤在下拉的选中文字里
+                        // （npm  ·  dsh 安装于此），把下拉本身撑得很长；改到行尾，
+                        // 且只在**选中的这个 PM 就是 owner** 时才亮。
+                        Text {
+                            visible: root.pm-is-owner;
+                            text: "DSH 在此！";
+                            color: Tokens.accent;
+                            font-family: Font.text;
+                            font-size: 11px;
+                            width: 58px;
+                            vertical-alignment: center;
+                        }
                     }
                     HorizontalLayout {
                         spacing: 10px;
-                        alignment: center;
                         Eyebrow { text: "目标版本"; width: 62px; }
                         ComboBox {
                             horizontal-stretch: 1;
@@ -851,6 +873,18 @@ export component MainWindow inherits Window {
                             current-index <=> root.version-index;
                             enabled: !root.busy;
                             selected(v) => { root.version-changed(self.current-index); }
+                        }
+                        // "← 当前"原先拼在下拉的选项文字里（把下拉撑长、还跟着走），
+                        // 现在和包管理行的"DSH 在此！"一样落在行尾，且只在
+                        // **选中的就是本机已装版本**时亮。
+                        Text {
+                            visible: root.version-is-current;
+                            text: "当前";
+                            color: Tokens.accent;
+                            font-family: Font.text;
+                            font-size: 11px;
+                            width: 30px;
+                            vertical-alignment: center;
                         }
                     }
 
@@ -1005,25 +1039,9 @@ export component MainWindow inherits Window {
 
                 // 日志（FR-28）：最大的一块地，因为 npm install 可能跑 30 秒以上，
                 // 这段时间里它是唯一的进度反馈。
-                HorizontalLayout {
-                    height: 30px;
-                    spacing: 8px;
-                    alignment: center;
-                    Eyebrow { text: "输出"; }
-                    Rectangle { horizontal-stretch: 1; }
-                    // 空状态就在这里表达：不额外占高度，也不与 ListView 抢空间，
-                    // 而且是"给出下一步"而不是干巴巴一句"没有数据"。
-                    Text {
-                        text: root.log-lines.length == 0
-                            ? "尚无输出 · 点“刷新”重新探测环境与版本列表"
-                            : root.log-lines.length + " 行";
-                        color: Tokens.ink-4;
-                        font-family: Font.mono;
-                        font-size: 10px;
-                        vertical-alignment: center;
-                    }
-                }
-
+                // ⚠ 表头（"输出" + "x 行" + "尚无输出…"）已按要求整条去掉：面板自己
+                // 会滚动，行数没人看；空状态那句提示也随之消失（要的话可以放回面板内）。
+                // 去掉后日志面板与左栏第一张卡片同高起头，右栏反而多出 30px。
                 Bezel {
                     vertical-stretch: 1.6;
                     // ⚠ 必须有下限：ListView 的最小高度是 0，窗口不够高时
@@ -1044,7 +1062,9 @@ export component MainWindow inherits Window {
                     // 额外子元素都会与 ListView 抢剩余高度（实测把日志区挤成 0），
                     // 而 Slint 的布局又拒绝绝对定位的装饰层（"The property 'y'
                     // cannot be set for elements placed in this layout"）。
-                    // 所以"尚无输出"改由面板上方的标题行承担（见 logmeta）。
+                    // ⚠ 原先表头那句"尚无输出 · 点刷新…"就是这么绕开布局限制的；
+                    // 表头整条去掉后，日志为空时面板就是一块空玻璃 —— 这是已知取舍，
+                    // 真要提示得放进面板内部（例如 ListView 之上叠一层，代价见上）。
                 }
 
                 Rectangle { height: 14px; }

@@ -116,9 +116,9 @@ pub fn save(s: &StateFile) -> Result<(), String> {
     }
 }
 
-/// 原子写入的测试缝。
+/// 原子写入：写 `.tmp` → rename。
 ///
-/// **必须**走"写 .tmp → rename"，不得直接截断目标文件。
+/// **必须**走这条路，不得直接截断目标文件。
 /// 依据：FR-31 要应对的核心场景是管理器被强杀，而直接截断写入时进程若在
 /// 写入中途终止，state.json 会变成半截 JSON。也就是说 —— 最需要持久化生效
 /// 的场景，恰恰是朴素写入最容易毁掉数据的场景。文件一坏，下次启动回落缺省
@@ -126,17 +126,10 @@ pub fn save(s: &StateFile) -> Result<(), String> {
 ///
 /// fs::rename 的覆盖语义已核实：Rust 文档明确 "replacing the original file
 /// if `to` already exists"，Windows 上通过 MoveFileExW 实现。
-pub fn save_to(path: &Path, s: &StateFile) -> Result<(), String> {
+fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("创建目录失败: {e}"))?;
     }
-    let json = serde_json::json!({
-        "preferred_port": s.preferred_port,
-        "running_port": s.running_port,
-        "close_behavior": s.close_behavior.map(CloseBehavior::as_str),
-    });
-    let text = serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?;
-
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, text).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
@@ -146,6 +139,109 @@ pub fn save_to(path: &Path, s: &StateFile) -> Result<(), String> {
         let _ = std::fs::remove_file(&tmp);
         format!("替换失败: {e}")
     })
+}
+
+/// 原子写入的测试缝（state.json）。
+pub fn save_to(path: &Path, s: &StateFile) -> Result<(), String> {
+    let json = serde_json::json!({
+        "preferred_port": s.preferred_port,
+        "running_port": s.running_port,
+        "close_behavior": s.close_behavior.map(CloseBehavior::as_str),
+    });
+    let text = serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?;
+    write_atomic(path, &text)
+}
+
+// ── 更新说明缓存（FR-27 修订）────────────────────────────────────────────────
+//
+// 需求：**同一个版本的更新说明只拉一次**，一周内不再联网；过期或没缓存过才去拉。
+// 单独一个文件（notes-cache.json），不塞进 state.json：说明正文是 KB 级的，
+// 而 state.json 每改一次端口就要整份重写 —— 混在一起等于每次改端口都顺带重写几 KB。
+
+/// 缓存有效期：一周。过了就当没有，重新拉。
+pub const NOTES_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// 缓存里最多留几个版本。说明正文是 KB 级，八个不同版本也就几十 KB；
+/// 超出时丢最旧的 —— 这是个缓存，不是档案。
+const NOTES_CACHE_MAX: usize = 8;
+
+pub fn notes_cache_path() -> Option<PathBuf> {
+    let base = std::env::var_os("APPDATA")?;
+    Some(PathBuf::from(base).join("dsh-manager").join("notes-cache.json"))
+}
+
+/// Unix 秒。取不到系统时间（时钟早于 1970）时返回 0 —— 那会让所有条目都判为过期，
+/// 即"重新拉一次"，这是安全的失败方向。
+pub fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 条目是否还在有效期内。⚠ 纯函数：TTL 的边界（差一秒、正好到点）只有把它
+/// 从系统时钟里摘出来才测得住。
+pub fn is_fresh(fetched_at: u64, now: u64) -> bool {
+    // ⚠ 用 saturating_sub：时钟被往回调（或 fetched_at 来自"未来"）时，
+    // now - fetched_at 会下溢 —— 在 debug 构建里那是 panic，不是"过期"。
+    now.saturating_sub(fetched_at) < NOTES_TTL_SECS
+}
+
+/// 取某个版本的说明正文（仅当缓存命中且未过期）。
+///
+/// 任何异常（文件缺失、损坏、字段类型不对）都返回 None —— 调用方据此去联网拉，
+/// 也就是"缓存坏了最多多拉一次"，绝不因为缓存本身出问题而报错。
+pub fn load_notes(version: &str) -> Option<String> {
+    load_notes_from(notes_cache_path()?.as_path(), version, now_unix())
+}
+
+pub fn load_notes_from(path: &Path, version: &str, now: u64) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let entry = v.get(version)?;
+    let at = entry.get("at")?.as_u64()?;
+    if !is_fresh(at, now) {
+        return None;
+    }
+    entry.get("body")?.as_str().map(str::to_string)
+}
+
+/// 写入一条缓存，并顺手清掉过期条目、裁到上限。
+pub fn store_notes(version: &str, body: &str) -> Result<(), String> {
+    match notes_cache_path() {
+        Some(p) => store_notes_to(&p, version, body, now_unix()),
+        None => Err("APPDATA 不可用".into()),
+    }
+}
+
+pub fn store_notes_to(path: &Path, version: &str, body: &str, now: u64) -> Result<(), String> {
+    let existing = std::fs::read_to_string(path).ok();
+    let mut map: serde_json::Map<String, serde_json::Value> = existing
+        .as_deref()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+
+    map.insert(version.to_string(), serde_json::json!({ "at": now, "body": body }));
+
+    // 过期条目直接丢：留着也不会被采用，只是占地方。
+    map.retain(|_, e| e.get("at").and_then(|a| a.as_u64()).is_some_and(|a| is_fresh(a, now)));
+    // 仍超上限时丢最旧的几个（at 最小的）。
+    while map.len() > NOTES_CACHE_MAX {
+        let oldest = map
+            .iter()
+            .min_by_key(|(_, e)| e.get("at").and_then(|a| a.as_u64()).unwrap_or(0))
+            .map(|(k, _)| k.clone());
+        match oldest {
+            Some(k) => {
+                map.remove(&k);
+            }
+            None => break,
+        }
+    }
+
+    let text = serde_json::to_string(&serde_json::Value::Object(map)).map_err(|e| e.to_string())?;
+    write_atomic(path, &text)
 }
 
 /// 串行化 `update` 的"读—改—写"。进程内全局锁，够用 —— 只有本程序写这个文件。
@@ -401,6 +497,86 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+        let _ = std::fs::remove_file(&p);
+    }
+}
+
+#[cfg(test)]
+mod notes_cache_tests {
+    use super::*;
+
+    fn tmp(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("dsh-mgr-notes-{name}-{}", std::process::id()))
+    }
+
+    /// 判别性测试：TTL 的**边界**。它捕获的变异是把 `<` 写成 `<=`（或反过来）——
+    /// 那种偏差在真实使用里要等一整周才看得出来。
+    #[test]
+    fn ttl_boundary_is_exclusive() {
+        let t = 1_000_000;
+        assert!(is_fresh(t, t), "刚写入的就是新鲜的");
+        assert!(is_fresh(t, t + NOTES_TTL_SECS - 1), "差一秒还没过期");
+        assert!(!is_fresh(t, t + NOTES_TTL_SECS), "正好到点就算过期");
+        assert!(!is_fresh(t, t + NOTES_TTL_SECS + 1));
+    }
+
+    /// 时钟被往回调 / 条目来自"未来"时不能 panic（debug 构建里减法下溢就是 panic）。
+    #[test]
+    fn clock_going_backwards_is_not_a_panic() {
+        assert!(is_fresh(2_000_000, 1_000_000));
+        assert!(is_fresh(0, 0));
+    }
+
+    #[test]
+    fn store_then_load_roundtrip() {
+        let p = tmp("roundtrip.json");
+        let _ = std::fs::remove_file(&p);
+        store_notes_to(&p, "1.2.3", "正文 A", 500).unwrap();
+        assert_eq!(load_notes_from(&p, "1.2.3", 500).as_deref(), Some("正文 A"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 需求的原话是"拉取一次后缓存，直到一周后失效"：过期后必须**读不到**，
+    /// 这样调用方才会重新去拉。
+    #[test]
+    fn expired_entry_is_not_served() {
+        let p = tmp("expired.json");
+        let _ = std::fs::remove_file(&p);
+        store_notes_to(&p, "1.2.3", "正文 A", 500).unwrap();
+        assert!(load_notes_from(&p, "1.2.3", 500 + NOTES_TTL_SECS).is_none());
+        // 而且写入新条目时会被顺手清掉，文件不会无限长大
+        store_notes_to(&p, "9.9.9", "正文 B", 500 + NOTES_TTL_SECS).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(!text.contains("1.2.3"), "过期条目应在写入时被清掉: {text}");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn unknown_version_and_broken_file_yield_none() {
+        let p = tmp("broken.json");
+        let _ = std::fs::remove_file(&p);
+        assert!(load_notes_from(&p, "1.2.3", 0).is_none(), "文件不存在 → None");
+        std::fs::write(&p, "{ 这不是 json").unwrap();
+        assert!(load_notes_from(&p, "1.2.3", 0).is_none(), "文件损坏 → None（最多多拉一次）");
+        std::fs::write(&p, r#"{"1.2.3":{"at":"昨天","body":42}}"#).unwrap();
+        assert!(load_notes_from(&p, "1.2.3", 0).is_none(), "字段类型不对 → None");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn keeps_other_versions_and_caps_size() {
+        let p = tmp("cap.json");
+        let _ = std::fs::remove_file(&p);
+        for i in 0..(NOTES_CACHE_MAX + 3) {
+            store_notes_to(&p, &format!("1.0.{i}"), &format!("正文 {i}"), 100 + i as u64).unwrap();
+        }
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        let map = v.as_object().unwrap();
+        assert_eq!(map.len(), NOTES_CACHE_MAX, "应裁到上限");
+        // 留下的必须是最新的几个：最新的那条一定在
+        assert!(map.contains_key(&format!("1.0.{}", NOTES_CACHE_MAX + 2)));
+        assert!(!map.contains_key("1.0.0"), "最旧的应被丢掉");
         let _ = std::fs::remove_file(&p);
     }
 }
