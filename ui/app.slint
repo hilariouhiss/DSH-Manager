@@ -152,13 +152,15 @@ component PillButton inherits Rectangle {
             padding-right: icon-only ? 0px : (emphasis ? 5px : 16px);
             spacing: icon-only ? 0px : 10px;
             alignment: center;
+            // ⚠ 必须显式写 center：cross-axis 的默认值是 stretch，而图标的尺寸是写死的 ——
+            // 实测 icon-only 时那枚 17px 图标被顶到 38px 按钮的**上沿**，看着就是没居中。
+            cross-axis-alignment: center;
 
-            Text {
-                // ⚠ 不能只写 `visible: !root.icon-only`：Slint 里**不可见的元素照样占布局位置**
-                // （实测：icon-only 时它和图标井一起把图标挤到按钮右侧 78px 处，
-                // 因为整组是居中的）。所以还要把内容清空、把井缩成 0 —— 光藏起来不够。
-                visible: !root.icon-only;
-                text: root.icon-only ? "" : root.label;
+            // ⚠ 这里一律用 `if` 而不是 `visible:` —— Slint 里**不可见的元素照样占布局位置**：
+            // 只写 visible: false 时，文字仍占着它的宽度（空串也留了 letter-spacing 那点
+            // 余地）、图标井仍占 26px，实测把图标从正中挤偏。`if` 是"根本不存在"，才不占位。
+            if !root.icon-only : Text {
+                text: root.label;
                 color: emphasis ? Tokens.cta-ink : (quiet ? Tokens.ink-3 : Tokens.ink);
                 font-family: Font.text;
                 font-size: 12.5px;
@@ -166,15 +168,14 @@ component PillButton inherits Rectangle {
                 letter-spacing: 0.1px;
                 vertical-alignment: center;
             }
-            Rectangle { visible: !root.icon-only; horizontal-stretch: 1; }
+            if !root.icon-only : Rectangle { horizontal-stretch: 1; }
             // 图标井：圆形容器，箭头嵌在井里而不是裸放在文字旁边。
             // 井的底色也随 hover 提亮一档（白底 CTA 上改用减暗，层次才不乱）。
             // icon-only 时整口井不要了 —— 井是为了给文字旁边的图标一个落点，
             // 没有文字时它就是多余的同心圆。
-            Rectangle {
-                visible: root.show-glyph && !root.icon-only;
-                width: icon-only ? 0px : 26px;
-                height: icon-only ? 0px : 26px;
+            if !root.icon-only && root.show-glyph : Rectangle {
+                width: 26px;
+                height: 26px;
                 border-radius: 13px;
                 background: emphasis
                     ? (touch.has-hover ? #0000001F : #00000024)
@@ -193,8 +194,7 @@ component PillButton inherits Rectangle {
             }
             // icon-only：图标裸放在正圆正中。17px 是井里那枚 14px 图标的放大档 ——
             // 没有文字分担视觉重量时，图标得更实一点。
-            Image {
-                visible: root.show-glyph && root.icon-only;
+            if root.icon-only && root.show-glyph : Image {
                 width: 17px;
                 height: 17px;
                 source: root.glyph;
@@ -793,7 +793,9 @@ export component MainWindow inherits Window {
                             // busy 文案同理不进按钮，改由状态栏与忙碌脉冲条承担 ——
                             // 一个圆按钮塞不下"准备中…"，硬塞回去就是又把文字加回来。
                             label: root.busy ? root.busy-label : "安装";
-                            glyph: @image-url("icons/arrow-up-right.svg");
+                            // arrow-down-to-line：向下落到一条横线上 = "装到本机"，
+                            // 比原来的 arrow-up-right 更贴"安装"这件事。
+                            glyph: @image-url("icons/arrow-down-to-line.svg");
                             emphasis: true;
                             // I-2 / TR-1：dsh web 正在启动时不得执行变更。
                             // 变灰不是唯一的守卫 —— main.rs 的 on_install_clicked
