@@ -585,7 +585,7 @@ export component MainWindow inherits Window {
 
     // ── 版本信息（FR-9）──
     in property <string> installed-version: "检测中…";
-    in property <string> installed-channel: "";
+
     in property <string> latest-version: "";
     in property <bool>   version-known: false;
     in property <bool>   up-to-date: false;
@@ -750,13 +750,8 @@ export component MainWindow inherits Window {
 
                     HorizontalLayout {
                         spacing: 7px;
-                        Tag {
-                            visible: root.installed-channel != "" && !root.absent;
-                            label: root.installed-channel;
-                            tint: root.installed-channel.starts-with("alpha")
-                                ? Tokens.accent
-                                : (root.installed-channel.starts-with("rc") ? Tokens.warn : Tokens.ink-4);
-                        }
+                        // "alpha 通道 / rc 通道"徽标已按要求去掉：通道信息本来就在版本号
+                        // 自己身上（0.1.6-**alpha**.2），再挂一枚徽标是同一件事说两遍。
                         Tag {
                             visible: root.version-known && root.up-to-date;
                             label: "已是最新";
@@ -964,7 +959,7 @@ export component MainWindow inherits Window {
                         }
 
                         HorizontalLayout {
-                            spacing: 8px;
+                            spacing: 9px;
                             alignment: center;
                             Eyebrow { text: "端口"; }
                             Rectangle {
@@ -973,30 +968,55 @@ export component MainWindow inherits Window {
                                 background: #00000059;
                                 border-width: 1px;
                                 border-color: Tokens.hairline;
-                                LineEdit {
-                                    text <=> root.port-text;
-                                    enabled: !root.busy;
-                                    horizontal-alignment: center;
-                                    font-family: Font.mono;
-                                    font-size: 12.5px;
-                                    edited(t) => { root.port-changed(t); }
+                                // ⚠ 必须用一层布局托住 LineEdit，两个坑一起解决：
+                                //   ① Fluent 的 LineEdit 自带 `min-width: max(160px, …)`。
+                                //      直接放在这个 74px 的外框里，它**不会**被裁 ——
+                                //      实测它渲染成 160×32，往右溢出 86px，把自带的浅色底
+                                //      与边框糊在"启动"按钮上（用户报的"白色遮罩侵入
+                                //      启动按钮"就是这个）；
+                                //   ② 光写 `min-width: 0px` 也不行：它会缩成内容宽
+                                //      （4 位端口号 ≈28px）并在外框里居中，正文被裁成一条。
+                                // 布局的交叉轴默认 stretch，会把子元素拉到布局自己的宽高，
+                                // 于是 LineEdit 正好铺满外框、文字居中、不再越界。
+                                VerticalLayout {
+                                    padding-left: 3px;
+                                    padding-right: 3px;
+                                    LineEdit {
+                                        min-width: 0px;
+                                        text <=> root.port-text;
+                                        enabled: !root.busy;
+                                        horizontal-alignment: center;
+                                        font-family: Font.mono;
+                                        font-size: 12.5px;
+                                        edited(t) => { root.port-changed(t); }
+                                    }
                                 }
                             }
                             Rectangle { horizontal-stretch: 1; }
-                            ChipButton {
-                                label: "启动";
-                                accent: true;
+                            // 三个服务动作改成图标按钮（原先是"启动/停止/打开"文字胶囊）。
+                            // 用与安装/刷新同一枚 PillButton 的 icon-only 档：正圆、图标居中、
+                            // label 只作无障碍名字。谁是"可用动作"由 enabled 状态本身表达 ——
+                            // 停止时只有"启动"是亮的，运行时只有"停止/打开"是亮的，
+                            // 所以不给任何一个加白底强调，免得跟安装按钮抢注意力。
+                            PillButton {
+                                icon-only: true;
+                                label: "启动 dsh web";
+                                glyph: @image-url("icons/play.svg");
                                 // I-2：启动窗口内不给第二次点击
                                 interactive: !root.web-running && !root.busy && !root.web-starting;
                                 clicked => { root.start-web(); }
                             }
-                            ChipButton {
-                                label: "停止";
+                            PillButton {
+                                icon-only: true;
+                                label: "停止 dsh web";
+                                glyph: @image-url("icons/square.svg");
                                 interactive: root.web-running && !root.busy;
                                 clicked => { root.stop-web(); }
                             }
-                            ChipButton {
-                                label: "打开";
+                            PillButton {
+                                icon-only: true;
+                                label: "在浏览器里打开 dsh web";
+                                glyph: @image-url("icons/external-link.svg");
                                 interactive: root.web-running;
                                 clicked => { root.open-web(); }
                             }

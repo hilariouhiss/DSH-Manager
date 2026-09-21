@@ -209,16 +209,10 @@ impl AppState {
             .versions
             .iter()
             .map(|v| {
-                let ch = match pm::channel_of(v) {
-                    Channel::Stable => "stable",
-                    Channel::Rc => "rc",
-                    Channel::Alpha => "alpha",
-                    Channel::Other => "other",
-                };
-                // ⚠ 这里**不再**拼 "← 当前"：那个标记已经移到行尾（见 app.slint 的
-                // 目标版本行）。留在选项文字里会把下拉撑长，而且它描述的是
-                // "本机装的是哪个"，跟"我要装哪个"混在同一句话里。
-                slint::SharedString::from(format!("{v}  ({ch})"))
+                // ⚠ 这里既不拼 "← 当前"（已移到行尾），也不拼 "({ch})" 通道后缀
+                // （按要求去掉）：通道信息本来就在版本号里（0.1.6-**alpha**.2），
+                // 再补一段括号是同一件事说两遍，还把下拉和说明区标题都撑长了。
+                slint::SharedString::from(v.to_string())
             })
             .collect()
     }
@@ -269,18 +263,6 @@ fn project(state: &AppState, win: &MainWindow, tray: &AppTray) {
                 .unwrap_or_else(|| "未检测到 dsh".into())
                 .into()
         },
-    );
-    win.set_installed_channel(
-        state
-            .channel()
-            .map(|c| match c {
-                Channel::Alpha => "alpha 通道",
-                Channel::Rc => "rc 通道",
-                Channel::Stable => "stable 通道",
-                Channel::Other => "其他通道",
-            })
-            .unwrap_or("")
-            .into(),
     );
     win.set_version_known(
         state.probed && state.env.installed.is_some() && state.newest_in_channel().is_some(),
