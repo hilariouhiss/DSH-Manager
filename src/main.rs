@@ -1287,6 +1287,12 @@ fn wire_callbacks(
         let q = quit.clone();
         tray.on_quit_app(move || q());
     }
+
+    // 应用菜单「文件 → 退出」：与托盘"退出"同一条路（停掉自己启动的 dsh web 再退）。
+    {
+        let q = quit.clone();
+        win.on_quit_app(move || q());
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

@@ -306,6 +306,95 @@ component Tag inherits Rectangle {
     }
 }
 
+// ── 应用菜单：菜单栏上的标题（文件 / 帮助）──────────────────────────────────
+// ⚠ 下拉面板**不能**放在主布局里：那是 VerticalLayout，而 Slint 拒绝给布局子元素
+// 写 x/y（"The property 'y' cannot be set for elements placed in this layout"）。
+// 所以标题在主布局的第一行，面板与"点外面就关"的遮罩是 Window 的绝对定位子元素
+// （在文件末尾，用标题的 absolute-position 对齐到它正下方）。
+component MenuTitle inherits Rectangle {
+    in property <string> label: "";
+    in property <bool> open: false;
+    callback toggled();
+
+    height: 26px;
+    min-width: 0px;
+    background: open ? #FFFFFF17 : (touch.has-hover ? #FFFFFF0D : transparent);
+    border-radius: 8px;
+    animate background { duration: 200ms; easing: ease-out-quint; }
+
+    // 无障碍：菜单标题就是一个按钮（与 PillButton 同一套路数）。
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-action-default => { root.toggled(); }
+
+    HorizontalLayout {
+        padding-left: 11px;
+        padding-right: 11px;
+        alignment: center;
+        Text {
+            text: root.label;
+            color: root.open ? Tokens.ink : Tokens.ink-2;
+            font-family: Font.text;
+            font-size: 12px;
+            vertical-alignment: center;
+        }
+    }
+
+    touch := TouchArea { clicked => { root.toggled(); } }
+}
+
+// 下拉里的一行。宽度由下拉面板给（VerticalLayout 的交叉轴默认 stretch），
+// 文字靠左、整行可点 —— 与原生菜单一致。
+component MenuAction inherits Rectangle {
+    in property <string> label: "";
+    callback picked();
+
+    height: 30px;
+    background: touch.has-hover ? #FFFFFF12 : transparent;
+    animate background { duration: 160ms; easing: ease-out-quint; }
+
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-action-default => { root.picked(); }
+
+    HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 14px;
+        alignment: start;
+        Text {
+            text: root.label;
+            color: touch.has-hover ? Tokens.ink : Tokens.ink-2;
+            font-family: Font.text;
+            font-size: 12px;
+            vertical-alignment: center;
+            animate color { duration: 160ms; easing: ease-out-quint; }
+        }
+    }
+
+    touch := TouchArea { clicked => { root.picked(); } }
+}
+
+// 下拉面板本体。
+// ⚠ 高度必须自己算：它是 Window 的绝对定位子元素，而 Rectangle 的 height 默认
+// 取**父元素**高度 —— 不写就会从菜单栏一直通到窗口底部（实测踩过，截图上是一根
+// 长条）。高度 = 上下 padding 6*2 + 每项 30 + 项间 2。
+component MenuPanel inherits Rectangle {
+    in property <int> item-count: 1;
+
+    width: 148px;
+    height: 12px + item-count * 30px + (item-count - 1) * 2px;
+    background: #16161C;
+    border-radius: Tokens.r-sm;
+    border-width: 1px;
+    border-color: Tokens.hairline;
+
+    VerticalLayout {
+        padding: 6px;
+        spacing: 2px;
+        @children
+    }
+}
+
 // ── 勾选框（询问框的"记住选择"）─────────────────────────────────────────────
 // `checked` 是 in-out：调用点用 `<=>` 双向绑到窗口属性上，勾选由本组件自己翻转。
 component CheckRow inherits Rectangle {
@@ -546,6 +635,9 @@ export component MainWindow inherits Window {
     /// 关闭主窗口的行为：0 = 隐藏到托盘 / 1 = 退出程序 / 2 = 每次询问。
     /// ⚠ 与 src/config.rs 的 `CloseBehavior` 下标一一对应，改顺序要两边一起改。
     in-out property <int> close-behavior-index: 2;
+    /// 当前展开的应用菜单：0 = 都没开 / 1 = 文件 / 2 = 帮助。
+    /// 纯 UI 状态：菜单开着的时候只可能有一个，用一个 int 比两个 bool 少一半状态。
+    in-out property <int> open-menu: 0;
 
     callback install-clicked();
     callback pm-changed(int);
@@ -559,6 +651,9 @@ export component MainWindow inherits Window {
     /// (行为下标, 是否记住)。第二个参数来自询问框的"记住选择"：
     /// 不勾就只管这一次，state.json 不动，下次关闭还会问。
     callback close-choice(int, bool);
+    /// 应用菜单「文件 → 退出」。与托盘菜单的"退出"走**同一条** Rust 路径
+    /// （停掉自己启动的 dsh web 再退出事件循环），所以不经过"关闭时的行为"那一问。
+    callback quit-app();
     callback link-clicked(string);
 
     // ═══ 派生量（纯展示推导，不引入新状态）═══
@@ -585,54 +680,37 @@ export component MainWindow inherits Window {
     VerticalLayout {
         padding-left: 14px;
         padding-right: 14px;
-        padding-top: 12px;
+        padding-top: 8px;
         padding-bottom: 10px;
         spacing: 0px;
 
-        // ═══════════════════════════ 报头 ═══════════════════════════════
+        // ═════════════════════════ 应用菜单栏 ═══════════════════════════════
+        // 「关于 / 设置」原先挤在底部状态栏那排按钮里 —— 那是窗口级动作的位置，
+        // 而这两件事是程序级入口。改成常见 Windows 应用的菜单栏：文件、帮助。
+        // ⚠ 不放在标题栏里（VS Code 那种自绘标题栏）：那要 no-frame + 自己接管
+        // 拖动 / 最大化 / 贴边吸附，为了两个菜单项把原生窗口行为全赔进去不划算；
+        // 而且你已经把 logo 放进系统标题栏了，那行还是留给系统画。
+        //
+        // ⚠ `alignment: start` 是必须的：默认对齐会把富余宽度摊给每一项（实测把
+        // 图标按钮撑到 121px），两个菜单标题会被拉成两根长条。
         HorizontalLayout {
-            height: 46px;
-            spacing: 12px;
-            alignment: center;
+            height: 30px;
+            spacing: 4px;
+            alignment: start;
 
-            // 品牌标记：直接用应用图标本身（标题栏 / 任务栏 / 托盘同一张 assets/logo.png），
-            // 一处资源四处身份，不再各画各的。原先是"玻璃方块 + 状态灯"的合成体 ——
-            // 那盏灯与状态栏、服务卡的状态点重复表达同一件事。
-            Rectangle {
-                width: 26px; height: 26px; border-radius: 9px;
-                clip: true;
-                Image {
-                    width: 100%; height: 100%;
-                    source: @image-url("../assets/logo.png");
-                    image-fit: cover; // 原图 910×941，非正方 —— cover 裁两边，不拉变形
-                }
+            file-menu := MenuTitle {
+                label: "文件";
+                open: root.open-menu == 1;
+                toggled => { root.open-menu = root.open-menu == 1 ? 0 : 1; }
             }
-            Text {
-                text: "DSH Manager";
-                color: Tokens.ink;
-                font-family: Font.display;
-                font-size: 14.5px;
-                font-weight: 600;
-                letter-spacing: -0.1px;
-                vertical-alignment: center;
-            }
-            Text {
-                text: "版本与服务";
-                color: Tokens.ink-4;
-                font-family: Font.text;
-                font-size: 11.5px;
-                vertical-alignment: center;
-            }
-            Rectangle { horizontal-stretch: 1; }
-            // 所有者 PM：托盘工具里这是"这机器归谁管"的关键读数，值得放在报头
-            Tag {
-                visible: root.owner-pm != "";
-                label: "owner · " + root.owner-pm;
-                tint: Tokens.ink-4;
+            help-menu := MenuTitle {
+                label: "帮助";
+                open: root.open-menu == 2;
+                toggled => { root.open-menu = root.open-menu == 2 ? 0 : 2; }
             }
         }
 
-        Rectangle { height: 14px; }
+        Rectangle { height: 10px; }
 
         // ═══════════════════════ 主体：双栏 ═══════════════════════════════
         HorizontalLayout {
@@ -1048,10 +1126,13 @@ export component MainWindow inherits Window {
         Rectangle { height: 12px; }
 
         // ══════════════════════════ 状态栏 ══════════════════════════════
+        // 只留状态：关于 / 设置 已搬进上方的应用菜单栏。
+        // ⚠ `alignment: start`：默认对齐会把富余宽度摊给每一项 —— 这条规则以前把
+        // 那两个按钮撑成 131px，现在只剩状态灯与文字，留着它会把文字推离左边。
         HorizontalLayout {
             height: 34px;
             spacing: 10px;
-            alignment: center;
+            alignment: start;
             StatusDot {
                 lamp: root.busy ? Tokens.warn
                     : (root.web-starting ? Tokens.warn
@@ -1069,21 +1150,46 @@ export component MainWindow inherits Window {
                 vertical-alignment: center;
                 animate color { duration: 300ms; easing: ease-out-quint; }
             }
-            Rectangle { horizontal-stretch: 1; }
-            PillButton {
-                label: "关于";
-                quiet: true;
-                show-glyph: false;
-                min-height: 30px;
-                clicked => { root.about-visible = true; }
+        }
+    }
+
+    // ═══════════════════════ 应用菜单的下拉面板 ═══════════════════════════
+    // ⚠ 必须是 Window 的直接子元素（绝对定位）。放进主 VerticalLayout 里会被拒：
+    // "The property 'y' cannot be set for elements placed in this layout"。
+    // 声明顺序在主体之后、对话框之前 —— 于是它盖住内容，又不会盖住对话框。
+    if root.open-menu != 0 : Rectangle {
+        // 点面板外面任何地方都关掉。铺满整窗、在面板**之下**（先声明者在下）。
+        TouchArea { clicked => { root.open-menu = 0; } }
+        // Esc 也关（菜单的惯例）。与三个对话框同一套路数：空壳 FocusScope 不自己
+        // 抢焦点就收不到按键（那条是实测踩出来的，见询问框处）。
+        FocusScope {
+            init => { self.focus(); }
+            key-pressed(e) => {
+                if (e.text == Key.Escape) { root.open-menu = 0; return accept; }
+                return reject;
             }
-            PillButton {
-                label: "设置";
-                quiet: true;
-                show-glyph: false;
-                min-height: 30px;
-                clicked => { root.settings-visible = true; }
-            }
+        }
+    }
+    if root.open-menu == 1 : MenuPanel {
+        x: file-menu.absolute-position.x;
+        y: file-menu.absolute-position.y + file-menu.height + 4px;
+        item-count: 2;
+        MenuAction {
+            label: "设置";
+            picked => { root.open-menu = 0; root.settings-visible = true; }
+        }
+        MenuAction {
+            label: "退出";
+            picked => { root.open-menu = 0; root.quit-app(); }
+        }
+    }
+    if root.open-menu == 2 : MenuPanel {
+        x: help-menu.absolute-position.x;
+        y: help-menu.absolute-position.y + help-menu.height + 4px;
+        item-count: 1;
+        MenuAction {
+            label: "关于 DSH Manager";
+            picked => { root.open-menu = 0; root.about-visible = true; }
         }
     }
 
