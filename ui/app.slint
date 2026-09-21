@@ -1,22 +1,498 @@
-// GC-13：std-widgets 不是语言内建元素，必须显式 import。
-// 漏掉会报 "Unknown element 'ListView'"，且错误发生在 build.rs 阶段。
+// ════════════════════════════════════════════════════════════════════════════
+//  DSH Manager —— 界面
+//
+//  设计语言：Ethereal Glass（OLED 近黑 + 径向光晕 + hairline 玻璃卡片）
+//  布局原型：Editorial Split（左控制栏 344px / 右输出栏）
+//
+//  ⚠ 两份契约必须原样保留，改这里就会打断 Rust 侧（src/main.rs 的
+//  project() 与 wire_callbacks()）：
+//    ① 所有 `in property` / `in-out property` 的名字与类型
+//    ② 所有 callback 的名字与签名
+//  Rust 侧没有的回调（曾有一个从未接线的 about-clicked）已删除 ——
+//  未接线 = 死代码，留着只会诱导下一个人以为它有用。
+//
+//  ⚠ 平台约束（已在 slint-1.18.0 / i-slint-compiler-1.18.0 源码中核实）：
+//    · 不支持 `@font-face` —— 字体只能引用**系统已装**字体，无法内嵌 Geist。
+//      故选用 Windows 自带的等宽/可变字体（见 Font 全局）。
+//    · 不支持自定义 cubic-bezier 字面量：easing 只能取内建名字。故用
+//      `ease-out-quint`（控制点 0.22,1,0.36,1，“重物落定”）与
+//      `ease-out-back`（带回弹的按压）—— 语义对上了，名字是 Slint 的。
+//    · 不支持 backdrop-blur：玻璃感靠多层半透明 + hairline 内高光模拟。
+//    · 不支持背景贴图平铺：颗粒噪点无法用图片实现，故以渐变代替。
+// ════════════════════════════════════════════════════════════════════════════
+
 import { Button, ComboBox, LineEdit, ListView, ScrollView, AboutSlint, Palette } from "std-widgets.slint";
 
 export enum NotesStatus { loading, ok, missing, failed }
 
+// ── 设计令牌 ────────────────────────────────────────────────────────────────
+// 一处定义，全局引用。升级路径：将来若做主题切换，只需把这里的常量
+// 换成 `in` 属性并由 Rust 写入。
+global Tokens {
+    out property <brush> canvas:        #07070A;  // 最深一层（OLED 近黑，非纯黑）
+    out property <brush> core-top:      #111116;  // 卡片内胎（渐变上端）
+    out property <brush> core-bottom:   #0C0C10;  // 卡片内胎（渐变下端）
+    out property <brush> shell:         #FFFFFF06; // 外碗底
+    out property <brush> hairline:      #FFFFFF12; // 1px 结构线
+    out property <brush> hairline-soft: #FFFFFF0A;
+    out property <brush> inner-light:   #FFFFFF0E; // 内胎顶缘高光
+
+    out property <brush> ink:           #EDEDF2;  // 主文字
+    out property <brush> ink-2:         #A9A9B6;  // 正文
+    out property <brush> ink-3:         #77778A;  // 次级
+    out property <brush> ink-4:         #5F5F6C;  // 标签 / 眉标
+
+    out property <brush> accent:        #6EE7B7;  // 唯一强调色（薄荷）
+    out property <brush> accent-ink:    #8FF0C8;  // 强调色上的文字
+    out property <brush> good:          #7AA2F7;  // 信息 / 成功（与强调色分工）
+    out property <brush> warn:          #E3B341;
+
+    out property <brush> cta-top:       #F4F4F7;  // 主 CTA（“主机白”）
+    out property <brush> cta-bottom:    #D9D9E0;
+    out property <brush> cta-ink:       #0A0A0D;
+
+    out property <brush> glow-accent:   #6EE7B759; // 光晕本体（靠 opacity 动画）
+    out property <brush> glow-mint:     #6EE7B71F;
+    out property <brush> glow-blue:     #7AA2F717;
+    out property <length> r-lg: 22px;
+    out property <length> r-md: 16px;
+    out property <length> r-sm: 11px;
+    out property <length> font-hero: 27px;
+}
+
+// ── 排版 ────────────────────────────────────────────────────────────────────
+// ⚠ 只能写**单个**家族名：Slint 的 FontRequest.family 是 Option<SharedString>，
+// 没有 font-stack 语法，写 "A, B" 会当作一个不存在的家族名而整段回落到默认字体。
+// 中文由字体的系统回退承担（Windows 上落到 Microsoft YaHei）。
+global Font {
+    out property <string> display: "Segoe UI Variable Display"; // 大字号 / 无衬线几何感
+    out property <string> text:    "Segoe UI Variable Text";    // 正文
+    out property <string> mono:    "Cascadia Mono";             // 日志 / 端口 / 版本号
+}
+
+// ── 光晕：背景的氛围层 ──────────────────────────────────────────────────────
+// ⚠ 必须是 fixed/装饰性图层，且 pointer-events 为无 —— 它铺满整窗，
+// 若参与命中测试会把下面的所有按钮都吃掉。
+component Orb inherits Rectangle {
+    in property <brush> tint: #6EE7B71F;
+    background: @radial-gradient(circle, root.tint 0%, transparent 70%);
+}
+
+// ── 状态点：一颗会呼吸的灯 ──────────────────────────────────────────────────
+component StatusDot inherits Rectangle {
+    in property <brush> lamp: Tokens.accent;
+    in property <bool>  halo: true;
+
+    width: 8px;
+    height: 8px;
+    border-radius: 4px;
+    background: lamp;
+
+    // 光晕用独立的固定层做，动画只动 opacity —— 不触发布局，永远不重排。
+    Rectangle {
+        x: -5px; y: -5px; width: 18px; height: 18px; border-radius: 9px;
+        background: @radial-gradient(circle, parent.lamp 0%, transparent 68%);
+        opacity: halo ? 0.85 : 0;
+    }
+}
+
+// ── 胶囊按钮（Button-in-Button）─────────────────────────────────────────────
+// 主按钮的箭头**不裸放**在文字旁边：它嵌在自己的圆形“井”里，随 hover 沿
+// 对角线轻移并微放大 —— 内部动能张力。按压时整体缩到 0.97 模拟物理下陷。
+component PillButton inherits Rectangle {
+    in property <string> label: "";
+    in property <image> glyph;
+    in property <bool> show-glyph: true;
+    /// 只留图标：不画文字、也不画图标井，按钮退化成正圆。
+    /// ⚠ `label` 此时**仍然必须传** —— 它是无障碍树里那个按钮的名字。
+    in property <bool> icon-only: false;
+    in property <bool> emphasis: false; // false = ghost / true = 主 CTA
+    in property <bool> quiet: false;    // 更弱的三级样式（页脚）
+    in property <bool> interactive: true;
+
+    callback clicked();
+
+    min-height: 38px;
+    min-width: icon-only ? 38px : (emphasis ? 132px : 0px);
+    opacity: interactive ? 1 : 0.34;
+
+    // ⚠ 文字被藏起来之后，子元素里再没有任何东西能给无障碍树当名字 ——
+    // 屏幕阅读器只会念到一个"无名按钮"。所以显式给 role + label。
+    accessible-role: button;
+    accessible-label: root.label;
+
+    background: emphasis
+        ? @linear-gradient(180deg, Tokens.cta-top 0%, Tokens.cta-bottom 100%)
+        : (quiet ? transparent : #FFFFFF0D);
+    border-radius: self.height / 2; // 胶囊：半径永远等于半高
+    border-width: emphasis ? 0px : (quiet ? 0px : 1px);
+    border-color: Tokens.hairline;
+
+    animate background { duration: 260ms; easing: ease-out-quint; }
+    animate opacity    { duration: 300ms; easing: ease-out-quint; }
+
+    // ⚠ Slint 1.18 里可以动画的只有「属性」。不存在 `animate scale`，
+    // 也不存在 `transform: [ translate-x: … ]` 字面量 —— 已核实编译器源码，
+    // 变换类保留属性只有 transform-rotation / transform-scale-x /
+    // transform-scale-y / transform-origin。所以：
+    //   · 整体按压反馈 -> 一个独立内层做 transform-scale（见下）
+    //   · 图标井的对角线位移 -> 图标自身的 x/y（局部重排，代价可忽略）
+    Rectangle {
+        // 按压反馈层：整块内容缩到 0.97 模拟物理下陷。
+        // 它在 self 内居中，缩放以自身中心为原点。
+        width: 100%;
+        height: 100%;
+        transform-scale-x: touch.pressed && root.interactive ? 0.97 : 1;
+        transform-scale-y: touch.pressed && root.interactive ? 0.97 : 1;
+        animate transform-scale-x { duration: 150ms; easing: ease-out-back; }
+        animate transform-scale-y { duration: 150ms; easing: ease-out-back; }
+
+        HorizontalLayout {
+            padding-left: icon-only ? 0px : (emphasis ? 18px : 16px);
+            padding-right: icon-only ? 0px : (emphasis ? 5px : 16px);
+            spacing: icon-only ? 0px : 10px;
+            alignment: center;
+
+            Text {
+                // ⚠ 不能只写 `visible: !root.icon-only`：Slint 里**不可见的元素照样占布局位置**
+                // （实测：icon-only 时它和图标井一起把图标挤到按钮右侧 78px 处，
+                // 因为整组是居中的）。所以还要把内容清空、把井缩成 0 —— 光藏起来不够。
+                visible: !root.icon-only;
+                text: root.icon-only ? "" : root.label;
+                color: emphasis ? Tokens.cta-ink : (quiet ? Tokens.ink-3 : Tokens.ink);
+                font-family: Font.text;
+                font-size: 12.5px;
+                font-weight: emphasis ? 600 : 500;
+                letter-spacing: 0.1px;
+                vertical-alignment: center;
+            }
+            Rectangle { visible: !root.icon-only; horizontal-stretch: 1; }
+            // 图标井：圆形容器，箭头嵌在井里而不是裸放在文字旁边。
+            // 井的底色也随 hover 提亮一档（白底 CTA 上改用减暗，层次才不乱）。
+            // icon-only 时整口井不要了 —— 井是为了给文字旁边的图标一个落点，
+            // 没有文字时它就是多余的同心圆。
+            Rectangle {
+                visible: root.show-glyph && !root.icon-only;
+                width: icon-only ? 0px : 26px;
+                height: icon-only ? 0px : 26px;
+                border-radius: 13px;
+                background: emphasis
+                    ? (touch.has-hover ? #0000001F : #00000024)
+                    : (touch.has-hover ? #FFFFFF1F : #FFFFFF12);
+                animate background { duration: 260ms; easing: ease-out-quint; }
+
+                Rectangle {
+                    width: 14px;
+                    height: 14px;
+                    x: touch.has-hover && root.interactive ? 7px : 6px;
+                    y: touch.has-hover && root.interactive ? 5px : 6px;
+                    animate x { duration: 320ms; easing: ease-out-quint; }
+                    animate y { duration: 320ms; easing: ease-out-quint; }
+                    Image { width: 100%; height: 100%; source: root.glyph; }
+                }
+            }
+            // icon-only：图标裸放在正圆正中。17px 是井里那枚 14px 图标的放大档 ——
+            // 没有文字分担视觉重量时，图标得更实一点。
+            Image {
+                visible: root.show-glyph && root.icon-only;
+                width: 17px;
+                height: 17px;
+                source: root.glyph;
+            }
+        }
+    }
+
+    states [
+        hover when touch.has-hover && root.interactive : {
+            background: emphasis
+                ? @linear-gradient(180deg, #FFFFFF 0%, #E4E4EA 100%)
+                : (quiet ? #FFFFFF08 : #FFFFFF14);
+        }
+    ]
+
+    touch := TouchArea {
+        enabled: root.interactive;
+        clicked => { root.clicked(); }
+    }
+}
+
+// ── 小型胶囊按钮（服务控制用，无图标井）─────────────────────────────────────
+component ChipButton inherits Rectangle {
+    in property <string> label: "";
+    in property <bool> accent: false;
+    in property <bool> interactive: true;
+
+    callback clicked();
+
+    min-height: 32px;
+    opacity: interactive ? 1 : 0.3;
+    background: accent ? #6EE7B71A : #FFFFFF0D;
+    border-radius: self.height / 2;
+    border-width: 1px;
+    border-color: accent ? #6EE7B747 : Tokens.hairline;
+
+    animate background { duration: 260ms; easing: ease-out-quint; }
+    animate opacity    { duration: 300ms; easing: ease-out-quint; }
+
+    // 同 PillButton：按压反馈靠内层的 transform-scale，不存在的 `scale` 属性不用。
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        transform-scale-x: touch.pressed && root.interactive ? 0.95 : 1;
+        transform-scale-y: touch.pressed && root.interactive ? 0.95 : 1;
+        animate transform-scale-x { duration: 150ms; easing: ease-out-back; }
+        animate transform-scale-y { duration: 150ms; easing: ease-out-back; }
+
+        HorizontalLayout {
+            padding-left: 15px;
+            padding-right: 15px;
+            alignment: center;
+            Text {
+                text: root.label;
+                color: root.accent ? Tokens.accent-ink : (root.interactive ? Tokens.ink-2 : Tokens.ink-4);
+                font-family: Font.text;
+                font-size: 12px;
+                font-weight: 500;
+                vertical-alignment: center;
+                animate color { duration: 260ms; easing: ease-out-quint; }
+            }
+        }
+    }
+
+    states [
+        hover when touch.has-hover && root.interactive : {
+            background: root.accent ? #6EE7B72E : #FFFFFF17;
+        }
+    ]
+
+    touch := TouchArea { enabled: root.interactive; clicked => { root.clicked(); } }
+}
+
+// ── 眉标：微型大写标签 ──────────────────────────────────────────────────────
+component Eyebrow inherits Text {
+    font-family: Font.text;
+    font-size: 9.5px;
+    font-weight: 600;
+    letter-spacing: 2px;
+    color: Tokens.ink-4;
+    vertical-alignment: center;
+}
+
+// ── 状态徽标（通道 / 是否最新）─────────────────────────────────────────────
+component Tag inherits Rectangle {
+    in property <string> label: "";
+    in property <color> tint: Tokens.ink-4;
+    in property <color> fill: transparent;
+
+    height: 22px;
+    min-width: 0px;
+    border-radius: 11px;
+    background: fill == transparent ? transparent : fill;
+    border-width: 1px;
+    border-color: tint.with-alpha(0.28);
+    HorizontalLayout {
+        padding-left: 9px;
+        padding-right: 9px;
+        alignment: center;
+        Text {
+            text: root.label;
+            color: root.tint;
+            font-family: Font.text;
+            font-size: 10px;
+            font-weight: 600;
+            letter-spacing: 1.2px;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// ── 勾选框（询问框的"记住选择"）─────────────────────────────────────────────
+// `checked` 是 in-out：调用点用 `<=>` 双向绑到窗口属性上，勾选由本组件自己翻转。
+component CheckRow inherits Rectangle {
+    in-out property <bool> checked: true;
+    in property <string> label: "";
+
+    height: 26px;
+    min-width: 0px;
+    background: transparent;
+
+    // 无障碍：整行是一个真正的勾选框；默认动作（键盘 / 读屏）与鼠标点击同路。
+    accessible-role: checkbox;
+    accessible-label: root.label;
+    accessible-action-default => { root.checked = !root.checked; }
+
+    HorizontalLayout {
+        spacing: 8px;
+        alignment: center;
+        Rectangle {
+            width: 15px; height: 15px;
+            border-radius: 4px;
+            background: checked ? Tokens.accent : transparent;
+            border-width: 1px;
+            border-color: checked ? Tokens.accent : #FFFFFF33;
+            animate background { duration: 200ms; easing: ease-out-quint; }
+            animate border-color { duration: 200ms; easing: ease-out-quint; }
+            // ⚠ x/y 绝对定位在这里是允许的：父元素是 Rectangle（不是布局元素）。
+            Image {
+                visible: root.checked;
+                width: 11px; height: 11px;
+                source: @image-url("icons/check.svg");
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+            }
+        }
+        Text {
+            text: root.label;
+            color: Tokens.ink-2;
+            font-family: Font.text;
+            font-size: 12.5px;
+            vertical-alignment: center;
+        }
+    }
+
+    touch := TouchArea { clicked => { root.checked = !root.checked; } }
+}
+
+// ── 双边框嵌套（Doppelrand）─────────────────────────────────────────────────
+// 卡片不是平贴在背景上，而是像一块玻璃板坐进铝制托盘：
+//   外碗 = 半透明底 + 外 hairline + 大圆角 + 内边距
+//   内胎 = 自己的渐变底色 + 顶缘内高光 + 同心的小圆角
+// 同心半径是数学算出来的：r-md = r-lg - 6px，两圈弧线才平行。
+//
+// ⚠ 结构上的两个硬约束（都是实测撞出来的，别改回去）：
+//   ① 卡片根必须是 Rectangle：布局元素（VerticalLayout 等）没有 background /
+//      border-radius，画不出玻璃。Slint 里能画底的只有 Rectangle / 图片。
+//   ② 内胎的布局**不能**绝对定位（写 x/y/width），因为 Slint 会拒绝
+//      "The property 'y' cannot be set for elements placed in this layout"；
+//      而绝对定位的子元素也不会被 Rectangle 用来推导尺寸，卡片会塌成 0 高。
+//   正确写法是让布局做 Rectangle 的**普通子元素**（不写 x/y/width/height）：
+//      · 宽度自动填满父容器 → 文本换行高度可算，不会与父高成绑定环
+//      · 高度取内容自然高度 → Rectangle 反过来由它定高
+//      · 留白由**外层** Rectangle 的 padding 承担（填充矩形不是布局，
+//        不会被布局接管几何）
+//   这正是 std-widgets 自己的写法（见 fluent/combobox.slint 的 background 层）。
+component Bezel inherits Rectangle {
+    in property <length> core-padding: 0px;
+    // 纵向节奏由外碗透传给内胎布局：卡片根是 Rectangle（为了画玻璃），
+    // 它没有 spacing，只能自己开一个转发口。
+    in property <length> spacing: 0px;
+
+    // 不参与纵向弹性分配：卡片高度 = 内容高度 + 留白，不是配额。
+    // 需要撑满的卡片（服务卡、日志/说明面板）在调用点写 vertical-stretch: 1。
+    vertical-stretch: 0;
+
+    background: Tokens.shell;
+    border-radius: Tokens.r-lg;
+    border-width: 1px;
+    border-color: Tokens.hairline;
+
+    Rectangle {
+        background: @linear-gradient(168deg, Tokens.core-top 0%, Tokens.core-bottom 100%);
+        border-radius: Tokens.r-md;
+        border-width: 1px;
+        border-color: Tokens.hairline-soft;
+
+        // ⚠ 留白写在**这一层布局**上，不能写在外碗 Rectangle 上：
+        // Slint 的 padding 只对布局元素生效，写在 Rectangle 上会被静默忽略
+        // 并给出 "padding only has effect on layout elements" 警告 ——
+        // 双边框看起来在、实际一点留白都没有。
+        VerticalLayout {
+            padding: root.core-padding;
+            spacing: root.spacing;
+            // 内胎顶缘的一线高光 —— 玻璃边缘的折射，是“厚度感”的来源。
+            // ⚠ 它是布局的第一个子元素，会占一行高度 —— 这是刻意的：
+            // 1px 的代价换来"折射线"落在内容之上而不是被内容盖住。
+            Rectangle {
+                height: 1px;
+                background: Tokens.inner-light;
+                opacity: 0.7;
+            }
+            @children
+        }
+    }
+}
+
+// ── 日志行 ──────────────────────────────────────────────────────────────────
+// 语义配色替代线性图标：命令 / 成功 / 警告 / 错误各有自己的颜色。
+//
+// ⚠ 分类在 Rust 侧完成（push_log 打前缀），这里只认前缀，理由见 push_log：
+// Slint 1.18 的 string 成员函数没有 contains，而关键词都在行中间。
+//
+// ⚠ 这个组件的形状是**实测唯一稳定**的一种：Text 直接做条目根的唯一子元素，
+// 且 Text 上不写任何定位/尺寸属性。以下写法全部试过且全部失败：
+//   x / y / width: parent.width / width: 100% / width: 420px / wrap: no-wrap
+//   → 文字消失、溢出面板、或触发布局绑定环
+//   HorizontalLayout + Text            → Text 不是布局认可的"容器型"元素
+//     （见 i-slint-compiler 的 layout.rs:allow_in_layout），该格宽度算成 0
+//   正文包 Rectangle 配 horizontal-stretch → Rectangle 拿不到拉伸，只有内容宽
+//
+// ⚠ 已知局限（诚实记录，未解决）：条目宽度由内容决定，而 ListView 会把
+// 内容尺寸的条目**水平居中**，所以单行日志目前悬在面板中间，而不是贴左。
+// 根因是 ListView 的 @children 落在内部 Flickable 里，Flickable 不会把子元素
+// 拉伸到视口宽度；而任何试图表达"条目宽度 = 视口宽度"的绑定都会与
+// content-width 形成环。升级路径：升级 Slint 后改用带 item-width 的列表，
+// 或自行用 Repeater + 固定行高实现滚动。左侧 2px 语义色条同理暂缓。
+component LogLine inherits Rectangle {
+    in property <string> raw-line: "";
+    in property <bool> is-cmd:  raw-line.starts-with("$ ");
+    in property <bool> is-ok:   raw-line.starts-with("✓ ");
+    in property <bool> is-err:  raw-line.starts-with("ER:");
+    in property <bool> is-warn: raw-line.starts-with("WR:");
+
+    height: 20px;
+    background: transparent;
+
+    Text {
+        text: root.raw-line.replace-all("$ ", "").replace-all("✓ ", "").replace-all("ER:", "").replace-all("WR:", "");
+        color: root.is-cmd ? Tokens.accent-ink
+             : root.is-err ? #F07178
+             : root.is-ok ? Tokens.good
+             : root.is-warn ? Tokens.warn
+             : Tokens.ink-3;
+        font-family: Font.mono;
+        font-size: 11px;
+        vertical-alignment: center;
+    }
+}
+
+// ── 键值行（关于对话框用）───────────────────────────────────────────────────
+component MetaRow inherits HorizontalLayout {
+    in property <string> k: "";
+    in property <string> v: "";
+    spacing: 12px;
+    Eyebrow { text: root.k; width: 78px; }
+    Text {
+        text: root.v;
+        color: Tokens.ink-2;
+        font-family: Font.mono;
+        font-size: 11px;
+        vertical-alignment: center;
+        wrap: word-wrap;
+        horizontal-stretch: 1;
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 export component MainWindow inherits Window {
     title: "DSH Manager";
-    width: 520px;
-    height: 660px;
+    // 标题栏 / 任务栏 / Alt-Tab 里的图标。⚠ 路径相对**本文件**（ui/），不是项目根。
+    // 为什么是 PNG：Slint 对栅格图**不做缩放**，会把整张 910×941 直接交给 winit 当
+    // HICON，由 Windows 自己缩到 16/32px —— 但至少不必像矢量那样先解析上百万字节的
+    // 描摹路径、再按内在尺寸栅格化一遍（那一步在 debug 档要 ~1s，见 AppTray 处的记录）。
+    icon: @image-url("../assets/logo.png");
+    // 双栏布局需要横向空间：单列 520px 时日志与说明只能上下挤叠。
+    // Slint 的 Window 不允许 width 与 min-width 同时出现，故只设初始尺寸；
+    // 用户手动缩到很窄时日志列会被挤压（列宽随窗口分配），这是可接受的退化。
+    width: 880px;
+    height: 780px;
+    background: Tokens.canvas;
 
-    // 本窗口是**刻意的浅色设计**（卡片底色全部硬编码为 #f5f5f5 / #fafafa / white），
-    // 而 Slint 默认跟随系统主题：Windows 暗色模式下 Palette.foreground 是白色，
-    // 于是所有未显式上色的文字都成了白底白字 —— 包括 FR-9 的版本读数、FR-27 的
-    // 说明正文，以及 Button 标签与 AboutSlint 内部的文字（后者是 private/内建，
-    // **无法逐个补色**）。故把配色方案钉死为浅色：一次让 foreground /
-    // control-foreground / control-background 与 AboutSlint 的 logo 选择同时回到浅色。
+    // ⚠ 配色方案必须钉死为**暗色**。
+    // Slint 默认跟随系统主题，而 std-widgets（ComboBox / LineEdit / Button /
+    // ScrollView / AboutSlint）的配色全部派生自 Palette.color-scheme：
+    // 若系统是浅色模式，控件内的文字会是黑字，落在本设计的近黑底上等于不可见。
     // 只能写在 init 里 —— 在组件体里直接写 `Palette.color-scheme: …;` 是语法错误。
-    init => { Palette.color-scheme = ColorScheme.light; }
+    init => { Palette.color-scheme = ColorScheme.dark; }
 
     // ── 版本信息（FR-9）──
     in property <string> installed-version: "检测中…";
@@ -59,6 +535,17 @@ export component MainWindow inherits Window {
 
     // 纯窗口本地 UI 状态，不参与 Rust 侧共享状态
     in-out property <bool> about-visible: false;
+    in-out property <bool> settings-visible: false;
+    /// 首次关闭窗口时的询问框。由 Rust 在 close-requested 里置真
+    /// （Rust 侧的 `CloseRequestResponse` 只能"取消这次关闭 + 弹框"，
+    /// 没法从回调里返回一个"等用户选完再决定"）。
+    in-out property <bool> close-prompt-visible: false;
+    /// 询问框里"记住选择"勾选框的当前状态。默认勾上 —— 与原始需求
+    /// "首次关闭时询问**默认行为**"一致：问一次就把答案记下来，而不是每次都问。
+    in-out property <bool> close-prompt-remember: true;
+    /// 关闭主窗口的行为：0 = 隐藏到托盘 / 1 = 退出程序 / 2 = 每次询问。
+    /// ⚠ 与 src/config.rs 的 `CloseBehavior` 下标一一对应，改顺序要两边一起改。
+    in-out property <int> close-behavior-index: 2;
 
     callback install-clicked();
     callback pm-changed(int);
@@ -68,256 +555,822 @@ export component MainWindow inherits Window {
     callback stop-web();
     callback open-web();
     callback port-changed(string);
-    callback hide-to-tray();
-    callback about-clicked();
+    callback settings-changed(int);
+    /// (行为下标, 是否记住)。第二个参数来自询问框的"记住选择"：
+    /// 不勾就只管这一次，state.json 不动，下次关闭还会问。
+    callback close-choice(int, bool);
     callback link-clicked(string);
 
-    VerticalLayout {
-        padding: 12px;
-        spacing: 10px;
+    // ═══ 派生量（纯展示推导，不引入新状态）═══
+    // "检测中…" 是 project() 在探测完成前写入的哨兵值；用它区分"还没检测"与
+    // "检测完但没装" —— 后者要显示未安装的引导，前者不能下任何结论（SRS:786）。
+    property <bool> probing: root.installed-version == "检测中…";
+    property <bool> absent:  !root.probing && root.installed-version == "未检测到 dsh";
+    property <string> service-state:
+        root.web-starting ? "启动中" : (root.web-running ? "运行中" : "已停止");
+    property <bool> can-install: !root.busy && !root.web-starting && !root.probing && !root.absent;
+    property <bool> has-notes: root.notes-status == NotesStatus.ok;
+    property <bool> notes-loading: root.notes-status == NotesStatus.loading;
 
-        // ═══ 版本信息 ═══
-        Rectangle {
-            background: #f5f5f5;
-            border-radius: 6px;
-            height: 76px;
-            HorizontalLayout {
-                padding: 10px;
-                spacing: 8px;
-                VerticalLayout {
-                    spacing: 4px;
+    // ═══ 氛围层（固定、不参与命中测试）═══
+    Orb { width: 560px; height: 560px; x: -180px; y: -220px; tint: #6EE7B71A; }
+    Orb { width: 640px; height: 640px; x: parent.width - 420px; y: 40px; tint: #7AA2F717; }
+    Orb { width: 520px; height: 520px; x: 140px; y: parent.height - 300px; tint: #6EE7B714; }
+    // 顶部一线极淡的竖直渐变，让"顶光"方向与所有内高光一致
+    Rectangle {
+        width: 100%; height: 120px;
+        background: @linear-gradient(180deg, #FFFFFF0B 0%, transparent 100%);
+    }
+
+    VerticalLayout {
+        padding-left: 14px;
+        padding-right: 14px;
+        padding-top: 12px;
+        padding-bottom: 10px;
+        spacing: 0px;
+
+        // ═══════════════════════════ 报头 ═══════════════════════════════
+        HorizontalLayout {
+            height: 46px;
+            spacing: 12px;
+            alignment: center;
+
+            // 品牌标记：直接用应用图标本身（标题栏 / 任务栏 / 托盘同一张 assets/logo.png），
+            // 一处资源四处身份，不再各画各的。原先是"玻璃方块 + 状态灯"的合成体 ——
+            // 那盏灯与状态栏、服务卡的状态点重复表达同一件事。
+            Rectangle {
+                width: 26px; height: 26px; border-radius: 9px;
+                clip: true;
+                Image {
+                    width: 100%; height: 100%;
+                    source: @image-url("../assets/logo.png");
+                    image-fit: cover; // 原图 910×941，非正方 —— cover 裁两边，不拉变形
+                }
+            }
+            Text {
+                text: "DSH Manager";
+                color: Tokens.ink;
+                font-family: Font.display;
+                font-size: 14.5px;
+                font-weight: 600;
+                letter-spacing: -0.1px;
+                vertical-alignment: center;
+            }
+            Text {
+                text: "版本与服务";
+                color: Tokens.ink-4;
+                font-family: Font.text;
+                font-size: 11.5px;
+                vertical-alignment: center;
+            }
+            Rectangle { horizontal-stretch: 1; }
+            // 所有者 PM：托盘工具里这是"这机器归谁管"的关键读数，值得放在报头
+            Tag {
+                visible: root.owner-pm != "";
+                label: "owner · " + root.owner-pm;
+                tint: Tokens.ink-4;
+            }
+        }
+
+        Rectangle { height: 14px; }
+
+        // ═══════════════════════ 主体：双栏 ═══════════════════════════════
+        HorizontalLayout {
+            spacing: 12px;
+            vertical-stretch: 1;
+
+            // ───────────────────── 左：控制栏 ─────────────────────
+            VerticalLayout {
+                width: 344px;
+                spacing: 12px;
+
+                // 版本主卡：数字是唯一的主角
+                Bezel {
+                    core-padding: 14px;
+                    spacing: 0px;
+
+                    // 大字号读数。用等宽字体 + tabular 数字，版本号换位时不跳动。
+                    Text {
+                        text: root.probing ? "—" : root.installed-version;
+                        color: root.probing ? Tokens.ink-4 : Tokens.ink;
+                        font-family: Font.mono;
+                        font-size: Tokens.font-hero;
+                        font-weight: 600;
+                        letter-spacing: -1.2px;
+                        wrap: no-wrap;
+                        animate color { duration: 400ms; easing: ease-out-quint; }
+                    }
+                    Rectangle { height: 9px; }
+
+                    HorizontalLayout {
+                        spacing: 7px;
+                        Tag {
+                            visible: root.installed-channel != "" && !root.absent;
+                            label: root.installed-channel;
+                            tint: root.installed-channel.starts-with("alpha")
+                                ? Tokens.accent
+                                : (root.installed-channel.starts-with("rc") ? Tokens.warn : Tokens.ink-4);
+                        }
+                        Tag {
+                            visible: root.version-known && root.up-to-date;
+                            label: "已是最新";
+                            tint: Tokens.accent;
+                            fill: #6EE7B712;
+                        }
+                        Tag {
+                            visible: root.version-known && !root.up-to-date;
+                            label: "可更新";
+                            tint: Tokens.warn;
+                            fill: #E3B34112;
+                        }
+                        Tag {
+                            visible: root.probing;
+                            label: "检测中";
+                            tint: Tokens.ink-4;
+                        }
+                    }
+
+                    // ⚠ 这里写过 `height: 100%` —— 在 VerticalLayout 的子元素上，
+                    // 百分比高度是**相对父容器**的，于是"父高取决于子高、子高取决于父高"
+                    // 成环。实测后果是整列高度算飞：卡片互相重叠、按钮被裁到窗外。
+                    // 让文字自己撑高即可，不要给布局子元素写百分比尺寸。
+                    Rectangle {
+                        visible: root.absent;
+                        Text {
+                            text: "未在 PATH 上找到 dsh。先装一个包管理器版本，再从下方选目标版本。";
+                            color: Tokens.ink-3;
+                            font-family: Font.text;
+                            font-size: 11.5px;
+                            wrap: word-wrap;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    Rectangle { height: 10px; }
+                    Rectangle { height: 1px; background: Tokens.hairline-soft; }
+                    Rectangle { height: 9px; }
+
                     HorizontalLayout {
                         spacing: 8px;
-                        Text { text: "已安装"; width: 56px; color: #666; }
-                        Text { text: root.installed-version; font-weight: 700; }
+                        Eyebrow { text: "通道最新"; width: 62px; }
                         Text {
-                            text: root.installed-channel;
-                            color: #0a7; font-size: 11px;
+                            text: root.version-known ? root.latest-version : "—";
+                            color: root.version-known ? Tokens.ink-2 : Tokens.ink-4;
+                            font-family: Font.mono;
+                            font-size: 11.5px;
                             vertical-alignment: center;
-                            visible: root.installed-channel != "";
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        Text {
+                            visible: root.version-known && !root.up-to-date;
+                            text: "可升级";
+                            color: Tokens.warn;
+                            font-family: Font.text;
+                            font-size: 10.5px;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+
+                // 操作卡
+                // 操作卡：两个字段 + 一行动作。
+                // ⚠ 字段原本是「眉标压在选择器上面」的两行结构，实测每字段 ~68px，
+                // 两个字段加动作行要 194px，而左栏在 660px 窗口里只能给它 169px ——
+                // 于是 PillButton 被压到下限以下、直接裁出卡片外面。
+                // 改成「眉标在左、选择器在右」的单行结构：每字段 38px，
+                // 总高降到 ~150px，既瘦下来又更像仪表盘（标签与读数同行，扫读更快）。
+                Bezel {
+                    core-padding: 16px;
+                    spacing: 8px;
+
+                    HorizontalLayout {
+                        spacing: 10px;
+                        alignment: center;
+                        Eyebrow { text: "包管理器"; width: 62px; }
+                        // ⚠ 必须钉死高度与最小宽度：Fluent ComboBox 自带
+                        // `min-width: max(160px, layout.min-height)` 与
+                        // `min-height: max(32px, …)`，实测它渲染成 62px 高、
+                        // 远宽于 160px，把同行标签挤成两截、卡片高度算飞。
+                        ComboBox {
+                            horizontal-stretch: 1;
+                            height: 30px;
+                            min-width: 0px;
+                            model: root.pm-options;
+                            current-index <=> root.pm-index;
+                            enabled: !root.busy;
+                            selected(v) => { root.pm-changed(self.current-index); }
                         }
                     }
                     HorizontalLayout {
-                        spacing: 8px;
-                        Text { text: "最新"; width: 56px; color: #666; }
-                        Text { text: root.latest-version; visible: root.version-known; }
-                        Text {
-                            text: "✓ 已是最新";
-                            color: #0a7;
-                            visible: root.version-known && root.up-to-date;
+                        spacing: 10px;
+                        alignment: center;
+                        Eyebrow { text: "目标版本"; width: 62px; }
+                        ComboBox {
+                            horizontal-stretch: 1;
+                            height: 30px;
+                            min-width: 0px;
+                            model: root.version-options;
+                            current-index <=> root.version-index;
+                            enabled: !root.busy;
+                            selected(v) => { root.version-changed(self.current-index); }
                         }
-                        Text {
-                            text: "↓ 可更新";
-                            color: #c60;
-                            visible: root.version-known && !root.up-to-date;
+                    }
+
+                    Rectangle { height: 1px; }
+                    HorizontalLayout {
+                        spacing: 9px;
+                        // 两个字面按钮都只剩图标（图标本身已经说明动作），
+                        // 所以它们不再撑满整行 —— 挤出多余的宽度，动作簇靠右收口，
+                        // 与"读数在左、动作在右"的仪表盘读法一致。
+                        Rectangle { horizontal-stretch: 1; }
+                        PillButton {
+                            icon-only: true;
+                            // ⚠ 宽度必须写死：HorizontalLayout 默认会把富余宽度摊给**每一项**
+                            // （实测两个图标按钮各被撑到 121px，图标浮在胶囊右侧）。
+                            // `min-width` 只保底、挡不住拉伸，固定 width 才挡得住。
+                            width: 38px;
+                            // ⚠ label 不显示，只作为无障碍名字存在（见 PillButton）。
+                            // busy 文案同理不进按钮，改由状态栏与忙碌脉冲条承担 ——
+                            // 一个圆按钮塞不下"准备中…"，硬塞回去就是又把文字加回来。
+                            label: root.busy ? root.busy-label : "安装";
+                            glyph: @image-url("icons/arrow-up-right.svg");
+                            emphasis: true;
+                            // I-2 / TR-1：dsh web 正在启动时不得执行变更。
+                            // 变灰不是唯一的守卫 —— main.rs 的 on_install_clicked
+                            // 里还有一道，并会给出可见的状态栏提示。
+                            interactive: root.can-install;
+                            clicked => { root.install-clicked(); }
+                        }
+                        PillButton {
+                            icon-only: true;
+                            width: 38px;
+                            label: "刷新";
+                            glyph: @image-url("icons/refresh.svg");
+                            interactive: !root.busy;
+                            clicked => { root.refresh-clicked(); }
+                        }
+                    }
+                }
+
+                // 服务卡：撑满左栏剩下的高度
+                // 服务卡吃掉左栏最后一块空间：弹性的，窗口变高时它变高，
+                // 而不是在底部留一条谁也解释不清的空白。
+                Bezel {
+                    vertical-stretch: 1;
+                    core-padding: 16px;
+                    VerticalLayout {
+                        spacing: 14px;
+
+                        HorizontalLayout {
+                            spacing: 10px;
+                            alignment: center;
+                            StatusDot {
+                                lamp: root.web-starting ? Tokens.warn
+                                    : (root.web-running ? Tokens.accent : #4A4A57);
+                                // 停止时不留光晕：一颗暗灯不该发光
+                                halo: root.web-running || root.web-starting;
+                            }
+                            Text {
+                                text: root.service-state;
+                                color: Tokens.ink;
+                                font-family: Font.text;
+                                font-size: 13px;
+                                font-weight: 600;
+                                vertical-alignment: center;
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                            Text {
+                                visible: root.web-running;
+                                text: root.web-url;
+                                color: Tokens.good;
+                                font-family: Font.mono;
+                                font-size: 10.5px;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            alignment: center;
+                            Eyebrow { text: "端口"; }
+                            Rectangle {
+                                width: 74px; height: 32px;
+                                border-radius: Tokens.r-sm;
+                                background: #00000059;
+                                border-width: 1px;
+                                border-color: Tokens.hairline;
+                                LineEdit {
+                                    text <=> root.port-text;
+                                    enabled: !root.busy;
+                                    horizontal-alignment: center;
+                                    font-family: Font.mono;
+                                    font-size: 12.5px;
+                                    edited(t) => { root.port-changed(t); }
+                                }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                            ChipButton {
+                                label: "启动";
+                                accent: true;
+                                // I-2：启动窗口内不给第二次点击
+                                interactive: !root.web-running && !root.busy && !root.web-starting;
+                                clicked => { root.start-web(); }
+                            }
+                            ChipButton {
+                                label: "停止";
+                                interactive: root.web-running && !root.busy;
+                                clicked => { root.stop-web(); }
+                            }
+                            ChipButton {
+                                label: "打开";
+                                interactive: root.web-running;
+                                clicked => { root.open-web(); }
+                            }
+                        }
+
+                        // 弹性撑杆：无内容时把端口行顶到上方，有剩余空间时吸收掉，
+                        // 而不是靠一个写死的像素值假装对齐。
+                        Rectangle { vertical-stretch: 1; min-height: 0px; }
+
+                        // 忙碌条：不确定进度，所以是条来回跑的脉冲而不是假百分数
+                        Rectangle {
+                            visible: root.busy;
+                            height: 2px;
+                            border-radius: 1px;
+                            background: Tokens.hairline;
+                            Rectangle {
+                                width: 96px;
+                                height: 2px;
+                                border-radius: 1px;
+                                background: @linear-gradient(90deg, transparent 0%, Tokens.accent 50%, transparent 100%);
+                                animate x {
+                                    duration: 1400ms;
+                                    iteration-count: -1;
+                                    easing: ease-in-out;
+                                }
+                                x: 0px;
+                                states [
+                                    run when root.busy : { x: parent.width - self.width; }
+                                ]
+                            }
                         }
                     }
                 }
             }
-        }
 
-        // ═══ 选择器 + 安装 ═══
-        HorizontalLayout {
-            spacing: 8px;
-            Text { text: "包管理器"; width: 64px; vertical-alignment: center; color: #666; }
-            ComboBox {
-                model: root.pm-options;
-                current-index <=> root.pm-index;
-                enabled: !root.busy;
-                selected(v) => { root.pm-changed(self.current-index); }
-            }
-        }
-        HorizontalLayout {
-            spacing: 8px;
-            Text { text: "目标版本"; width: 64px; vertical-alignment: center; color: #666; }
-            ComboBox {
-                model: root.version-options;
-                current-index <=> root.version-index;
-                enabled: !root.busy;
-                selected(v) => { root.version-changed(self.current-index); }
-            }
-            Button {
-                text: "安装";
-                // I-2 / TR-1：dsh web 正在启动时不得执行变更（见 web-starting 的说明）。
-                // 变灰不是唯一的守卫 —— main.rs 的 on_install_clicked 里还有一道，
-                // 并会给出可见的状态栏提示（两者条件相同，这里是"点不动"，那里是"说出来"）。
-                enabled: !root.busy && !root.web-starting;
-                clicked => { root.install-clicked(); }
-            }
-            Button {
-                text: "刷新";
-                enabled: !root.busy;
-                clicked => { root.refresh-clicked(); }
-            }
-        }
-
-        // ═══ dsh web ═══
-        Rectangle {
-            background: #fafafa;
-            border-radius: 6px;
-            border-width: 1px;
-            border-color: #e0e0e0;
+            // ───────────────────── 右：输出栏 ─────────────────────
             VerticalLayout {
-                padding: 10px;
-                spacing: 8px;
+                horizontal-stretch: 1;
+                spacing: 0px;
+
+                // 日志（FR-28）：最大的一块地，因为 npm install 可能跑 30 秒以上，
+                // 这段时间里它是唯一的进度反馈。
                 HorizontalLayout {
+                    height: 30px;
                     spacing: 8px;
-                    cross-axis-alignment: center;
-                    Rectangle {
-                        width: 8px; height: 8px; border-radius: 4px;
-                        background: root.web-running ? #0c0 : (root.web-starting ? #c60 : #bbb);
-                    }
+                    alignment: center;
+                    Eyebrow { text: "输出"; }
+                    Rectangle { horizontal-stretch: 1; }
+                    // 空状态就在这里表达：不额外占高度，也不与 ListView 抢空间，
+                    // 而且是"给出下一步"而不是干巴巴一句"没有数据"。
                     Text {
-                        // "启动中…" 而不是"已停止"：前者是事实，后者在 Starting 期间是谎话
-                        text: root.web-starting ? "启动中…" : (root.web-running ? "运行中" : "已停止");
-                        font-weight: 600;
-                    }
-                    Text {
-                        text: root.web-url;
-                        color: #06c;
-                        visible: root.web-running;
+                        text: root.log-lines.length == 0
+                            ? "尚无输出 · 点“刷新”重新探测环境与版本列表"
+                            : root.log-lines.length + " 行";
+                        color: Tokens.ink-4;
+                        font-family: Font.mono;
+                        font-size: 10px;
                         vertical-alignment: center;
                     }
                 }
+
+                Bezel {
+                    vertical-stretch: 1.6;
+                    // ⚠ 必须有下限：ListView 的最小高度是 0，窗口不够高时
+                    // 它会被压缩到只剩一条缝（实测 660px 窗口下日志区塌成 0）。
+                    min-height: 150px;
+                    // ⚠ 【不要】用 ScrollView 包 ListView。ListView 自己就会滚动；
+                    // 套一层 ScrollView 会让它按内容全高布局，从而破坏虚拟化 ——
+                    // 日志上限 2000 行（GC-12），那就等于一次渲染 2000 个 Text。
+                    ListView {
+                        // ⚠ vertical-stretch 必须写：布局子元素默认 0，不写会让
+                        // ListView 按内容高度居中停在面板正中。
+                        vertical-stretch: 1;
+                        // ⚠ 不要给 ListView 写 padding：它是 ScrollView，不是布局
+                        // 元素，padding 会被静默忽略（并给出编译警告）。
+                        for line in root.log-lines : LogLine { raw-line: line; }
+                    }
+                    // 空状态不在这里做：本面板的子元素全部是布局项，任何
+                    // 额外子元素都会与 ListView 抢剩余高度（实测把日志区挤成 0），
+                    // 而 Slint 的布局又拒绝绝对定位的装饰层（"The property 'y'
+                    // cannot be set for elements placed in this layout"）。
+                    // 所以"尚无输出"改由面板上方的标题行承担（见 logmeta）。
+                }
+
+                Rectangle { height: 14px; }
+
+                // 更新说明（FR-27）
                 HorizontalLayout {
+                    height: 30px;
                     spacing: 8px;
-                    Text { text: "端口"; vertical-alignment: center; color: #666; }
-                    LineEdit {
-                        text <=> root.port-text;
-                        width: 80px;
-                        enabled: !root.busy;
-                        edited(t) => { root.port-changed(t); }
+                    alignment: center;
+                    Eyebrow {
+                        text: "更新说明" + (
+                            root.notes-status == NotesStatus.missing ? " · 该版本无更新说明" :
+                            root.notes-status == NotesStatus.loading ? " · 加载中…" :
+                            root.notes-status == NotesStatus.failed  ? " · 加载失败" : ""
+                        );
                     }
-                    Button {
-                        text: "启动";
-                        // I-2：启动窗口内不给第二次点击（守卫同样在 main.rs 里，
-                        // 因为托盘菜单项不受这里的 enabled 约束）。
-                        enabled: !root.web-running && !root.busy && !root.web-starting;
-                        clicked => { root.start-web(); }
+                    Rectangle { horizontal-stretch: 1; }
+                    Text {
+                        visible: root.has-notes;
+                        text: root.version-index >= 0 && root.version-index < root.version-options.length
+                            ? root.version-options[root.version-index] : "";
+                        color: Tokens.ink-4;
+                        font-family: Font.mono;
+                        font-size: 10px;
+                        vertical-alignment: center;
                     }
-                    Button {
-                        text: "停止";
-                        enabled: root.web-running && !root.busy;
-                        clicked => { root.stop-web(); }
+                }
+
+                Bezel {
+                    vertical-stretch: 1;
+                    min-height: 130px;
+                    ScrollView {
+                        vertical-stretch: 1;
+                        // ⚠ StyledText 必须由布局托管，不能直接当 Flickable 的子元素。
+                        // 隐式尺寸的非布局子元素会被 Slint 在父元素里居中
+                        // （maybe_center_in_parent）：实测 257 字正文变成一条 2877px 的
+                        // 单行、左右各溢出卡片 1190px 被裁掉；而 1275 字的正文（高 442px）
+                        // 会从卡片上方 -148px 开始，开头 10 行看不见。
+                        // 套一层 VerticalLayout 后正文才既贴左、又按卡片宽度换行、又从顶部开始。
+                        VerticalLayout {
+                            padding-left: 4px;
+                            padding-right: 4px;
+                            StyledText {
+                                text: root.notes-text;
+                                default-font-size: 12px;
+                                link-clicked(link) => { root.link-clicked(link); }
+                            }
+                        }
                     }
-                    Button {
-                        text: "打开网页";
-                        enabled: root.web-running;
-                        clicked => { root.open-web(); }
+                    // 骨架屏：形状与正文一致，比转圈的 spinner 更少突兀
+                    VerticalLayout {
+                        visible: root.notes-loading;
+                        padding-left: 4px;
+                        spacing: 9px;
+                        Rectangle { height: 11px; width: 62%; border-radius: 5px; background: Tokens.hairline-soft; }
+                        Rectangle { height: 11px; width: 88%; border-radius: 5px; background: Tokens.hairline-soft; }
+                        Rectangle { height: 11px; width: 74%; border-radius: 5px; background: Tokens.hairline-soft; }
+                        Rectangle { height: 11px; width: 41%; border-radius: 5px; background: Tokens.hairline-soft; }
+                    }
+                    // 空状态：该版本没有说明，说清楚而不是留一片白
+                    VerticalLayout {
+                        visible: root.notes-status == NotesStatus.missing
+                              || root.notes-status == NotesStatus.failed;
+                        alignment: center;
+                        Text {
+                            text: root.notes-status == NotesStatus.missing
+                                ? "该版本没有附带更新说明"
+                                : "更新说明加载失败，稍后重试";
+                            color: Tokens.ink-4;
+                            font-family: Font.text;
+                            font-size: 11.5px;
+                            horizontal-alignment: center;
+                        }
                     }
                 }
             }
         }
 
-        // ═══ 更新说明 ═══
-        Text {
-            text: "更新说明" + (
-                root.notes-status == NotesStatus.missing ? " · 该版本无更新说明" :
-                root.notes-status == NotesStatus.loading ? " · 加载中…" :
-                root.notes-status == NotesStatus.failed  ? " · 加载失败" : ""
-            );
-            color: #666;
-        }
-        Rectangle {
-            background: white;
-            border-radius: 6px;
-            border-width: 1px;
-            border-color: #e0e0e0;
-            min-height: 130px;
-            ScrollView {
-                // ⚠ StyledText 必须由布局托管，不能直接当 Flickable 的子元素。
-                // 隐式尺寸的非布局子元素会被 Slint 在父元素里居中（maybe_center_in_parent）：
-                // 实测 257 字正文变成一条 2877px 的单行、左右各溢出卡片 1190px 被裁掉；
-                // 而 1275 字的正文（高 442px）会从卡片上方 -148px 开始，开头 10 行看不见。
-                // 套一层 VerticalLayout 后正文才既贴左、又按卡片宽度换行、又从顶部开始。
-                VerticalLayout {
-                    StyledText {
-                        text: root.notes-text;
-                        default-font-size: 12px;
-                        link-clicked(link) => { root.link-clicked(link); }
-                    }
-                }
-            }
-        }
+        Rectangle { height: 12px; }
 
-        // ═══ 日志（FR-28）═══
-        Text { text: "日志"; color: #666; }
-        Rectangle {
-            background: #1e1e1e;
-            border-radius: 6px;
-            min-height: 120px;
-            // ⚠ 【不要】用 ScrollView 包 ListView。ListView 自己就会滚动；
-            // 套一层 ScrollView 会让它按内容全高布局，从而破坏虚拟化 ——
-            // 日志上限 2000 行（GC-12），那就等于一次渲染 2000 个 Text。
-            ListView {
-                for line in root.log-lines : Text {
-                    text: line;
-                    color: #d4d4d4;
-                    font-family: "Consolas";
-                    font-size: 11px;
-                    wrap: no-wrap;
-                }
-            }
-        }
-
-        // ═══ 底部状态栏 ═══
+        // ══════════════════════════ 状态栏 ══════════════════════════════
         HorizontalLayout {
-            spacing: 8px;
+            height: 34px;
+            spacing: 10px;
+            alignment: center;
+            StatusDot {
+                lamp: root.busy ? Tokens.warn
+                    : (root.web-starting ? Tokens.warn
+                    : (root.web-running ? Tokens.accent : #4A4A57));
+                halo: root.busy || root.web-running || root.web-starting;
+            }
             Text {
-                text: root.busy ? root.busy-label : root.status-text;
-                color: root.busy ? #c60 : #666;
+                text: root.busy ? root.busy-label
+                    : (root.status-text != "" ? root.status-text
+                    : (root.probing ? "正在探测本地环境…" : "就绪"));
+                color: root.busy ? Tokens.warn
+                     : (root.status-text != "" ? Tokens.ink-3 : Tokens.ink-4);
+                font-family: Font.text;
+                font-size: 11.5px;
                 vertical-alignment: center;
-                font-size: 12px;
+                animate color { duration: 300ms; easing: ease-out-quint; }
             }
             Rectangle { horizontal-stretch: 1; }
-            Button { text: "关于"; clicked => { root.about-visible = true; root.about-clicked(); } }
-            Button { text: "隐藏到托盘"; clicked => { root.hide-to-tray(); } }
+            PillButton {
+                label: "关于";
+                quiet: true;
+                show-glyph: false;
+                min-height: 30px;
+                clicked => { root.about-visible = true; }
+            }
+            PillButton {
+                label: "设置";
+                quiet: true;
+                show-glyph: false;
+                min-height: 30px;
+                clicked => { root.settings-visible = true; }
+            }
         }
     }
 
-    // ═══ 关于对话框（GC-10：AboutSlint 是许可的强制署名义务）═══
+    // ═══════════════════════════ 关于（FR-29）═══════════════════════════
+    // GC-10 / CON-8：AboutSlint 是 Slint 免版税许可的**强制署名义务**，不可删。
     if root.about-visible : Rectangle {
-        background: #00000066;
+        background: #000000B8;
         // 遮罩必须吃掉点击，否则会穿透到后面的按钮
-        TouchArea { }
+        TouchArea { clicked => { root.about-visible = false; } }
+        // Esc 关闭：模态的唯一无鼠标出口
+        // ⚠ 空壳 FocusScope 必须自己抢焦点：默认只有"被点到"才会获得焦点
+        // （focus-on-click），而这里没有任何可点的内容 —— 不写这一行，Esc 是死的
+        // （已实测：真按键发进来，弹窗纹丝不动）。
+        FocusScope {
+            init => { self.focus(); }
+            key-pressed(e) => {
+                if (e.text == Key.Escape) { root.about-visible = false; return accept; }
+                return reject;
+            }
+        }
+
         VerticalLayout {
             alignment: center;
             cross-axis-alignment: center;
-            Rectangle {
-                background: white;
-                border-radius: 8px;
-                width: 360px;
-                VerticalLayout {
-                    padding: 16px;
+            Bezel {
+                width: 400px;
+                core-padding: 20px;
+                spacing: 0px;
+
+                    // ⚠ 这里**不要**写 alignment: center —— 那样 spacer 一点都不吃宽度
+                    // （实测两个弹窗的标题和 × 挤在中间）。用默认对齐时 spacer 才会
+                    // 把 × 顶到最右，标题留在最左（另一处实测：动作卡的图标按钮就是这么靠右的）。
+                    HorizontalLayout {
+                        spacing: 10px;
+                        Text {
+                            text: "DSH Manager";
+                            color: Tokens.ink;
+                            font-family: Font.display;
+                            font-size: 17px;
+                            font-weight: 600;
+                            letter-spacing: -0.2px;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        Rectangle {
+                            width: 26px; height: 26px; border-radius: 13px;
+                            background: #FFFFFF0D;
+                            border-width: 1px; border-color: Tokens.hairline;
+                            Image {
+                                width: 13px; height: 13px;
+                                source: @image-url("icons/close.svg");
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                            }
+                            TouchArea { clicked => { root.about-visible = false; } }
+                        }
+                    }
+                    Rectangle { height: 4px; }
+                    Text {
+                        text: "管理 DeepSeek Harness 的版本与 Web 服务";
+                        color: Tokens.ink-4;
+                        font-family: Font.text;
+                        font-size: 11.5px;
+                    }
+                    Rectangle { height: 18px; }
+                    Rectangle { height: 1px; background: Tokens.hairline-soft; }
+                    Rectangle { height: 16px; }
+
+                    VerticalLayout {
+                        spacing: 11px;
+                        MetaRow { k: "程序版本"; v: root.app-version; }
+                        MetaRow { k: "dsh 路径"; v: root.dsh-path; }
+                        MetaRow { k: "owner PM"; v: root.owner-pm; }
+                        MetaRow { k: "当前端口"; v: root.current-port; }
+                    }
+
+                    Rectangle { height: 18px; }
+                    Rectangle { height: 1px; background: Tokens.hairline-soft; }
+                    Rectangle { height: 16px; }
+
+                    HorizontalLayout {
+                        alignment: center;
+                        AboutSlint { }
+                    }
+            }
+        }
+    }
+
+    // ═══════════════════════════ 设置 ═══════════════════════════════════
+    // 目前只有一项（关闭行为）。做成一个独立面板而不是往主界面再塞一行控件，
+    // 是因为状态栏那排按钮是"窗口级动作"，而设置是"程序级配置"，两者不该并排。
+    if root.settings-visible : Rectangle {
+        background: #000000B8;
+        TouchArea { clicked => { root.settings-visible = false; } }
+        // ⚠ 空壳 FocusScope 必须自己抢焦点：默认只有"被点到"才会获得焦点
+        // （focus-on-click），而这里没有任何可点的内容 —— 不写这一行，Esc 是死的
+        // （已实测：真按键发进来，弹窗纹丝不动）。
+        FocusScope {
+            init => { self.focus(); }
+            key-pressed(e) => {
+                if (e.text == Key.Escape) { root.settings-visible = false; return accept; }
+                return reject;
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            cross-axis-alignment: center;
+            Bezel {
+                width: 400px;
+                core-padding: 20px;
+                spacing: 0px;
+
+                HorizontalLayout {
                     spacing: 10px;
-                    Text { text: "DSH Manager"; font-size: 18px; font-weight: 700; }
-                    Text { text: "管理 DeepSeek Harness 的版本与 Web 服务"; font-size: 12px; color: #666; }
-                    Text { text: "程序版本"; font-size: 12px; color: #666; }
-                    Text { text: root.app-version; font-size: 12px; }
-                    Text { text: "dsh 安装路径"; font-size: 12px; color: #666; }
-                    Text { text: root.dsh-path; font-size: 12px; }
-                    Text { text: "owner PM"; font-size: 12px; color: #666; }
-                    Text { text: root.owner-pm; font-size: 12px; }
-                    Text { text: "当前端口"; font-size: 12px; color: #666; }
-                    Text { text: root.current-port; font-size: 12px; }
-                    AboutSlint { }
-                    Button { text: "关闭"; clicked => { root.about-visible = false; } }
+                    Text {
+                        text: "设置";
+                        color: Tokens.ink;
+                        font-family: Font.display;
+                        font-size: 17px;
+                        font-weight: 600;
+                        letter-spacing: -0.2px;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    Rectangle {
+                        width: 26px; height: 26px; border-radius: 13px;
+                        background: #FFFFFF0D;
+                        border-width: 1px; border-color: Tokens.hairline;
+                        Image {
+                            width: 13px; height: 13px;
+                            source: @image-url("icons/close.svg");
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                        }
+                        TouchArea { clicked => { root.settings-visible = false; } }
+                    }
+                }
+                Rectangle { height: 18px; }
+                Rectangle { height: 1px; background: Tokens.hairline-soft; }
+                Rectangle { height: 16px; }
+
+                Eyebrow { text: "关闭主窗口时"; }
+                Rectangle { height: 10px; }
+                // 选中态就是 ChipButton 的 accent：同一个组件、只换颜色，
+                // 不做单选圆点 —— 三选一的语义靠强调色已经足够清楚。
+                HorizontalLayout {
+                    spacing: 8px;
+                    ChipButton {
+                        label: "隐藏至托盘";
+                        accent: root.close-behavior-index == 0;
+                        clicked => { root.settings-changed(0); }
+                    }
+                    ChipButton {
+                        label: "彻底退出";
+                        accent: root.close-behavior-index == 1;
+                        clicked => { root.settings-changed(1); }
+                    }
+                    ChipButton {
+                        label: "每次询问";
+                        accent: root.close-behavior-index == 2;
+                        clicked => { root.settings-changed(2); }
+                    }
+                }
+                Rectangle { height: 12px; }
+                Text {
+                    text: "首次关闭窗口时会先问一次，勾了“记住选择”的那个答案就落在这里，随时可改。选“彻底退出”会连同本程序启动的 dsh web 一起停掉。";
+                    color: Tokens.ink-4;
+                    font-family: Font.text;
+                    font-size: 11.5px;
+                    wrap: word-wrap;
+                }
+            }
+        }
+    }
+
+    // ═════════════════════════ 首次关闭的询问 ═══════════════════════════
+    // 只有 `close-behavior-index` 还是"每次询问"时才可能被 Rust 置真。
+    // 点遮罩或按 Esc = 放弃这次关闭，窗口留着（我们不替用户做决定）。
+    if root.close-prompt-visible : Rectangle {
+        background: #000000B8;
+        TouchArea { clicked => { root.close-prompt-visible = false; } }
+        // ⚠ 空壳 FocusScope 必须自己抢焦点：默认只有"被点到"才会获得焦点
+        // （focus-on-click），而这里没有任何可点的内容 —— 不写这一行，Esc 是死的
+        // （已实测：真按键发进来，弹窗纹丝不动）。
+        FocusScope {
+            init => { self.focus(); }
+            key-pressed(e) => {
+                if (e.text == Key.Escape) { root.close-prompt-visible = false; return accept; }
+                return reject;
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            cross-axis-alignment: center;
+            Bezel {
+                width: 380px;
+                core-padding: 20px;
+                spacing: 0px;
+
+                HorizontalLayout {
+                    spacing: 10px;
+                    Text {
+                        text: "关闭时的行为";
+                        color: Tokens.ink;
+                        font-family: Font.display;
+                        font-size: 16px;
+                        font-weight: 600;
+                        letter-spacing: -0.2px;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    // 右上角关闭 = 与 Esc / 点遮罩同义：放弃这次关闭，窗口留着。
+                    Rectangle {
+                        width: 26px; height: 26px; border-radius: 13px;
+                        background: #FFFFFF0D;
+                        border-width: 1px; border-color: Tokens.hairline;
+                        Image {
+                            width: 13px; height: 13px;
+                            source: @image-url("icons/close.svg");
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                        }
+                        TouchArea { clicked => { root.close-prompt-visible = false; } }
+                    }
+                }
+                Rectangle { height: 14px; }
+                HorizontalLayout {
+                    alignment: center;
+                    CheckRow {
+                        checked <=> root.close-prompt-remember;
+                        label: "记住选择";
+                    }
+                }
+                Rectangle { height: 8px; }
+                // 小字紧跟"记住选择"这一行：它解释的正是上面那个勾选框。
+                Text {
+                    text: "勾选后这次选择会记为默认行为，之后可在设置里修改。";
+                    color: Tokens.ink-4;
+                    font-family: Font.text;
+                    font-size: 11px;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+                Rectangle { height: 18px; }
+                // 两个动作做成按钮、落在底部右侧（对话框的惯用位置）。
+                // 点一下**就是**决定本身（随即隐藏或退出），没有"选中再确认"那一步。
+                HorizontalLayout {
+                    spacing: 9px;
+                    Rectangle { horizontal-stretch: 1; }
+                    PillButton {
+                        label: "彻底退出";
+                        show-glyph: false;
+                        clicked => { root.close-choice(1, root.close-prompt-remember); }
+                    }
+                    PillButton {
+                        label: "隐藏至托盘";
+                        emphasis: true;
+                        show-glyph: false;
+                        clicked => { root.close-choice(0, root.close-prompt-remember); }
+                    }
                 }
             }
         }
     }
 }
 
-// 托盘组件是【顶层】组件：inherits SystemTrayIcon，不能放进 Window 里，
-// 且必须恰好包含一个 Menu 子元素。
+// ════════════════════════════════════════════════════════════════════════════
+//  托盘组件是【顶层】组件：inherits SystemTrayIcon，不能放进 Window 里，
+//  且必须恰好包含一个 Menu 子元素。
 //
-// ⚠ 它与 MainWindow 各自持有 global 的独立副本，二者不共享任何状态 ——
-// 所有同步必须由 Rust 侧推送（SRS FR-25）。
+//  ⚠ 它与 MainWindow 各自持有 global 的独立副本，二者不共享任何状态 ——
+//  所有同步必须由 Rust 侧推送（SRS FR-25）。
+//
+//  ⚠ 托盘菜单是**原生菜单**，由操作系统绘制，无法应用本文件的设计语言；
+//  这里只能保证文案与启用条件正确。
+// ════════════════════════════════════════════════════════════════════════════
 export component AppTray inherits SystemTrayIcon {
     in property <bool> web-running: false;
     in property <bool> busy: false;
 
-    icon: @image-url("tray-icon.png");
+    // 托盘图标用 logo.png（与标题栏 / 任务栏 / 报头同一张图）。
+    // 为什么不是矢量：托盘图标走 `Image::to_rgba8()`，对 SVG 是按**内在尺寸**栅格化
+    // —— 也就是每次启动都要把 910×941 整幅画一遍（实测 debug 档窗口 1.36s 才可见，
+    // release 档 0.32~0.45s）。换成 PNG 后那一段变成一次位图解码（debug 档 598~666ms）。
+    // ⚠ PNG 解码要靠 Cargo.toml 的 `image-default-formats`：少了它 Slint 是**静默**
+    // 解不出来，托盘会"图标根本不出现"（ARCHITECTURE R-3）。
+    icon: @image-url("../assets/logo.png");
     tooltip: "DSH Manager";
 
     callback show-window();

@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use slint::{ComponentHandle, Model, ModelRc, Timer, TimerMode, VecModel};
 
+use config::CloseBehavior;
 use model::*;
 
 slint::include_modules!();
@@ -83,6 +84,9 @@ struct AppState {
     /// 其它闭包），而"全局最新"和"owner PM"都【不是】用户的选择。
     selected_pm: Option<Pm>,
     selected_version: Option<Version>,
+    /// 关闭主窗口的行为（FR-23 修订）。缺省 `Ask` = 首次关闭弹询问框，
+    /// 见 `config::CloseBehavior` 与 `on_close_requested`。
+    close_behavior: CloseBehavior,
     log: Rc<VecModel<slint::SharedString>>,
 }
 
@@ -95,7 +99,7 @@ struct NotesState {
 }
 
 impl AppState {
-    fn new(preferred_port: u16) -> Self {
+    fn new(preferred_port: u16, close_behavior: CloseBehavior) -> Self {
         Self {
             env: PmEnv::default(),
             probed: false,
@@ -113,6 +117,7 @@ impl AppState {
             web_pid: None,
             selected_pm: None,
             selected_version: None,
+            close_behavior,
             log: Rc::new(VecModel::default()),
         }
     }
@@ -328,6 +333,10 @@ fn project(state: &AppState, win: &MainWindow, tray: &AppTray) {
     // ⚠ 必须是【实际在运行】的端口，不是用户在输入框里敲的 port-text ——
     // 后者只是偏好值。否则"关于"会与 FR-30 的持久化状态互相矛盾。
     win.set_current_port(state.web.port().unwrap_or(state.preferred_port).to_string().into());
+
+    // ── 关闭行为（FR-23 修订：可在设置里改）──
+    // ⚠ 必须每帧都推：设置面板改变的是 AppState，而"唯一点投影点"是本函数。
+    win.set_close_behavior_index(state.close_behavior.index());
 
     // ── 推给托盘（独立实例，必须再推一次）──
     tray.set_web_running(state.web.is_running());
@@ -1102,23 +1111,106 @@ fn wire_callbacks(
     }
 
     {
-        let state = state.clone();
-        // ⚠ 必须先 clone：`win_weak` 是本函数的参数，直接 move 进这个闭包后，
-        // 下面托盘块的 `win_weak.clone()` 就会编译失败（use of moved value）。
-        let win_weak = win_weak.clone();
-        win.on_hide_to_tray(move || {
-            if let Some(w) = win_weak.upgrade() {
-                let _ = w.hide();
-            }
-            push_log(&state.borrow(), "主窗口已隐藏，程序仍在托盘运行");
-        });
-    }
-
-    {
         let send = send.clone();
         win.on_link_clicked(move |url| {
             // FR-27b：说明正文自带的链接透传给系统浏览器
             send(Job::OpenUrl { url: url.to_string() });
+        });
+    }
+
+    // ── 关闭行为（FR-23 修订）──
+    //
+    // 只有一条投影路径：`close_behavior` 落在 AppState 里，再由 `project()`
+    // 推回 `close-behavior-index`。面板上的高亮因此**必须**置 dirty ——
+    // 设置面板的点击不发任何 Job，稳态下没有消息可排空。
+    {
+        let state = state.clone();
+        win.on_settings_changed(move |idx| {
+            let Some(behavior) = CloseBehavior::from_index(idx) else { return };
+            {
+                let mut s = state.borrow_mut();
+                s.close_behavior = behavior;
+                s.dirty = true;
+            }
+            // FR-30 同款：偏好立即落盘，设置面板里没有"保存"按钮。
+            // 写失败只记日志、不回滚 —— 回滚界面上的选择会让"点了没反应"，
+            // 而这次选择在本次运行里已经生效。
+            if let Err(e) = config::update(|f| f.close_behavior = Some(behavior)) {
+                push_log(&state.borrow(), format!("关闭行为保存失败（本次运行仍生效）：{e}"));
+            }
+        });
+    }
+
+    // 首次关闭时那个询问框：两个单选项各带一次"是否记住"。
+    {
+        let state = state.clone();
+        let q = quit.clone();
+        let win_weak = win_weak.clone();
+        win.on_close_choice(move |idx, remember| {
+            let Some(behavior) = CloseBehavior::from_index(idx) else { return };
+            if remember {
+                {
+                    let mut s = state.borrow_mut();
+                    s.close_behavior = behavior;
+                    s.dirty = true;
+                }
+                // FR-30 同款：偏好立即落盘，没有"保存"按钮。
+                // 写失败只记日志、不回滚 —— 回滚界面上的选择会让"点了没反应"，
+                // 而这次选择在本次运行里已经生效。
+                if let Err(e) = config::update(|f| f.close_behavior = Some(behavior)) {
+                    push_log(&state.borrow(), format!("关闭行为保存失败（本次运行仍生效）：{e}"));
+                }
+            }
+            // ⚠ 没勾"记住选择"时**什么都不写**：AppState 里仍是 `Ask`，state.json 不动 ——
+            // 于是设置面板继续显示"每次询问"，下次关闭还会问。这正是勾选框的语义。
+            let Some(w) = win_weak.upgrade() else { return };
+            w.set_close_prompt_visible(false); // 框必须先关掉，否则退出/隐藏都像卡住
+            if behavior == CloseBehavior::Quit {
+                q();
+            } else {
+                let _ = w.hide();
+                push_log(&state.borrow(), "主窗口已隐藏，程序仍在托盘运行");
+            }
+        });
+    }
+
+    // FR-23 修订：关闭窗口做什么由用户定（隐藏 / 退出 / 每次询问）。
+    // ⚠ 两个已实测确认的易错点（ARCHITECTURE §2.4.2）：
+    //   1. on_close_requested 挂在 slint::Window 上（win.window()），
+    //      不在生成的组件上（win.on_close_requested 不存在）
+    //   2. 返回 KeepWindowShown 会【取消】关闭，返回 HideWindow 才是
+    //      "接受关闭并隐藏"（表现是点 X 毫无反应的那种错，就是把两者写反了）
+    {
+        let state = state.clone();
+        let q = quit.clone();
+        let win_weak = win_weak.clone();
+        win.window().on_close_requested(move || {
+            // ⚠ 先把行为拷出来（`CloseBehavior` 是 Copy）。写成
+            // `match state.borrow().close_behavior` 也能编译 —— 但那个临时的
+            // `Ref` 会活到整个 match 结束，将来任何一个分支里加一句 `borrow_mut`
+            // 就会在**点关闭按钮时**panic（运行期才发现）。
+            let behavior = state.borrow().close_behavior;
+            match behavior {
+                CloseBehavior::Hide => {
+                    push_log(&state.borrow(), "主窗口已隐藏，程序仍在托盘运行");
+                    slint::CloseRequestResponse::HideWindow
+                }
+                CloseBehavior::Quit => {
+                    // ⚠ 必须返回 KeepWindowShown：退出是自己把事件循环停掉，
+                    // 若先返回 HideWindow，窗口会先消失再由 quit 收尾 —— 用户看到的是
+                    // "窗口没了但进程还在"的一帧，与"退出"的预期不符。
+                    q();
+                    slint::CloseRequestResponse::KeepWindowShown
+                }
+                CloseBehavior::Ask => {
+                    // ⚠ 询问框只能挂在一个**还开着**的窗口上，所以这里必须取消这次关闭
+                    // （KeepWindowShown）。真正的隐藏/退出发生在上面的 close-choice 里。
+                    if let Some(w) = win_weak.upgrade() {
+                        w.set_close_prompt_visible(true);
+                    }
+                    slint::CloseRequestResponse::KeepWindowShown
+                }
+            }
         });
     }
 
@@ -1205,21 +1297,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // NULL，std 把写失败直接吞掉 —— eprintln! 在这里是**空操作**，消息无影无踪。
     // 日志面板是本程序唯一的日志出口，所以把话带出 match，等 state 建好再 push_log。
     // （别用 `cargo run` 验证这条：它会给子进程一个继承来的控制台，从而假通过。）
-    let (preferred_port, startup_note) = match config::load() {
-        config::Loaded::Ok(s) => (s.preferred_port.unwrap_or(3080), None),
-        config::Loaded::Missing => (3080, None),
+    // FR-23 修订：关闭窗口的行为（隐藏 / 退出 / 每次询问）与端口同源，都读 state.json。
+    // 没有记录时是 `Ask` —— "首次关闭要询问"这条需求不需要额外的"是否问过"标志：
+    // 没值就是没问过。
+    let (preferred_port, close_behavior, startup_note) = match config::load() {
+        config::Loaded::Ok(s) => (
+            s.preferred_port.unwrap_or(3080),
+            s.close_behavior.unwrap_or_default(),
+            None,
+        ),
+        config::Loaded::Missing => (3080, CloseBehavior::default(), None),
         // FR-32：记日志但不阻止启动 —— 端口回落缺省值
         config::Loaded::Corrupt(e) => (
             3080,
+            CloseBehavior::default(),
             Some(format!("state.json 损坏，使用缺省端口 3080：{e}")),
         ),
-        config::Loaded::NoLocation => (3080, None),
+        config::Loaded::NoLocation => (3080, CloseBehavior::default(), None),
     };
 
     let win = MainWindow::new()?;
     let tray = AppTray::new()?;
 
-    let state = Rc::new(RefCell::new(AppState::new(preferred_port)));
+    let state = Rc::new(RefCell::new(AppState::new(preferred_port, close_behavior)));
     push_log(&state.borrow(), "DSH Manager 启动");
     if let Some(note) = startup_note {
         push_log(&state.borrow(), note);
@@ -1328,19 +1428,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 每个 tick 重复触发。
     drop(msg_tx);
 
-    // FR-23：关闭窗口 → 隐藏，不退出。
-    // ⚠ 两个已实测确认的易错点（ARCHITECTURE §2.4.2）：
-    //   1. on_close_requested 挂在 slint::Window 上（win.window()），
-    //      不在生成的组件上（win.on_close_requested 不存在）
-    //   2. 必须返回 HideWindow 才是"接受关闭并隐藏"；
-    //      返回 KeepWindowShown 会【取消】关闭 —— 表现是点 X 毫无反应
-    {
-        let state = state.clone();
-        win.window().on_close_requested(move || {
-            push_log(&state.borrow(), "主窗口已隐藏，程序仍在托盘运行");
-            slint::CloseRequestResponse::HideWindow
-        });
-    }
+    // FR-23 修订版的关闭语义（隐藏 / 退出 / 每次询问）连同询问框一起挂在
+    // wire_callbacks 里 —— 退出路径 `quit` 必须已经就绪，而它在这之下才定义。
 
     // FR-21：退出必须先停掉本程序启动的 dsh web，不留孤儿 node 进程。
     // ⚠ 用 AppState.web_pid（由 drain 的 WebState 臂维护：Starting 与 Running 都带
@@ -1408,6 +1497,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 不加这行，IsWindowVisible 实测为 false：启动后只剩托盘图标、窗口永不出现，
     // 既不满足简报 Step 3 的预期 1，也不满足 NFR-1。
     win.show()?;
+
     slint::run_event_loop_until_quit()?; // FR-23：不是 run_event_loop()
     drop(timer);
     Ok(())

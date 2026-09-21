@@ -3,10 +3,63 @@
 
 use std::path::{Path, PathBuf};
 
+/// 关闭主窗口时的行为。FR-23 修订版：**首次关闭时询问一次**，选中的结果
+/// 记在这里，之后可在"设置"里随时改。
+///
+/// ⚠ 下标即 UI 契约：`ui/app.slint` 的 `close-behavior-index` 用 0/1/2 表示
+/// 这三档，两边必须一起改。
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub enum CloseBehavior {
+    Hide,
+    Quit,
+    /// 每次关闭都问一遍。也是 state.json 里**没记过**时的缺省值 ——
+    /// 于是"首次关闭"这条路径不需要任何额外标志：没值就是问。
+    #[default]
+    Ask,
+}
+
+impl CloseBehavior {
+    pub fn index(self) -> i32 {
+        match self {
+            CloseBehavior::Hide => 0,
+            CloseBehavior::Quit => 1,
+            CloseBehavior::Ask => 2,
+        }
+    }
+
+    pub fn from_index(i: i32) -> Option<Self> {
+        match i {
+            0 => Some(CloseBehavior::Hide),
+            1 => Some(CloseBehavior::Quit),
+            2 => Some(CloseBehavior::Ask),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            CloseBehavior::Hide => "hide",
+            CloseBehavior::Quit => "quit",
+            CloseBehavior::Ask => "ask",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "hide" => Some(CloseBehavior::Hide),
+            "quit" => Some(CloseBehavior::Quit),
+            "ask" => Some(CloseBehavior::Ask),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Default, Clone, Debug, PartialEq)]
 pub struct StateFile {
     pub preferred_port: Option<u16>,
     pub running_port: Option<u16>,
+    /// `None` = 从没问过（首次关闭要弹询问框）。见 `CloseBehavior`。
+    pub close_behavior: Option<CloseBehavior>,
 }
 
 #[derive(Debug)]
@@ -37,6 +90,12 @@ pub fn load_from(path: Option<&Path>) -> Loaded {
     Loaded::Ok(StateFile {
         preferred_port: read_port("preferred_port"),
         running_port: read_port("running_port"),
+        // ⚠ 认不出的值（手改过、将来降级运行）一律当"没记过"处理，
+        // 也就是回到"每次询问"—— 比替用户猜一个行为安全。
+        close_behavior: v
+            .get("close_behavior")
+            .and_then(|x| x.as_str())
+            .and_then(CloseBehavior::parse),
     })
 }
 
@@ -74,6 +133,7 @@ pub fn save_to(path: &Path, s: &StateFile) -> Result<(), String> {
     let json = serde_json::json!({
         "preferred_port": s.preferred_port,
         "running_port": s.running_port,
+        "close_behavior": s.close_behavior.map(CloseBehavior::as_str),
     });
     let text = serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?;
 
@@ -176,6 +236,60 @@ mod tests {
             Loaded::Ok(s) => {
                 assert_eq!(s.preferred_port, None);
                 assert_eq!(s.running_port, None);
+                // ⚠ 这一条是"首次关闭要询问"的立身之本：没记过 ≠ 默认隐藏。
+                assert_eq!(s.close_behavior, None, "没记过关闭行为时必须回到“每次询问”");
+            }
+            other => panic!("期望 Ok，得到 {other:?}"),
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 判别性测试：认不出的 close_behavior 必须当"没记过"处理。
+    ///
+    /// 它钉住的是"**绝不替用户猜**"：手改过、或将来降级运行读到新版本写的值时，
+    /// 未知值只能回到"每次询问"，不能猜成隐藏或退出。下面把三个合法值也各读一遍 ——
+    /// 否则"未知值 → None"这条断言在"解析整个坏掉、永远返回 None"的实现下会假通过。
+    #[test]
+    fn unknown_close_behavior_falls_back_to_ask() {
+        let p = tmp("unknown-behavior.json");
+        std::fs::write(&p, r#"{"close_behavior":"nuke-the-site"}"#).unwrap();
+        match load_from(Some(&p)) {
+            Loaded::Ok(s) => assert_eq!(s.close_behavior, None),
+            other => panic!("期望 Ok，得到 {other:?}"),
+        }
+        for (text, want) in [
+            ("hide", CloseBehavior::Hide),
+            ("quit", CloseBehavior::Quit),
+            ("ask", CloseBehavior::Ask),
+        ] {
+            std::fs::write(&p, format!(r#"{{"close_behavior":"{text}"}}"#)).unwrap();
+            match load_from(Some(&p)) {
+                Loaded::Ok(s) => assert_eq!(s.close_behavior, Some(want), "{text} 应被读回"),
+                other => panic!("期望 Ok，得到 {other:?}"),
+            }
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn close_behavior_survives_update() {
+        // 设置面板改的就是这一项，而 update 是"读—改—写"：
+        // 改关闭行为绝不能顺手抹掉运行态端口（反之亦然）。
+        let p = tmp("behavior-update.json");
+        save_to(
+            &p,
+            &StateFile {
+                preferred_port: Some(3080),
+                running_port: Some(8080),
+                close_behavior: None,
+            },
+        )
+        .unwrap();
+        update_at(&p, |s| s.close_behavior = Some(CloseBehavior::Hide)).unwrap();
+        match load_from(Some(&p)) {
+            Loaded::Ok(s) => {
+                assert_eq!(s.close_behavior, Some(CloseBehavior::Hide));
+                assert_eq!(s.running_port, Some(8080), "改关闭行为不得丢失运行态端口");
             }
             other => panic!("期望 Ok，得到 {other:?}"),
         }
@@ -190,7 +304,11 @@ mod tests {
     #[test]
     fn save_then_load_roundtrip() {
         let p = tmp("roundtrip.json");
-        let s = StateFile { preferred_port: Some(8080), running_port: Some(9090) };
+        let s = StateFile {
+            preferred_port: Some(8080),
+            running_port: Some(9090),
+            close_behavior: Some(CloseBehavior::Quit),
+        };
         save_to(&p, &s).unwrap();
         match load_from(Some(&p)) {
             Loaded::Ok(got) => assert_eq!(got, s),
@@ -212,7 +330,8 @@ mod tests {
     #[test]
     fn save_leaves_no_tmp_file_behind() {
         let p = tmp("notmp.json");
-        save_to(&p, &StateFile { preferred_port: Some(1), running_port: None }).unwrap();
+        let s = StateFile { preferred_port: Some(1), running_port: None, close_behavior: None };
+        save_to(&p, &s).unwrap();
         let leftover = p.with_extension("json.tmp");
         assert!(!leftover.exists(), "原子写入不得残留 .tmp 文件");
         let _ = std::fs::remove_file(&p);
@@ -221,7 +340,8 @@ mod tests {
     #[test]
     fn update_preserves_other_field() {
         let p = tmp("update.json");
-        save_to(&p, &StateFile { preferred_port: Some(3080), running_port: None }).unwrap();
+        let s = StateFile { preferred_port: Some(3080), running_port: None, close_behavior: None };
+        save_to(&p, &s).unwrap();
         update_at(&p, |s| s.running_port = Some(8080)).unwrap();
         match load_from(Some(&p)) {
             Loaded::Ok(s) => {
@@ -265,12 +385,14 @@ mod tests {
         let _ = std::fs::remove_file(&p);
         let _ = std::fs::remove_dir_all(&tmp_dir);
 
-        let baseline = StateFile { preferred_port: Some(3080), running_port: None };
+        let baseline =
+            StateFile { preferred_port: Some(3080), running_port: None, close_behavior: None };
         save_to(&p, &baseline).unwrap();
 
         // 占住 .tmp 路径，使"写临时文件"必然失败
         std::fs::create_dir_all(&tmp_dir).unwrap();
-        let different = StateFile { preferred_port: Some(9999), running_port: Some(1) };
+        let different =
+            StateFile { preferred_port: Some(9999), running_port: Some(1), close_behavior: None };
         assert!(save_to(&p, &different).is_err(), "写 .tmp 失败时 save_to 必须报错");
 
         match load_from(Some(&p)) {
