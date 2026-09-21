@@ -727,7 +727,10 @@ export component MainWindow inherits Window {
 
             // ───────────────────── 左：控制栏 ─────────────────────
             VerticalLayout {
-                width: 344px;
+                // ⚠ 344 → 420px：日志搬进这一栏后，`$ npm.cmd install -g
+                // @deepseek-ai/dsh@0.1.6-alpha.2` 这类原文在 344px 里放不下（11px 等宽
+                // 约 52 字符 ≈ 345px），会溢出卡片被裁。右栏剩 420px 仍够读说明。
+                width: 420px;
                 spacing: 12px;
 
                 // 版本主卡：数字是唯一的主角
@@ -1022,9 +1025,41 @@ export component MainWindow inherits Window {
                             }
                         }
 
-                        // 弹性撑杆：无内容时把端口行顶到上方，有剩余空间时吸收掉，
-                        // 而不是靠一个写死的像素值假装对齐。
-                        Rectangle { vertical-stretch: 1; min-height: 0px; }
+                        // 弹性撑杆（原先在这里）已换成下面的日志区：日志就是这块区域
+                        // 干活的输出，放在同一条纵向节奏里比塞一根空撑杆更有意义。
+
+                        // ═══════════════════ 应用输出（FR-28）═══════════════════
+                        // 原先是右栏上半独立的一块面板，现按需求**并入本区域下方**：
+                        // "输出"是这块区域（探测 / 安装事务 / dsh web 启停）干出来的东西，
+                        // 挨着它看才有因果。
+                        // ⚠ 右栏因此整个让给更新说明（长文阅读需要整列宽度与高度）。
+                        Rectangle { height: 1px; background: Tokens.hairline-soft; }
+                        HorizontalLayout {
+                            height: 24px;
+                            alignment: center;
+                            Eyebrow {
+                                text: "输出";
+                                // 居中：即使这一格被布局撑宽，字形也留在格子中间
+                                horizontal-alignment: center;
+                            }
+                        }
+                        // ⚠ 【不要】用 ScrollView 包 ListView。ListView 自己就会滚动；
+                        // 套一层 ScrollView 会让它按内容全高布局，从而破坏虚拟化 ——
+                        // 日志上限 2000 行（GC-12），那就等于一次渲染 2000 个 Text。
+                        ListView {
+                            // ⚠ vertical-stretch 必须写：布局子元素默认 0，不写会让
+                            // ListView 按内容高度居中停在面板正中。
+                            vertical-stretch: 1;
+                            // 并入左侧窄栏后要有下限：窗口不够高时 ListView 会被压成一条缝。
+                            min-height: 120px;
+                            // ⚠ 不要给 ListView 写 padding：它是 ScrollView，不是布局
+                            // 元素，padding 会被静默忽略（并给出编译警告）。
+                            for line in root.log-lines : LogLine { raw-line: line; }
+                        }
+                        // 空状态不在这里做：本面板的子元素全部是布局项，任何
+                        // 额外子元素都会与 ListView 抢剩余高度（实测把日志区挤成 0），
+                        // 而 Slint 的布局又拒绝绝对定位的装饰层（"The property 'y'
+                        // cannot be set for elements placed in this layout"）。
 
                         // 忙碌条：不确定进度，所以是条来回跑的脉冲而不是假百分数
                         Rectangle {
@@ -1052,51 +1087,12 @@ export component MainWindow inherits Window {
                 }
             }
 
-            // ───────────────────── 右：输出栏 ─────────────────────
+            // ───────────────────── 右：更新说明 ─────────────────────
+            // 应用输出已并入左栏的服务区（见上），右栏整列让给更新说明 ——
+            // 长文阅读需要的是宽度和高度，日志不需要。
             VerticalLayout {
                 horizontal-stretch: 1;
                 spacing: 0px;
-
-                // 日志（FR-28）：最大的一块地，因为 npm install 可能跑 30 秒以上，
-                // 这段时间里它是唯一的进度反馈。
-                // ⚠ 标题在面板**内部**顶部居中（原先那行表头在面板外侧，还带个"x 行"
-                // 计数器与空状态提示）—— 计数器与提示确实去掉了，但标题本身回到它
-                // 描述的那块区域里，与下方"更新说明"同一种做法。
-                Bezel {
-                    vertical-stretch: 1.6;
-                    // ⚠ 必须有下限：ListView 的最小高度是 0，窗口不够高时
-                    // 它会被压缩到只剩一条缝（实测 660px 窗口下日志区塌成 0）。
-                    min-height: 150px;
-                    HorizontalLayout {
-                        height: 30px;
-                        alignment: center;
-                        Eyebrow {
-                            text: "输出";
-                            // 居中：即使这一格被布局撑宽，字形也留在格子中间
-                            horizontal-alignment: center;
-                        }
-                    }
-                    // ⚠ 【不要】用 ScrollView 包 ListView。ListView 自己就会滚动；
-                    // 套一层 ScrollView 会让它按内容全高布局，从而破坏虚拟化 ——
-                    // 日志上限 2000 行（GC-12），那就等于一次渲染 2000 个 Text。
-                    ListView {
-                        // ⚠ vertical-stretch 必须写：布局子元素默认 0，不写会让
-                        // ListView 按内容高度居中停在面板正中。
-                        vertical-stretch: 1;
-                        // ⚠ 不要给 ListView 写 padding：它是 ScrollView，不是布局
-                        // 元素，padding 会被静默忽略（并给出编译警告）。
-                        for line in root.log-lines : LogLine { raw-line: line; }
-                    }
-                    // 空状态不在这里做：本面板的子元素全部是布局项，任何
-                    // 额外子元素都会与 ListView 抢剩余高度（实测把日志区挤成 0），
-                    // 而 Slint 的布局又拒绝绝对定位的装饰层（"The property 'y'
-                    // cannot be set for elements placed in this layout"）。
-                    // ⚠ 原先表头那句"尚无输出 · 点刷新…"就是这么绕开布局限制的；
-                    // 表头整条去掉后，日志为空时面板就是一块空玻璃 —— 这是已知取舍，
-                    // 真要提示得放进面板内部（例如 ListView 之上叠一层，代价见上）。
-                }
-
-                Rectangle { height: 14px; }
 
                 // 更新说明（FR-27）
                 // ⚠ 标题移进面板**内部**顶部居中（原先在面板外侧单独占一行）。
@@ -1105,7 +1101,8 @@ export component MainWindow inherits Window {
                 // 不会被撑开，标题会贴在左边（Slint 布局分配富余宽度的行为与直觉不同）。
                 Bezel {
                     vertical-stretch: 1;
-                    min-height: 130px;
+                    // 独占整列后下限提一点：这是唯一的长文区，窗口再矮也别压成一条缝。
+                    min-height: 260px;
                     HorizontalLayout {
                         height: 30px;
                         spacing: 8px;
