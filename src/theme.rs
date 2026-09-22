@@ -125,20 +125,29 @@ pub fn system_dark() -> bool {
     uxtheme_dark().unwrap_or_else(registry_dark)
 }
 
-/// 本机是否达到"支持暗色模式"的 Windows 版本，即 build >= 17763（Windows 10 1809）。
+/// 本机是否达到"支持暗色模式"的 Windows 版本。
 ///
-/// ⚠ **与 winit 同源，这是同源约束的一部分，不是可选优化。**
-/// winit 用 `DARK_MODE_SUPPORTED` 做同一件事（`winit-0.30.13/src/platform_impl/windows/dark_mode.rs:46-53`），
-/// 构建号经 ntdll 的 `RtlGetVersion` 取得 —— 不能用 `GetVersionExW`：它没有 manifest 时会**撒谎**
-/// （在 Win10+ 上仍报 6.2 / build 9200），那会让本函数在现代系统上恒为 false，于是我们永远走注册表
-/// 而 winit 走 uxtheme，**又回到主体与标题栏不同源**。
+/// ⚠ **与 winit 逐字同源，这是同源约束的一部分，不是可选优化。**
+/// winit 的判定是 `DARK_MODE_SUPPORTED`（`winit-0.30.13/src/platform_impl/windows/dark_mode.rs:46-53`），
+/// 它先经 ntdll 的 `RtlGetVersion` 取版本，再要求
+/// **`status >= 0` 且 `dwMajorVersion == 10` 且 `dwMinorVersion == 0`**，最后才比 `dwBuildNumber >= 17763`。
+/// 本函数把那三个条件一起照搬 —— 只比构建号会让本函数在"主版本不是 10 的未来系统"上
+/// 判成 `true` 而 winit 判 `false`，于是我们走 uxtheme、winit 走浅色，
+/// **又回到主体与标题栏各说各话**，正是同源约束要禁止的那件事。
 ///
-/// 为什么必须挡：`uxtheme.dll` 的序号 132 只在 17763+ 才有定义。低于该版本时，
+/// ⚠ **不能用 `GetVersionExW`**：它没有 manifest 时会**撒谎**（Win10+ 仍报 6.2 / build 9200），
+/// 那会让本函数在现代系统上恒为 false，于是我们永远走注册表而 winit 走 uxtheme —— 同样是不同源。
+/// winit 用 `RtlGetVersion` 正是为此。
+///
+/// 为什么必须挡：`uxtheme.dll` 的序号 132 只在 build 17763+ 才有定义。低于该版本时，
 /// ① 若该序号上恰好是别的导出，`transmute` 出来的错误原型调用就是 **UB**；
-/// ② 即便侥幸可用，winit 在这种机器上判**浅色**（它同样返回 None→false），我们若判成暗色，
-///    标题栏与窗口主体就会各说各话 —— 正是"必须同源"要避免的那件事。
+/// ② winit 在那种机器上判**浅色**，我们若判成暗色就会不一致。
 ///
-/// 取不到版本号时返回 `false`（走注册表）：宁可在旧机器上退化成注册表读数，也不赌一个未知序号。
+/// 取不到版本号、或版本不满足上述条件时返回 `false`（走注册表）：
+/// 宁可在旧机器上退化成注册表读数，也不赌一个未知序号。
+///
+/// ⚠ **维护契约**：本函数是 winit 判定的镜像。若哪天 winit 放宽了它的条件
+/// （例如支持主版本不再是 10 的系统），**这里必须同步放宽**，否则又会分叉。
 #[cfg(windows)]
 fn dark_mode_supported() -> bool {
     use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
@@ -160,11 +169,9 @@ fn dark_mode_supported() -> bool {
             dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as u32,
             ..Default::default()
         };
-        // RtlGetVersion 返回 NTSTATUS，0 = STATUS_SUCCESS
-        if f(&mut vi) != 0 {
-            return false;
-        }
-        vi.dwBuildNumber >= 17763
+        let status = f(&mut vi);
+        // NTSTATUS 的成功判据是 `>= 0`（不是 `== 0`）—— 与 winit 的写法保持一致
+        status >= 0 && vi.dwMajorVersion == 10 && vi.dwMinorVersion == 0 && vi.dwBuildNumber >= 17763
     }
 }
 
