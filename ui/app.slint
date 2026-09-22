@@ -90,6 +90,10 @@ global Tokens {
     out property <duration> motion-slow:  400ms;
     out property <duration> motion-hover: 200ms;
     out property <duration> motion-tap:   150ms;
+    /// 状态栏高度。⚠ 两处必须一致：主布局靠 `padding-bottom: Tokens.status-h`
+    /// 给贴底的状态栏让位，状态栏自己用它定高 —— 不一致就会出现"内容压在栏上"
+    /// 或者"栏上方一条谁也解释不清的空白"。
+    out property <length> status-h: 34px;
     /// 不可用元素整体压暗的统一档位（收敛前 0.30 / 0.34 两个值）。
     out property <float> disabled: 0.35;
 }
@@ -1096,7 +1100,8 @@ export component MainWindow inherits Window {
         padding-left: 14px;
         padding-right: 14px;
         padding-top: 8px;
-        padding-bottom: 10px;
+        // 给贴底的应用状态栏让位（它是 Window 的绝对定位子元素，见文件末尾前一段）
+        padding-bottom: Tokens.status-h;
         spacing: 0px;
 
         // ═════════════════════════ 应用菜单栏 ═══════════════════════════════
@@ -1344,6 +1349,9 @@ export component MainWindow inherits Window {
                         // **读数从左边起，尾随动作靠右收口**。
                         HorizontalLayout {
                             spacing: 10px;
+                            // ⚠ 同状态栏：cross-axis 默认 stretch，8px 的状态点会被顶到行上沿
+                            // —— 不写这一行，点就悬在"运行中"三个字的左上角。
+                            cross-axis-alignment: center;
                             StatusDot {
                                 lamp: root.web-starting ? Tokens.warn
                                     : (root.web-running ? Tokens.accent : Tokens.lamp-off);
@@ -1561,15 +1569,46 @@ export component MainWindow inherits Window {
         }
 
         Rectangle { height: 12px; }
+    }
 
-        // ══════════════════════════ 状态栏 ══════════════════════════════
-        // 只留状态：关于 / 设置 已搬进上方的应用菜单栏。
-        // ⚠ `alignment: start`：默认对齐会把富余宽度摊给每一项 —— 这条规则以前把
-        // 那两个按钮撑成 131px，现在只剩状态灯与文字，留着它会把文字推离左边。
+    // ══════════════════════════ 应用状态栏 ══════════════════════════════
+    // 只留状态：关于 / 设置 已搬进上方的应用菜单栏。
+    //
+    // ⚠ 为什么它是 Window 的绝对定位子元素，而不是主布局的最后一行：
+    // 主布局左右各有 14px 内容留白，而状态栏要**整宽贴底**（条带越过留白，
+    // 文字再自己缩进 14px）。写进主布局里就只能缩在留白内；要让它整宽就得把
+    // 整块主体再套一层布局 —— 那是 500 行的重新缩进，为一条状态栏不值。
+    // 所以主布局改成 `padding-bottom: Tokens.status-h` 给它让位，本组件贴底。
+    // 声明顺序在主布局**之后**、菜单与对话框**之前**：盖住内容，但不盖弹层。
+    Rectangle {
+        y: parent.height - self.height;
+        width: 100%;
+        height: Tokens.status-h;
+        background: Tokens.shell;
+
+        // 顶边一线：把状态栏与内容区分开（窗口级的分隔线，比卡片内的 hairline-soft 实一档）
+        Rectangle {
+            y: 0px;
+            width: 100%;
+            height: 1px;
+            background: Tokens.hairline;
+        }
+
         HorizontalLayout {
-            height: 34px;
+            y: 1px;
+            width: 100%;
+            height: parent.height - 1px;
+            padding-left: 14px;
+            padding-right: 14px;
             spacing: 10px;
+            // ⚠ `alignment: start`：默认对齐会把富余宽度摊给每一项 —— 这条规则以前把
+            // 那两个按钮撑成 131px，现在只剩状态灯与文字，留着它会把文字推离左边。
             alignment: start;
+            // ⚠ 必须显式写 center：cross-axis 的默认值是 stretch，而状态点的尺寸是写死的
+            // 8px —— 不写这一行，那颗点会被顶到状态栏的**上沿**，看起来挂在文字的左上角
+            // （用户报的就是这条）。同一坑见 PillButton 的图标与 GlassSelect 的箭头。
+            cross-axis-alignment: center;
+
             StatusDot {
                 lamp: root.busy ? Tokens.warn
                     : (root.web-starting ? Tokens.warn
