@@ -831,11 +831,13 @@ component PluginRowView inherits Rectangle {
         }
         Rectangle { horizontal-stretch: 1; }
 
-        // 更新：未安装时文案改"安装"（走同一条 Update 路径，按最新版重装）。
-        // 最新版未知 → 禁用（不知道装哪个版本）。
-        ChipButton {
+        // 更新：只在**确实有更新**或**未安装**时才出现 —— spec §8.2 的
+        // "已是最新的行不显示〔更新〕（禁用不如不显示）"。
+        // ⚠ 用 `if` 而不是 `interactive: false`：后者会在每行右边留一个点不动的灰按钮，
+        // 六行里五行都是它，看着像坏了。未安装时文案改"安装"（走同一条 Update 路径）。
+        if root.plugin.updatable || root.plugin.missing : ChipButton {
             label: root.plugin.missing ? "安装" : "更新";
-            accent: root.plugin.updatable || root.plugin.missing;
+            accent: true;
             interactive: !root.busy && root.plugin.latest != "—";
             clicked => { root.update-clicked(); }
         }

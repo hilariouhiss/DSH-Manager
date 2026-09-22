@@ -335,8 +335,10 @@ impl AppState {
 fn plugin_card_height(rows: usize) -> f32 {
     /// SectionHeader + 安装行 + Divider + 汇总行 + 上下留白。
     const CHROME: f32 = 118.0;
-    /// 一行的高度（两行式行条目）。
-    const ROW: f32 = 46.0;
+    /// 一行的高度。⚠ 必须与 `ui/app.slint` 的 `PluginRowView.height` **同一个数**：
+    /// 离屏探针实测过 46 的情形 —— 每行多算 6px，`ListView` 因此比内容高 36px，
+    /// 最后一行与汇总行之间凭空多出 63px 空白（带 y 347 与 y 410 之间）。
+    const ROW: f32 = 40.0;
     let visible = rows.clamp(1, 6) as f32; // 至少留一行的位置（空态也要有个落点）
     CHROME + ROW * visible
 }

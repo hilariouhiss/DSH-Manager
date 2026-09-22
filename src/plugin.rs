@@ -200,17 +200,24 @@ pub fn update_all_op(rows: &[PluginRow]) -> Option<PluginOp> {
 /// 会在每次操作时闪一个黑窗口。退出码非零**不是** `Err`（与 `pm::run_cmd` 同语义）——
 /// 由调用方判定成败，这样 pnpm 的原文才能进日志。
 pub fn run_plugin(args: &[String]) -> Result<CmdOut, String> {
+    run_plugin_with(&SHIM_NAMES, args)
+}
+
+/// `run_plugin` 的可测内核：按给定 shim 名单顺序尝试，全失败才 `Err`。
+///
+/// **为什么要有这道缝**：真实的 `dsh plugin` 依赖 pnpm，而本项目的沙箱里 pnpm
+/// 跑不起来（`pnpm --version` 直接报 untrusted mount point，见 VERIFICATION 的环境限制）。
+/// 但"参数是否**逐字**送到进程"与"退出码非零不被当成执行失败"这两条可以用临时目录里的
+/// 假 shim 验 —— 与 `pm::read_dsh_version_at` 存在的理由同款（TR-4 的判别性测试靠它）。
+pub fn run_plugin_with(shims: &[&str], args: &[String]) -> Result<CmdOut, String> {
     let mut last = String::new();
-    for shim in SHIM_NAMES {
+    for shim in shims {
         match pm::run_cmd(shim, args) {
             Ok(out) => return Ok(out),
             Err(e) => last = format!("{shim}: {e}"),
         }
     }
-    Err(format!(
-        "无法执行 dsh —— 已尝试 {}：{last}",
-        SHIM_NAMES.join(" / ")
-    ))
+    Err(format!("无法执行 dsh —— 已尝试 {}：{last}", shims.join(" / ")))
 }
 
 /// worker 的唯一入口：定位 profile → 盘点 → 并行补最新版。
@@ -336,6 +343,40 @@ mod tests {
     #[test]
     fn read_installed_reports_unreadable_profile() {
         assert!(read_installed(Path::new(r"C:\definitely\not\here")).is_err());
+    }
+
+    /// ★ 假 shim 冒烟：参数必须**逐字**送到进程，且退出码非零是**结果**不是 `Err`。
+    ///
+    /// 这两条是"命令表写对了"之外唯一还能自动化的部分 —— 真实 `dsh plugin` 要 pnpm，
+    /// 而本项目沙箱里 pnpm 起不来（见 VERIFICATION 的环境限制，端到端由用户执行）。
+    #[test]
+    fn run_plugin_forwards_args_verbatim_and_reports_exit_code() {
+        let dir = std::env::temp_dir().join(format!("dsh-mgr-plugin-run-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let shim = dir.join("dsh-probe.cmd");
+        // 回显收到的参数，然后以 3 退出（pnpm 失败时就是这个形状）
+        std::fs::write(&shim, "@echo off\r\necho ARGS:%*\r\nexit /b 3\r\n").unwrap();
+
+        let args = PluginOp::Remove("@s/p".into()).args("web");
+        let got = run_plugin_with(&[shim.to_str().unwrap()], &args);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let out = got.expect("shim 存在 → 必须 Ok（非零退出码不是 Err）");
+        assert_eq!(out.code, 3, "退出码必须原样带回来");
+        assert!(
+            out.stdout.contains("ARGS:plugin --profile web remove @s/p"),
+            "参数必须逐字到达进程（顺序与拼写都算），实际输出：{}",
+            out.stdout
+        );
+    }
+
+    #[test]
+    fn run_plugin_errors_only_when_no_shim_starts() {
+        let args = PluginOp::Install("@s/p".into()).args("web");
+        let err = run_plugin_with(&["definitely-not-a-real-shim.exe"], &args)
+            .expect_err("一个 shim 都起不来才该 Err");
+        assert!(err.contains("definitely-not-a-real-shim.exe"), "错误里要点明试过谁：{err}");
     }
 
     #[test]
