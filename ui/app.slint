@@ -1127,11 +1127,13 @@ export component MainWindow inherits Window {
     }
     init => { Palette.color-scheme = is-dark ? ColorScheme.dark : ColorScheme.light; }
 
-    // ── 版本信息（FR-9）──
+    // ── 版本信息（FR-9 修订）──
+    // ⚠ 这里原有 `latest-version`（显示"通道最新 x.y.z"那一行用的），随版本主卡删除 ——
+    // 删卡后它没有任何消费者（目标版本下拉的默认选中项就是通道最新版）。
+    // 留着它就是一个只有 setter、没有读者的属性。
     in property <string> installed-version: "检测中…";
-
-    in property <string> latest-version: "";
     in property <bool>   version-known: false;
+    /// "是否已是最新"（FR-9）—— 由操作卡「当前版本」右侧的状态徽标消费。
     in property <bool>   up-to-date: false;
 
     // ── 选择器（FR-10 / FR-11 修订）──
@@ -1303,84 +1305,12 @@ export component MainWindow inherits Window {
                 width: 420px;
                 spacing: 12px;
 
-                // 版本主卡：数字是唯一的主角
-                Bezel {
-                    core-padding: 16px;
-                    spacing: 0px;
-
-                    // ⚠ 这里原先是**大字号版本读数**（`font-hero` 等宽数字，该令牌已随它删除），
-                    // 已移除：
-                    // "当前装的是什么版本"改由操作卡的「包管理器 ｜ 当前版本」那一行承担 ——
-                    // 它就在「目标版本」正上方，选目标时可以直接上下对比。
-                    // 本卡因此从"读数卡"收敛为"**有没有新版**"卡：
-                    // 状态标签 + 通道最新，两件事都与"要不要升级"有关，不再重复版本号。
-                    // 删读数时连带删掉了它下面那根 9px 占位 —— 它的唯一作用就是给读数与
-                    // 标签行留距，读数没了它只会让卡片顶部空一块。
-
-                    HorizontalLayout {
-                        spacing: 7px;
-                        // "alpha 通道 / rc 通道"徽标已按要求去掉：通道信息本来就在版本号
-                        // 自己身上（0.1.6-**alpha**.2），再挂一枚徽标是同一件事说两遍。
-                        Tag {
-                            visible: root.version-known && root.up-to-date;
-                            label: "已是最新";
-                            tint: Tokens.accent;
-                            fill: Tokens.accent-soft;
-                        }
-                        Tag {
-                            visible: root.version-known && !root.up-to-date;
-                            label: "可更新";
-                            tint: Tokens.warn;
-                            fill: Tokens.warn-soft;
-                        }
-                        Tag {
-                            visible: root.probing;
-                            label: "检测中";
-                            tint: Tokens.ink-4;
-                        }
-                    }
-
-                    // ⚠ 这里写过 `height: 100%` —— 在 VerticalLayout 的子元素上，
-                    // 百分比高度是**相对父容器**的，于是"父高取决于子高、子高取决于父高"
-                    // 成环。实测后果是整列高度算飞：卡片互相重叠、按钮被裁到窗外。
-                    // 让文字自己撑高即可，不要给布局子元素写百分比尺寸。
-                    Rectangle {
-                        visible: root.absent;
-                        Text {
-                            text: "未在 PATH 上找到 dsh。先装一个包管理器版本，再从下方选目标版本。";
-                            color: Tokens.ink-3;
-                            font-family: Font.text;
-                            font-size: 11.5px;
-                            wrap: word-wrap;
-                            vertical-alignment: center;
-                        }
-                    }
-
-                    Rectangle { height: 10px; }
-                    Divider { }
-                    Rectangle { height: 9px; }
-
-                    HorizontalLayout {
-                        spacing: 8px;
-                        Eyebrow { text: "通道最新"; width: 62px; }
-                        Text {
-                            text: root.version-known ? root.latest-version : "—";
-                            color: root.version-known ? Tokens.ink-2 : Tokens.ink-4;
-                            font-family: Font.mono;
-                            font-size: 11.5px;
-                            vertical-alignment: center;
-                        }
-                        Rectangle { horizontal-stretch: 1; }
-                        Text {
-                            visible: root.version-known && !root.up-to-date;
-                            text: "可升级";
-                            color: Tokens.warn;
-                            font-family: Font.text;
-                            font-size: 10.5px;
-                            vertical-alignment: center;
-                        }
-                    }
-                }
+                // ⚠ 这里原有**版本主卡**（大字号读数 + 状态徽标 + 通道最新一行），
+                // 已整卡删除。它的两块信息各有了新落点：
+                //   · "是否已是最新"（FR-9）→ 操作卡「当前版本」右侧的状态徽标；
+                //   · "通道最新 x.y.z"       → 不再单独显示：目标版本下拉的**默认选中项**
+                //     就是通道内最新版，同一个值说两遍只是多一行。
+                // 左栏因此从三张卡收敛为两张（操作卡 + 服务卡）。
 
                 // 操作卡
                 // 操作卡：两个字段 + 一行动作。
@@ -1399,6 +1329,9 @@ export component MainWindow inherits Window {
                     // 两行左边缘就都从同一条线开始（下拉吃掉剩下的宽度）。
                     HorizontalLayout {
                         spacing: 10px;
+                        // ⚠ cross-axis-alignment: center 是**必需**的：默认的 stretch 会把
+                        // 22px 高的 Tag 顶到 32px 行的上沿（服务卡的状态点踩过同一条坑）。
+                        cross-axis-alignment: center;
                         FieldLabel { text: "包管理器"; width: 62px; }
                         // 只读指示（FR-11 修订）：本程序不再提供 PM 选择器 ——
                         // 从界面发起的变更一律作用于**当前 owner PM**，跨 PM 迁移已从
@@ -1413,7 +1346,7 @@ export component MainWindow inherits Window {
                             vertical-alignment: center;
                         }
                         Rectangle { horizontal-stretch: 1; }
-                        // 右半回答"当前是什么版本"。它原先是大字号读数（本卡顶部），
+                        // 右半回答"当前是什么版本"。它原先是大字号读数（已随版本主卡删除），
                         // 现在只在这里出现一次 —— 所以用正文色 + 等宽，不再用 ink-4。
                         FieldLabel { text: "当前版本"; }
                         Text {
@@ -1422,6 +1355,29 @@ export component MainWindow inherits Window {
                             font-family: Font.mono;
                             font-size: 12.5px;
                             vertical-alignment: center;
+                        }
+                        // FR-9 的"是否已是最新"结论随版本主卡搬到这里：挂在版本号右侧，
+                        // 与它判断的那个读数挨着。（"通道最新 x.y.z"不再单独显示 ——
+                        // 目标版本下拉的默认选中项就是它。）
+                        // ⚠ 这里用 `if` 而不是 `visible:`：三个 Tag 里最多亮一个，而
+                        // **不可见的 Tag 照样占着两侧 9px 的 padding** —— 离屏探针实测
+                        // 两枚隐藏 Tag 白占 36px，把"已是最新"从卡片右边缘推开约 54px，
+                        // 同时把左侧两组挤到几乎贴在一起（`npm` 止于 x123、`当前版本`
+                        // 从 x144 就开始）。`if` 是"根本不存在"，这一行才恢复成
+                        // "左一组 / 右一组"的仪表盘读法。
+                        if root.version-known && root.up-to-date : Tag {
+                            label: "已是最新";
+                            tint: Tokens.accent;
+                            fill: Tokens.accent-soft;
+                        }
+                        if root.version-known && !root.up-to-date : Tag {
+                            label: "可更新";
+                            tint: Tokens.warn;
+                            fill: Tokens.warn-soft;
+                        }
+                        if root.probing : Tag {
+                            label: "检测中";
+                            tint: Tokens.ink-4;
                         }
                     }
                     HorizontalLayout {
@@ -1438,6 +1394,17 @@ export component MainWindow inherits Window {
                         // 它回答的是"我选中的是不是现在装着的"—— 这个问题现在由**点击时**的
                         // 确认框回答（FR-12b）：选中的就是已装版本时，〔安装〕先弹
                         // "是否重新安装"，而不是在行尾常驻一枚小字。
+                    }
+                    // "未在 PATH 上找到 dsh"的引导（原在版本主卡里）。搬到这里 ——
+                    // 未检测到 dsh 时它必须还能看见，而那张卡已经没有了。
+                    // ⚠ 用 `if` 而不是 `visible:`：不可见元素照样占布局位置
+                    // （Slint 的既有坑，本文件多处已记），这行只在异常态出现，不该留空位。
+                    if root.absent : Text {
+                        text: "未在 PATH 上找到 dsh。先装一个包管理器版本，再从下方选目标版本。";
+                        color: Tokens.ink-3;
+                        font-family: Font.text;
+                        font-size: 11.5px;
+                        wrap: word-wrap;
                     }
 
                     // ⚠ 这是分隔线，不是空行 —— 原先写成没有 background 的裸

@@ -282,13 +282,9 @@ fn project(state: &AppState, win: &MainWindow, tray: &AppTray) {
     win.set_version_known(
         state.probed && state.env.installed.is_some() && state.newest_in_channel().is_some(),
     );
-    win.set_latest_version(
-        state
-            .newest_in_channel()
-            .map(|v| v.to_string())
-            .unwrap_or_default()
-            .into(),
-    );
+    // FR-9 修订：版本主卡已删，"通道最新 x.y.z"不再单独投影（`latest-version` 属性随之
+    // 删除）—— 目标版本下拉的默认选中项就是通道内最新版。这里只推"是否已是最新"，
+    // 它由操作卡「当前版本」右侧的状态徽标消费。
     win.set_up_to_date(state.is_up_to_date());
 
     // PM 不再有选择器：只推一个只读指示（原 `pm-options` / `pm-index` /
