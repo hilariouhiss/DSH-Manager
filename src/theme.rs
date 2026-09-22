@@ -7,9 +7,11 @@
 //! 这一点），`SlintContext::color_scheme()` 又只在 `private_unstable_api` 里。
 //! 所以"跟随系统"必须我们自己探测。
 
-// `registry_dark` 里 `OsStr::encode_wide` 的来源。
-#[cfg(windows)]
-use std::os::windows::ffi::OsStrExt;
+// ⚠ 此处曾有一行 `#[cfg(windows)] use std::os::windows::ffi::OsStrExt;`（供
+// `registry_dark` 的 `encode_wide` 使用）。Ruling 17 删除 `registry_dark` 后它没有
+// 消费者 —— 实测 `cargo build` 报 `unused import`（简报 Step 4 末尾"在顶部加这一行"
+// 是删除前的残留），故一并删除。Task 6 的注册表**通知**需要宽字符串时，在那次提交里
+// 按需加回。
 
 // ⚠ 过渡期抑制，**Task 9 Step 1 必须删除这三行**（那里有强制的删除步骤）。
 // 本模块的项分三批被消费：parse/as_str → Task 2，resolve → Task 6，
@@ -83,16 +85,30 @@ pub fn resolve(mode: ThemeMode, system_dark: bool) -> bool {
     }
 }
 
-/// 个人化设置键。`AppsUseLightTheme` 是 DWORD：1 = 浅色，0 = 深色。
+/// 个人化设置键。Task 6 的变更监视用它 —— **只用于通知，不用于取值**
+/// （取值一律走上面的 uxtheme 序号，理由见 `system_dark` 的文档）。
+///
+/// ⚠ 它的消费者在 Task 6，故需要一处过渡期抑制（Task 9 一并删除）。
+#[allow(dead_code)]
 #[cfg(windows)]
 const PERSONALIZE_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize";
 
 /// 当前系统是否为暗色。
 ///
-/// **主路径与 winit 同源**：`uxtheme.dll` 的序号 132 导出（`ShouldAppsUseDarkMode`），
-/// 并同样排除高对比度。不同源的话，系统标题栏（winit 负责）与窗口主体（本函数
-/// 负责）会各说各话 —— 那正是本设计要避免的。取不到该导出时回落注册表读
-/// `AppsUseLightTheme`。
+/// **本函数是 winit 判据 `should_use_dark_mode()` 的逐条镜像**
+/// （`winit-0.30.13/src/platform_impl/windows/dark_mode.rs:126-127`）：
+/// `should_apps_use_dark_mode() && !is_high_contrast()`。
+///
+/// ⚠ **三条失败路径一律返回 `false`（浅色），这是刻意的，不是保守。**
+/// winit 的 `should_apps_use_dark_mode()` 用 `.unwrap_or(false)` 收尾（`:126` 同文件 `:153`），
+/// `try_theme` 在 `!DARK_MODE_SUPPORTED` 时也直接落到 `Theme::Light`（`:61`/`:80`）。
+/// 也就是说**取不到版本、取不到模块、取不到序号，winit 全判浅色**。
+/// 我们若在这些情况下改读注册表，就会在"系统设置是暗色"的旧机器上让主体变暗、
+/// 而标题栏仍是浅的 —— 正是同源约束要禁止的那种不一致。
+///
+/// ⚠ 因此本模块**不读注册表**。早先的 `registry_dark()` 回落已删除：
+/// 它只在上述失败路径上被触发，而那些路径恰恰是 winit 判浅色的路径 ——
+/// 回落不是安全网，是分叉源。（注册表在 Task 6 仍然要用，但只用于**变更通知**，不用于取值。）
 // ⚠ 过渡期抑制：Task 6 的监视器是它的消费者，Task 9 连同文件顶部三处一起删除。
 #[allow(dead_code)]
 #[cfg(windows)]
@@ -115,14 +131,16 @@ pub fn system_dark() -> bool {
         ok != 0 && hc.dwFlags & HCF_HIGHCONTRASTON != 0
     }
 
+    // 三条失败路径全判浅色 —— 逐条对齐 winit，理由见函数文档。
+    // 顺序上先挡版本：不达标时 winit 连序号都不去解析，我们也不必白跑一次高对比度查询。
+    if !dark_mode_supported() {
+        return false;
+    }
     if high_contrast() {
         return false;
     }
-    // ⚠ 低于 Windows 10 1809 时**不碰**序号 132，直接走注册表回落。理由见 `dark_mode_supported`。
-    if !dark_mode_supported() {
-        return registry_dark();
-    }
-    uxtheme_dark().unwrap_or_else(registry_dark)
+    // 取不到序号 → winit 的 `unwrap_or(false)` → 浅色
+    uxtheme_dark().unwrap_or(false)
 }
 
 /// 本机是否达到"支持暗色模式"的 Windows 版本。
@@ -195,45 +213,6 @@ fn uxtheme_dark() -> Option<bool> {
         // 释放它会在下次调用时重新加载 —— 那是纯粹的浪费，不是严谨。
         let f: ShouldAppsUseDarkMode = std::mem::transmute(proc);
         Some(f() != 0)
-    }
-}
-
-/// 回落：直接读注册表。序号 132 取不到时才走这里。
-#[cfg(windows)]
-fn registry_dark() -> bool {
-    use windows_sys::Win32::System::Registry::{
-        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY_CURRENT_USER, HKEY, KEY_READ,
-        REG_DWORD,
-    };
-
-    let sub: Vec<u16> = std::ffi::OsStr::new(PERSONALIZE_KEY)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let name: Vec<u16> = std::ffi::OsStr::new("AppsUseLightTheme")
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-
-    unsafe {
-        let mut hkey: HKEY = std::ptr::null_mut();
-        if RegOpenKeyExW(HKEY_CURRENT_USER, sub.as_ptr(), 0, KEY_READ, &mut hkey) != 0 {
-            return false; // 读不到就当浅色：暗色是本应用的"特殊外观"，不该是猜错的默认
-        }
-        let mut val: u32 = 1;
-        let mut size = std::mem::size_of::<u32>() as u32;
-        let mut ty = 0u32;
-        let r = RegQueryValueExW(
-            hkey,
-            name.as_ptr(),
-            std::ptr::null_mut(),
-            &mut ty,
-            (&raw mut val).cast(),
-            &mut size,
-        );
-        RegCloseKey(hkey);
-        // AppsUseLightTheme == 0 表示深色
-        r == 0 && ty == REG_DWORD && val == 0
     }
 }
 
