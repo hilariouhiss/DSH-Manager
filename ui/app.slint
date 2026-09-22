@@ -43,32 +43,41 @@ export struct NoteBlock {
 // ── 设计令牌 ────────────────────────────────────────────────────────────────
 // 一处定义，全局引用。升级路径：将来若做主题切换，只需把这里的常量
 // 换成 `in` 属性并由 Rust 写入。
+//
+// ⚠ 色值锚定 `assets/logo.png`（本机采样，非肉眼估）：
+//     头发主蓝 #59659B（占 9.2%，签名色）／发丝高光 #7AA3CD→#95B6E9
+//     裙装藏青 #30304E~#3B3C62／围裙暖白 #FDF4F5
+// 所以下面三件事是一体的，改一件要一起想：
+//   ① 中性色阶是**藏青**不是纯灰（取裙装的色相，压到近黑）
+//   ② 玻璃层的白是**冷白**（#EEF0FF…）不是灰白（#FFFFFF…）
+//   ③ 强调色是**紫蓝**不是薄荷 —— logo 里一个绿色像素都没有，
+//      这是"配色不适配 logo"的全部根源。
 global Tokens {
-    out property <brush> canvas:        #07070A;  // 最深一层（OLED 近黑，非纯黑）
-    out property <brush> core-top:      #111116;  // 卡片内胎（渐变上端）
-    out property <brush> core-bottom:   #0C0C10;  // 卡片内胎（渐变下端）
-    out property <brush> shell:         #FFFFFF06; // 外碗底
-    out property <brush> hairline:      #FFFFFF12; // 1px 结构线
-    out property <brush> hairline-soft: #FFFFFF0A;
-    out property <brush> hairline-strong: #FFFFFF33; // 输入类控件的描边（小面积上结构线看不见）
-    out property <brush> inner-light:   #FFFFFF0E; // 内胎顶缘高光
+    out property <brush> canvas:        #08080F;  // 最深一层（OLED 近黑，带藏青，非纯黑）
+    out property <brush> core-top:      #12121C;  // 卡片内胎（渐变上端）
+    out property <brush> core-bottom:   #0D0D15;  // 卡片内胎（渐变下端）
+    out property <brush> shell:         #EEF0FF06; // 外碗底
+    out property <brush> hairline:      #EEF0FF12; // 1px 结构线
+    out property <brush> hairline-soft: #EEF0FF0A;
+    out property <brush> hairline-strong: #EEF0FF33; // 输入类控件的描边（小面积上结构线看不见）
+    out property <brush> inner-light:   #EEF0FF0E; // 内胎顶缘高光
 
-    out property <brush> ink:           #EDEDF2;  // 主文字
-    out property <brush> ink-2:         #A9A9B6;  // 正文
-    out property <brush> ink-3:         #77778A;  // 次级
-    out property <brush> ink-4:         #5F5F6C;  // 标签 / 眉标
+    out property <brush> ink:           #EFEFF7;  // 主文字
+    out property <brush> ink-2:         #AFB0C6;  // 正文
+    out property <brush> ink-3:         #7C7D95;  // 次级
+    out property <brush> ink-4:         #63647C;  // 标签 / 眉标
 
-    out property <brush> accent:        #6EE7B7;  // 唯一强调色（薄荷）
-    out property <brush> accent-ink:    #8FF0C8;  // 强调色上的文字
-    out property <brush> good:          #7AA2F7;  // 信息 / 成功（与强调色分工）
-    out property <brush> warn:          #E3B341;
+    out property <brush> accent:        #9AA6E8;  // 唯一强调色（logo 签名蓝 #59659B 提亮）
+    out property <brush> accent-ink:    #BCC5F7;  // 强调色上的文字
+    out property <brush> good:          #7FB4E4;  // 信息 / 成功（logo 高光天蓝，与强调色分工）
+    out property <brush> warn:          #E3B341;  // ⚠ 刻意**不**取自 logo：金蝶结只占 67px(0.05%)
 
-    out property <brush> cta-top:       #F4F4F7;  // 主 CTA（“主机白”）
-    out property <brush> cta-bottom:    #D9D9E0;
-    out property <brush> cta-ink:       #0A0A0D;
+    out property <brush> cta-top:       #F8F6FA;  // 主 CTA（围裙白）
+    out property <brush> cta-bottom:    #DCDAE6;
+    out property <brush> cta-ink:       #0B0B14;
 
-    out property <brush> glow-mint:     #6EE7B71F;
-    out property <brush> glow-blue:     #7AA2F717;
+    out property <brush> glow-brand:    #9AA6E81F; // 强调色的氛围光（原名 glow-mint，随配色改）
+    out property <brush> glow-blue:     #7FB4E417;
     out property <length> r-lg: 22px;
     out property <length> r-md: 16px;
     out property <length> r-sm: 11px;
@@ -77,24 +86,24 @@ global Tokens {
     // ── 控制面：所有可点元素共用同一套填充，不允许各自写白百分比 ─────────────
     // 收敛前散着 #FFFFFF08/0D/12/14/17/1F 六个值，四个按钮族各挑一个，
     // 于是"同一档悬停"在四个地方是四种亮度。
-    out property <brush> fill:        #FFFFFF0D; // 静止
-    out property <brush> fill-hover:  #FFFFFF17; // 悬停
-    out property <brush> fill-active: #FFFFFF1F; // 按压 / 已展开
+    out property <brush> fill:        #EEF0FF0D; // 静止
+    out property <brush> fill-hover:  #EEF0FF17; // 悬停
+    out property <brush> fill-active: #EEF0FF1F; // 按压 / 已展开
 
     // ── 槽与浮层 ──────────────────────────────────────────────────────────
     out property <brush> sunk:        #00000059; // 下凹槽底（输入框 / 下拉框）
-    out property <brush> solid:       #16161C;   // 浮层底：不透明，才压得住下层文字
+    out property <brush> solid:       #15151F;   // 浮层底：不透明，才压得住下层文字
     out property <brush> overlay:     #000000B8; // 模态遮罩
 
     // ── 强调色的四档（静止填充 / 悬停填充 / 描边 / 徽标底）──────────────────
-    out property <brush> accent-fill:       #6EE7B71A;
-    out property <brush> accent-fill-hover: #6EE7B72E;
-    out property <brush> accent-line:       #6EE7B747;
-    out property <brush> accent-soft:       #6EE7B712;
+    out property <brush> accent-fill:       #9AA6E81A;
+    out property <brush> accent-fill-hover: #9AA6E82E;
+    out property <brush> accent-line:       #9AA6E847;
+    out property <brush> accent-soft:       #9AA6E812;
     out property <brush> warn-soft:         #E3B34112;
 
     out property <brush> danger:      #F07178;   // 错误（日志行）
-    out property <brush> lamp-off:    #4A4A57;   // 熄灭的状态灯：暗，但仍看得见那颗灯
+    out property <brush> lamp-off:    #494C60;   // 熄灭的状态灯：暗，但仍看得见那颗灯
 
     // ── 动效与状态 ────────────────────────────────────────────────────────
     // 三档时长：读数变色 400ms / 配色切换 200ms / 按压回弹 150ms。
@@ -124,7 +133,7 @@ global Font {
 // ⚠ 必须是 fixed/装饰性图层，且 pointer-events 为无 —— 它铺满整窗，
 // 若参与命中测试会把下面的所有按钮都吃掉。
 component Orb inherits Rectangle {
-    in property <brush> tint: #6EE7B71F;
+    in property <brush> tint: #9AA6E81F;
     background: @radial-gradient(circle, root.tint 0%, transparent 70%);
 }
 
@@ -256,7 +265,7 @@ component PillButton inherits Rectangle {
     states [
         hover when touch.has-hover && root.interactive : {
             background: emphasis
-                ? @linear-gradient(180deg, #FFFFFF 0%, #E4E4EA 100%)
+                ? @linear-gradient(180deg, #FFFFFF 0%, #E6E7F2 100%)
                 : Tokens.fill-hover;
         }
     ]
@@ -1172,13 +1181,13 @@ export component MainWindow inherits Window {
     property <bool> notes-loading: root.notes-status == NotesStatus.loading;
 
     // ═══ 氛围层（固定、不参与命中测试）═══
-    Orb { width: 560px; height: 560px; x: -180px; y: -220px; tint: Tokens.glow-mint; }
+    Orb { width: 560px; height: 560px; x: -180px; y: -220px; tint: Tokens.glow-brand; }
     Orb { width: 640px; height: 640px; x: parent.width - 420px; y: 40px; tint: Tokens.glow-blue; }
-    Orb { width: 520px; height: 520px; x: 140px; y: parent.height - 300px; tint: Tokens.glow-mint; }
+    Orb { width: 520px; height: 520px; x: 140px; y: parent.height - 300px; tint: Tokens.glow-brand; }
     // 顶部一线极淡的竖直渐变，让"顶光"方向与所有内高光一致
     Rectangle {
         width: 100%; height: 120px;
-        background: @linear-gradient(180deg, #FFFFFF0B 0%, transparent 100%);
+        background: @linear-gradient(180deg, #EEF0FF0B 0%, transparent 100%);
     }
 
     VerticalLayout {
