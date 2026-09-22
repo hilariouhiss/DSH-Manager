@@ -7,11 +7,14 @@
 //! 这一点），`SlintContext::color_scheme()` 又只在 `private_unstable_api` 里。
 //! 所以"跟随系统"必须我们自己探测。
 
-// ⚠ 此处曾有一行 `#[cfg(windows)] use std::os::windows::ffi::OsStrExt;`（供
-// `registry_dark` 的 `encode_wide` 使用）。Ruling 17 删除 `registry_dark` 后它没有
-// 消费者 —— 实测 `cargo build` 报 `unused import`（简报 Step 4 末尾"在顶部加这一行"
-// 是删除前的残留），故一并删除。Task 6 的注册表**通知**需要宽字符串时，在那次提交里
-// 按需加回。
+// ⚠ 这行 import **有消费者，别在清理里删掉**：`spawn_watcher` 要把
+// `PERSONALIZE_KEY` 编成宽字符串，而 `encode_wide` 是 `OsStrExt` 的 trait 方法、
+// 不是固有方法（实测少了它 `cargo build` 报 E0599 并直接提示"perhaps you want to
+// import it"）。来龙去脉：它原为 `registry_dark` 服务，Ruling 17 删掉 `registry_dark`
+// 后确实一度没有消费者（Task 5 实测 `unused import`，故当时删除），
+// Task 6 的注册表**通知**又需要它 —— 计划 Step 4 末尾的说明正是"届时再按需引入"。
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
 
 // ⚠ 过渡期抑制，**Task 9 Step 1 必须删除这三行**（那里有强制的删除步骤）。
 // 本模块的项分三批被消费：parse/as_str → Task 2，resolve → Task 6，
@@ -154,15 +157,16 @@ pub fn system_dark() -> bool {
 /// **又回到主体与标题栏各说各话**，正是同源约束要禁止的那件事。
 ///
 /// ⚠ **不能用 `GetVersionExW`**：它没有 manifest 时会**撒谎**（Win10+ 仍报 6.2 / build 9200），
-/// 那会让本函数在现代系统上恒为 false，于是我们永远走注册表而 winit 走 uxtheme —— 同样是不同源。
+/// 那会让本函数在现代系统上恒为 `false` —— 我们恒判**浅色**，而 winit 用 `RtlGetVersion`
+/// 判出真正的暗色：标题栏跟着变暗、主体却停在浅色，**同样是不同源**。
 /// winit 用 `RtlGetVersion` 正是为此。
 ///
 /// 为什么必须挡：`uxtheme.dll` 的序号 132 只在 build 17763+ 才有定义。低于该版本时，
 /// ① 若该序号上恰好是别的导出，`transmute` 出来的错误原型调用就是 **UB**；
 /// ② winit 在那种机器上判**浅色**，我们若判成暗色就会不一致。
 ///
-/// 取不到版本号、或版本不满足上述条件时返回 `false`（走注册表）：
-/// 宁可在旧机器上退化成注册表读数，也不赌一个未知序号。
+/// 取不到版本号、或版本不满足上述条件时返回 `false`（= 判**浅色**，与 winit 同判）：
+/// 宁可在这类机器上判浅色，也不赌一个未知序号。
 ///
 /// ⚠ **维护契约**：本函数是 winit 判定的镜像。若哪天 winit 放宽了它的条件
 /// （例如支持主版本不再是 10 的系统），**这里必须同步放宽**，否则又会分叉。
@@ -223,6 +227,89 @@ fn uxtheme_dark() -> Option<bool> {
 pub fn system_dark() -> bool {
     false
 }
+
+/// 启动系统主题监视线程。任何变更都会经 `tx` 送回 UI 线程。
+///
+/// ⚠ 顺序**必须**是"先武装通知、再读值"：反过来（读 → 武装）会留下一个
+/// 微秒级窗口，落在窗口里的变更**永远**不会被发现 —— 因为此后不再有变更
+/// 来唤醒它。后果不是慢一拍，而是永久不一致：winit 的标题栏早已变色，
+/// 应用主体却停在旧主题，直到用户下次再切主题才自愈。
+#[cfg(windows)]
+pub fn spawn_watcher(tx: std::sync::mpsc::Sender<crate::model::UiMsg>) {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegNotifyChangeKeyValue, RegOpenKeyExW, HKEY, HKEY_CURRENT_USER, KEY_NOTIFY,
+        KEY_READ, REG_NOTIFY_CHANGE_LAST_SET,
+    };
+    use windows_sys::Win32::System::Threading::{
+        CreateEventW, ResetEvent, WaitForSingleObject, INFINITE,
+    };
+
+    let sub: Vec<u16> = std::ffi::OsStr::new(PERSONALIZE_KEY)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    std::thread::spawn(move || {
+        // 事件对象建一次、每轮复用；键句柄每轮开关（生命周期短且成对，避免长期持有）
+        let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if event.is_null() {
+            return;
+        }
+        loop {
+            unsafe {
+                let mut hkey: HKEY = std::ptr::null_mut();
+                if RegOpenKeyExW(HKEY_CURRENT_USER, sub.as_ptr(), 0, KEY_READ | KEY_NOTIFY, &mut hkey)
+                    != 0
+                {
+                    // 键打不开（极罕见）：先退避 30 秒再结束本线程。
+                    // ⚠ 这里**不重试**（原注释写"退避后重试"，与代码不符，已按实际行为更正）：
+                    // 这段代码是 `return`。重试需要长期持有事件对象与发送端，
+                    // 而本路径只在键根本打不开时到达，收益不成比例。
+                    CloseHandle(event);
+                    std::thread::sleep(std::time::Duration::from_secs(30));
+                    return;
+                }
+                // ① 先武装（异步：立即返回，变更时置位 event）
+                let armed = RegNotifyChangeKeyValue(
+                    hkey,
+                    1, // bWatchSubtree
+                    REG_NOTIFY_CHANGE_LAST_SET,
+                    event,
+                    1, // fAsynchronous = TRUE
+                );
+                // ② 再读值 —— 此刻之后发生的任何变更都会置位 event，不会丢
+                let dark = system_dark();
+                RegCloseKey(hkey);
+                if armed != 0 {
+                    // 武装失败：无法可靠监视，退化为定时重读（仍然不丢，只是有延迟）
+                    if tx.send(crate::model::UiMsg::SystemThemeChanged(system_dark())).is_err() {
+                        CloseHandle(event);
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    continue;
+                }
+                if tx.send(crate::model::UiMsg::SystemThemeChanged(dark)).is_err() {
+                    // UI 线程已退出
+                    CloseHandle(event);
+                    return;
+                }
+                // ③ 等下一次变更
+                let w = WaitForSingleObject(event, INFINITE);
+                ResetEvent(event);
+                if w != WAIT_OBJECT_0 {
+                    CloseHandle(event);
+                    return;
+                }
+            }
+        }
+    });
+}
+
+/// 非 Windows：没有系统主题可跟随，空实现。
+#[cfg(not(windows))]
+pub fn spawn_watcher(_tx: std::sync::mpsc::Sender<crate::model::UiMsg>) {}
 
 #[cfg(test)]
 mod tests {
@@ -457,5 +544,15 @@ mod tests {
         let a = system_dark();
         let b = system_dark();
         assert_eq!(a, b, "同一时刻两次探测必须一致");
+    }
+
+    #[test]
+    fn watcher_sender_survives_a_dropped_receiver() {
+        // 线程必须能容忍接收端先消失（UI 线程退出）而不 panic ——
+        // 它是在 `send` 失败时 return，不是 unwrap。
+        let (tx, rx) = std::sync::mpsc::channel::<crate::model::UiMsg>();
+        drop(rx);
+        spawn_watcher(tx);
+        std::thread::sleep(std::time::Duration::from_millis(200));
     }
 }

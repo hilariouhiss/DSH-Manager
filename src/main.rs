@@ -20,6 +20,7 @@ use slint::{ComponentHandle, Model, ModelRc, Timer, TimerMode, VecModel};
 
 use config::CloseBehavior;
 use model::*;
+use theme::ThemeMode;
 
 slint::include_modules!();
 
@@ -91,6 +92,10 @@ struct AppState {
     /// 关闭主窗口的行为（FR-23 修订）。缺省 `Ask` = 首次关闭弹询问框，
     /// 见 `config::CloseBehavior` 与 `on_close_requested`。
     close_behavior: CloseBehavior,
+    theme_mode: ThemeMode,
+    /// 系统当前是否为暗色。**刻意只存在 Rust 侧** —— UI 拿不到也不需要，
+    /// 它只需要知道 `resolve()` 之后的结果（那个进了 Tokens.dark）。
+    system_dark: bool,
     log: Rc<VecModel<slint::SharedString>>,
 }
 
@@ -103,7 +108,7 @@ struct NotesState {
 }
 
 impl AppState {
-    fn new(preferred_port: u16, close_behavior: CloseBehavior) -> Self {
+    fn new(preferred_port: u16, close_behavior: CloseBehavior, theme_mode: ThemeMode) -> Self {
         Self {
             env: PmEnv::default(),
             probed: false,
@@ -123,6 +128,8 @@ impl AppState {
             selected_pm: None,
             selected_version: None,
             close_behavior,
+            theme_mode,
+            system_dark: theme::system_dark(),
             log: Rc::new(VecModel::default()),
         }
     }
@@ -476,6 +483,23 @@ fn drain(rx: &Receiver<UiMsg>, state: &Rc<RefCell<AppState>>, tx: &Sender<Job>) 
                             s.web_pid = None;
                             let _ = config::update(|f| f.running_port = None);
                         }
+                    }
+                    // 系统主题变了。⚠ 只有「跟随系统」档会因此改变外观：强制档下
+                    // resolved 不变，就不该置 dirty 触发一次无谓重绘。
+                    //
+                    // ⚠ **不在这里再 `state.borrow()`** —— 本臂之上 `drain` 已经持有
+                    // `s`（`state.borrow_mut()`，作用域覆盖整个 `match`）。RefCell 的
+                    // 借用是**运行期**检查的：多借一次编译期毫无提示，第一次切系统主题就
+                    // 直接 panic（实测 "RefCell already mutably borrowed"）。
+                    // 所以旧值一律从**已在手的** `s` 上取，先取完再改 —— 次序不变。
+                    UiMsg::SystemThemeChanged(dark) => {
+                        let was = theme::resolve(s.theme_mode, s.system_dark);
+                        let now = theme::resolve(s.theme_mode, dark);
+                        s.system_dark = dark;
+                        if was != now {
+                            s.dirty = true;
+                        }
+                        changed |= was != now;
                     }
                     UiMsg::Failed { context, message } => {
                         // 探测失败也必须置真：否则界面会永远停在"检测中…"，
@@ -1393,7 +1417,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let win = MainWindow::new()?;
     let tray = AppTray::new()?;
 
-    let state = Rc::new(RefCell::new(AppState::new(preferred_port, close_behavior)));
+    // ⚠ 第三个实参现在是**缺省值**（= `Auto` = 跟随系统）。Task 8 会把它换成
+    // `config::load()` 里持久化的 `theme_mode` —— 那一步还要把 load 的元组扩成四元。
+    let state = Rc::new(RefCell::new(AppState::new(
+        preferred_port,
+        close_behavior,
+        ThemeMode::default(),
+    )));
     push_log(&state.borrow(), "DSH Manager 启动");
     if let Some(note) = startup_note {
         push_log(&state.borrow(), note);
@@ -1410,6 +1440,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (job_tx, job_rx) = mpsc::channel::<Job>();
     let (msg_tx, msg_rx) = mpsc::channel::<UiMsg>();
     spawn_worker(job_rx, msg_tx.clone());
+
+    // 系统主题监视。⚠ 必须在 `run()`（以及这个 Timer）之前起 —— 否则启动瞬间到
+    // 事件循环就绪之间发生的变更会丢。消息走既有的 UiMsg 通道，由下面的 80ms timer 排空。
+    //
+    // ⚠ 本行是 **Task 6** 落地的（计划原来把它排在 Task 8 Step 3）：不在这里起监视，
+    // `spawn_watcher` 与 `UiMsg::SystemThemeChanged` 都无人构造，`cargo build` 实测报
+    // 2 条 dead_code，直接违反 0 警告规则。**Task 8 不要再加第二个** —— 两条监视线程
+    // 会各自武装同一把键、各自送一条消息（虽然 `drain` 的臂是幂等的，但那是白烧一份线程）。
+    //
+    // ⚠ 代价（已知且刻意）：本线程持有 `msg_tx` 的一个克隆直到进程结束，于是
+    // §5.2 的"worker 已死"安全网不再可达 —— 完整说明见下方 `drop(msg_tx)` 处（Ruling 77）。
+    theme::spawn_watcher(msg_tx.clone());
 
     // 决策 3：80ms Timer 排空。实测 timer 精度 ±1.2ms，未被节流。
     // ⚠ GC-15：timer 必须存活到事件循环结束，且其捕获的 Rc 永不离开 UI 线程。
@@ -1501,6 +1543,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 发送端（此刻它还活着，正在后台探测）；此处之后 main 只发 `Job`，不再需要它。
     // 配套的 `worker_dead` 闩锁在 `AppState` 里，否则这条分支一旦可达就会
     // 每个 tick 重复触发。
+    //
+    // ⚠⚠ **Task 6 之后，上面这条已经不足以让那个分支可达了**：上面的
+    // `theme::spawn_watcher()` 自己持有 `msg_tx` 的一个克隆直到进程结束，所以
+    // `try_recv` 现在**永远**返回不了 `Disconnected` —— §5.2 的安全网（连同
+    // `worker_dead` 闩锁）已不可达，这行 drop 不再是它的开关（Ruling 83 早已指出
+    // "worker 死了 + dsh web 在跑"时它就接不住，现在是不管什么情况都接不住）。
+    // 要同时保住两者，只能给主题消息单开一条通道并让 `drain` 同时排空两条 ——
+    // 那是对 `drain` 的结构性改动，不在 Task 6 范围。
+    // 这行 drop 仍然要留着：它正确表达了"main 不再需要这个发送端"，
+    // 也是将来拆分通道时的起点。
     drop(msg_tx);
 
     // FR-23 修订版的关闭语义（隐藏 / 退出 / 每次询问）连同询问框一起挂在

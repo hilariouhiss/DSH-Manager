@@ -289,6 +289,9 @@ pub enum UiMsg {
     /// 后者会把新实例的 `web_pid` 清掉 —— 退出路径随即拿不到 pid（孤儿），
     /// 或者更糟：拿着被系统复用的旧 pid 去 taskkill。
     WebExited { pid: u32, code: Option<i32> },
+    /// 系统主题变了。⚠ 只带"现在是不是暗色"，不带模式 ——
+    /// 模式归 Rust 的 AppState 管，与系统态在这里是正交的两件事。
+    SystemThemeChanged(bool),
     Failed { context: &'static str, message: String },
 }
 
