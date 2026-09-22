@@ -7,6 +7,15 @@
 //! 这一点），`SlintContext::color_scheme()` 又只在 `private_unstable_api` 里。
 //! 所以"跟随系统"必须我们自己探测。
 
+// ⚠ 过渡期抑制，**Task 9 必须删除本行**（那里有强制的删除步骤）。
+// 本模块的项分三批被消费：parse/as_str → Task 2，resolve → Task 6，
+// index/from_index → Task 8。在最后一个消费者到位之前，`cargo build` 会对尚未
+// 被消费的项报 dead_code，而 Global Constraints 要求构建输出干净。
+// 仓库先例：docs/RULINGS.md Ruling 10（同一缺陷，当时用的是 crate 级写法，
+// 因为那时受影响项跨多个文件；本次只涉及本模块，故取更窄的模块级）。
+// ⚠ 本行只压"还没被消费"，**不得**用它掩盖真实死代码 —— 后者一律删除。
+#![allow(dead_code)]
+
 /// 主题模式。
 ///
 /// ⚠ 下标即 UI 契约：`ui/app.slint` 的 `theme-mode` 用 0/1/2 表示这三档，
