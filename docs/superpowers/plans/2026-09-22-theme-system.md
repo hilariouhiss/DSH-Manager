@@ -839,11 +839,17 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security",
     "Win32_System_LibraryLoader",
     "Win32_System_Registry",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_UI_Accessibility",
     "Win32_UI_WindowsAndMessaging",
 ] }
 ```
+
+⚠ `Win32_System_SystemInformation` 是给 `dark_mode_supported` 里的 `OSVERSIONINFOW` 用的。
+⚠ `RtlGetVersion` 本身在 windows-sys 里属 `Win32::Wdk::System::SystemServices`（要再拉一整棵 `Win32_Wdk`）；
+本计划**故意不用它**，改为像取 uxtheme 那样从 ntdll 用 `GetProcAddress` 按名取 —— 少一个 feature 树，
+且与本文件既有的取法一致。同一个 crate，故仍不新增编译单元。
 
 - [ ] **Step 3b: 编译确认依赖本身没问题**
 
@@ -897,7 +903,54 @@ pub fn system_dark() -> bool {
     if high_contrast() {
         return false;
     }
+    // ⚠ 低于 Windows 10 1809 时**不碰**序号 132，直接走注册表回落。理由见 `dark_mode_supported`。
+    if !dark_mode_supported() {
+        return registry_dark();
+    }
     uxtheme_dark().unwrap_or_else(registry_dark)
+}
+
+/// 本机是否达到"支持暗色模式"的 Windows 版本，即 build >= 17763（Windows 10 1809）。
+///
+/// ⚠ **与 winit 同源，这是同源约束的一部分，不是可选优化。**
+/// winit 用 `DARK_MODE_SUPPORTED` 做同一件事（`winit-0.30.13/src/platform_impl/windows/dark_mode.rs:46-53`），
+/// 构建号经 ntdll 的 `RtlGetVersion` 取得 —— 不能用 `GetVersionExW`：它没有 manifest 时会**撒谎**
+/// （在 Win10+ 上仍报 6.2 / build 9200），那会让本函数在现代系统上恒为 false，于是我们永远走注册表
+/// 而 winit 走 uxtheme，**又回到主体与标题栏不同源**。
+///
+/// 为什么必须挡：`uxtheme.dll` 的序号 132 只在 17763+ 才有定义。低于该版本时，
+/// ① 若该序号上恰好是别的导出，`transmute` 出来的错误原型调用就是 **UB**；
+/// ② 即便侥幸可用，winit 在这种机器上判**浅色**（它同样返回 None→false），我们若判成暗色，
+///    标题栏与窗口主体就会各说各话 —— 正是"必须同源"要避免的那件事。
+///
+/// 取不到版本号时返回 `false`（走注册表）：宁可在旧机器上退化成注册表读数，也不赌一个未知序号。
+#[cfg(windows)]
+fn dark_mode_supported() -> bool {
+    use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
+    use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
+
+    type RtlGetVersion = unsafe extern "system" fn(*mut OSVERSIONINFOW) -> i32;
+
+    unsafe {
+        // 与 `uxtheme_dark` 同一套取法：ntdll 常驻进程，不 FreeLibrary（同款理由）。
+        let module = LoadLibraryA(c"ntdll.dll".as_ptr().cast());
+        if module.is_null() {
+            return false;
+        }
+        let Some(proc) = GetProcAddress(module, c"RtlGetVersion".as_ptr().cast()) else {
+            return false;
+        };
+        let f: RtlGetVersion = std::mem::transmute(proc);
+        let mut vi = OSVERSIONINFOW {
+            dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as u32,
+            ..Default::default()
+        };
+        // RtlGetVersion 返回 NTSTATUS，0 = STATUS_SUCCESS
+        if f(&mut vi) != 0 {
+            return false;
+        }
+        vi.dwBuildNumber >= 17763
+    }
 }
 
 /// `uxtheme.dll` 序号 132 导出。取不到（老系统）返回 `None`。
