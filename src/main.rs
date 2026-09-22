@@ -84,10 +84,13 @@ struct AppState {
     /// 由本程序启动的 dsh web 的 pid。停止时优先用它，
     /// 避免 find_listener_pid 拿到外部进程。
     web_pid: Option<u32>,
-    /// 用户在下拉里选中的目标 PM 与版本。
+    /// 用户在下拉里选中的目标版本。
     /// **必须存在状态里** —— 回调闭包拿不到 MainWindow（它已被 move 进
-    /// 其它闭包），而"全局最新"和"owner PM"都【不是】用户的选择。
-    selected_pm: Option<Pm>,
+    /// 其它闭包），而"全局最新"【不是】用户的选择。
+    ///
+    /// ⚠ 原先是 `selected_pm` + `selected_version` 一对（FR-11 的两个独立选择器）。
+    /// PM 选择器已删除（跨 PM 迁移从界面撤下），因此目标 PM 恒为 `env.owner` ——
+    /// 少一个状态字段，也就少一处"UI 与状态不一致"的可能。
     selected_version: Option<Version>,
     /// 关闭主窗口的行为（FR-23 修订）。缺省 `Ask` = 首次关闭弹询问框，
     /// 见 `config::CloseBehavior` 与 `on_close_requested`。
@@ -137,7 +140,6 @@ impl AppState {
             status: String::new(),
             preferred_port,
             web_pid: None,
-            selected_pm: None,
             selected_version: None,
             close_behavior,
             theme_mode,
@@ -145,15 +147,6 @@ impl AppState {
             system_dark: theme::system_dark(),
             log: Rc::new(VecModel::default()),
         }
-    }
-
-    /// 下拉的选中下标。未手动选过时回落到 owner PM。
-    fn selected_pm_index(&self) -> i32 {
-        self.selected_pm
-            .or(self.env.owner)
-            .and_then(|pm| self.env.available.iter().position(|i| i.kind == pm))
-            .map(|i| i as i32)
-            .unwrap_or(0)
     }
 
     /// 版本下拉的选中下标。
@@ -194,32 +187,33 @@ impl AppState {
         }
     }
 
-    /// 下拉里只放 PM 名字。归属标记**不在这里**：它现在由行尾那句"DSH 在此！"
-    /// 承担（见 ui/app.slint 的包管理行），塞进选项文字会把下拉撑得很长，
-    /// 而且只有选中 owner 时才有意义。
-    fn pm_labels(&self) -> Vec<slint::SharedString> {
+    /// owner PM 的**只读指示**（原 PM 下拉框的位置）。
+    ///
+    /// ⚠ 三条哨兵值与 `installed-version` 同款纪律：探测未完成 → "检测中…"，
+    /// 完成但没找到 dsh → "—"。**不得**在未探测时下任何结论（SRS:786）。
+    /// 用 "—" 而非空串：空串会让那一格看着像布局坏了。
+    fn pm_label(&self) -> slint::SharedString {
+        if !self.probed {
+            return "检测中…".into();
+        }
         self.env
-            .available
-            .iter()
-            .map(|info| slint::SharedString::from(info.kind.label()))
-            .collect()
+            .owner
+            .map(|pm| slint::SharedString::from(pm.label()))
+            .unwrap_or_else(|| "—".into())
     }
 
-    /// 行尾那个"当前"的判据：下拉里选中的版本是不是本机已装的那个。
-    /// ⚠ 与版本卡上的"已是最新"不是一回事：那个问的是"通道内还有没有更新的"，
-    /// 这个问的是"我选中的是不是现在装着的"（选了旧版本时它就不亮）。
-    fn version_is_current(&self) -> bool {
+    /// 需不需要先弹"是否重装"确认框（FR-12b）：目标版本 == 本机已装版本。
+    ///
+    /// ⚠ 这就是**原先行尾那枚"当前"小字**的判据（`version_is_current`）——
+    /// 那枚常驻提示已按需求删除，同一个问题改由"动作前确认"回答：
+    /// 选中的就是现在装着的那个版本时，〔安装〕先问一句"是否重新安装"。
+    /// ⚠ 与版本卡上的"已是最新/可更新"不是一回事：那个问的是"通道内还有没有
+    /// 更新的"，这个问的是"我选中的是不是现在装着的"（选了旧版本时为假）。
+    fn needs_reinstall_confirm(&self) -> bool {
         match (self.selected_version.as_ref(), self.env.installed.as_ref()) {
             (Some(sel), Some(cur)) => sel == cur,
             _ => false,
         }
-    }
-
-    /// 行尾那句"DSH 在此！"的判据：当前选中的 PM 是不是 owner。
-    /// 还没选过时下标回落到 owner（见 `selected_pm_index`），所以也算命中。
-    fn pm_is_owner(&self) -> bool {
-        let Some(owner) = self.env.owner else { return false };
-        self.selected_pm.unwrap_or(owner) == owner
     }
 
     fn version_labels(&self) -> Vec<slint::SharedString> {
@@ -297,14 +291,11 @@ fn project(state: &AppState, win: &MainWindow, tray: &AppTray) {
     );
     win.set_up_to_date(state.is_up_to_date());
 
-    win.set_pm_options(ModelRc::from(Rc::new(VecModel::from(state.pm_labels()))));
-    // ⚠ 必须反映【用户的选择】，不能硬编码 owner 下标 —— 否则用户切到
-    // pnpm 后界面会被下一帧弹回 npm。
-    win.set_pm_index(state.selected_pm_index());
-    win.set_pm_is_owner(state.pm_is_owner());
+    // PM 不再有选择器：只推一个只读指示（原 `pm-options` / `pm-index` /
+    // `pm-is-owner` 三件套随 FR-11 的修订一起删除）。
+    win.set_pm_label(state.pm_label());
     win.set_version_options(ModelRc::from(Rc::new(VecModel::from(state.version_labels()))));
     win.set_version_index(state.selected_version_index());
-    win.set_version_is_current(state.version_is_current());
 
     win.set_web_running(state.web.is_running());
     // ⚠ I-2：`web-running` 只认 Running/External，而 `Starting`（正常约 2 秒，超时路径
@@ -1042,6 +1033,73 @@ fn start_web(port: u16, tx: &Sender<UiMsg>) {
     }
 }
 
+/// 〔安装〕与〔重装确认〕共用的派发路径。
+///
+/// **返回 `Some(version)` = "需要先弹『是否重装』确认框"**（此时不派发任何 Job）；
+/// `None` = 已派发，或已给出拒绝提示，调用方什么都不用做。
+///
+/// 为什么要有这个函数：同一个动作现在有两个入口（点〔安装〕、在确认框里点〔重装〕），
+/// 而"三条拒绝路径 + I-2 守卫 + 组 Job"这一整段必须**逐字一致** —— 复制一份迟早分叉，
+/// 典型后果是确认框那条路漏掉 I-2 守卫，于是能在 `dsh web` 正在启动的窗口里发起事务
+/// （那正是 TR-1 要避开的文件锁场景）。
+///
+/// `confirm_reinstall`：点〔安装〕时为真 —— 目标版本 == 已装版本则先问一句（FR-12b）；
+/// 确认框里为假 —— 已经问过了，再问一次就成了"点了没反应"。
+fn request_install(
+    state: &Rc<RefCell<AppState>>,
+    send: &impl Fn(Job),
+    confirm_reinstall: bool,
+) -> Option<Version> {
+    let mut s = state.borrow_mut();
+    let (Some(owner), Some(installed)) = (s.env.owner, s.env.installed.clone()) else {
+        s.status = "未检测到已安装的 dsh，无法执行变更".into();
+        // ⚠ 必须置 dirty：本条拒绝**不发 Job**，稳态下没有任何消息可排空，
+        // 只写 status 的话 timer 永远不会投影，用户看不到提示（按钮像坏的）。
+        s.dirty = true;
+        return None;
+    };
+    // ⚠ 目标必须来自【用户的选择】。不能取 catalog.versions.first()
+    // （那是全局最新，可能是更旧的 rc）。
+    let Some(target_version) = s.selected_version.clone() else {
+        s.status = "请先选择一个目标版本".into();
+        s.dirty = true; // 同上：这条路径也没有 Job
+        return None;
+    };
+    // ⚠ I-2：TR-1 在 `Starting` 窗口里**必须自己挡住**（守卫 + UI 变灰两道）。
+    // 理由见 `project()` 里 `web-starting` 的说明：这段窗口里"端口探测"必然
+    // 得出"空闲"，而我们的 `dsh web` 正在启动 —— 事务会在文件锁上撞车。
+    //
+    // ⚠ 这条守卫不能只靠 UI 的 `enabled`：`project()` 要等下一次 80ms tick，
+    // 点击与变灰之间存在一拍的空隙，且托盘/未来入口不受按钮约束。
+    if s.start_pending || matches!(s.web, WebState::Starting { .. }) {
+        s.status = "dsh web 正在启动，请稍候再执行变更".into();
+        s.dirty = true; // 同上面两条：这条路径也不发 Job，不置 dirty 就投影不出来
+        return None;
+    }
+    // FR-12b：目标版本就是现在装着的那个 → 交给调用方弹确认框。
+    // ⚠ 位置必须在 I-2 守卫**之后**：正在启动时连问都不该问（问了也没法执行）。
+    if confirm_reinstall && s.needs_reinstall_confirm() {
+        return Some(target_version);
+    }
+    // ⚠ 必须传【实际在运行】的端口（若有），而不是偏好端口。
+    // 若 dsh web 跑在非偏好端口上（例如上次用了 8080、偏好仍是 3080），
+    // 传偏好端口会让 TR-1 去停一个空端口 —— 真正持锁的实例还在，
+    // 事务照样撞上 Windows 文件锁，TR-1 就形同虚设。
+    let port = s.web.port().unwrap_or(s.preferred_port);
+    s.busy = true;
+    s.busy_label = "准备中…".into();
+    drop(s);
+
+    // FR-11 修订：目标 PM **恒为 owner** —— 界面上的 PM 选择器已删除，
+    // 「换版本」与「迁移 PM」不再由本程序区分（引擎仍支持跨 PM，见 ARCHITECTURE §4.2）。
+    send(Job::Transact {
+        origin: Origin { pm: owner, version: installed },
+        target: Target { pm: owner, version: target_version },
+        port,
+    });
+    None
+}
+
 /// 把 Slint 回调接到 Job 派发上。
 ///
 /// ⚠ 这里是 GC-16 的边界：回调运行在 UI 线程，**不得**做任何子进程/网络动作。
@@ -1066,66 +1124,27 @@ fn wire_callbacks(
     {
         let send = send.clone();
         let state = state.clone();
+        let win_weak = win_weak.clone();
         win.on_install_clicked(move || {
-            let mut s = state.borrow_mut();
-            let (Some(owner), Some(installed)) = (s.env.owner, s.env.installed.clone()) else {
-                s.status = "未检测到已安装的 dsh，无法执行变更".into();
-                // ⚠ 必须置 dirty：本条拒绝**不发 Job**，稳态下没有任何消息可排空，
-                // 只写 status 的话 timer 永远不会投影，用户看不到提示（按钮像坏的）。
-                s.dirty = true;
-                return;
-            };
-            // ⚠ 目标必须来自【用户的选择】。不能取 catalog.versions.first()
-            // （那是全局最新，可能是更旧的 rc），也不能取 owner PM
-            // （用户可能在下拉里切到了别的 PM）。
-            let Some(target_version) = s.selected_version.clone() else {
-                s.status = "请先选择一个目标版本".into();
-                s.dirty = true; // 同上：这条路径也没有 Job
-                return;
-            };
-            let target_pm = s.selected_pm.unwrap_or(owner);
-            // ⚠ I-2：TR-1 在 `Starting` 窗口里**必须自己挡住**（守卫 + UI 变灰两道）。
-            // 理由见 `project()` 里 `web-starting` 的说明：这段窗口里"端口探测"必然
-            // 得出"空闲"，而我们的 `dsh web` 正在启动 —— 事务会在文件锁上撞车。
-            //
-            // ⚠ 这条守卫不能只靠 UI 的 `enabled`：`project()` 要等下一次 80ms tick，
-            // 点击与变灰之间存在一拍的空隙，且托盘/未来入口不受按钮约束。
-            if s.start_pending || matches!(s.web, WebState::Starting { .. }) {
-                s.status = "dsh web 正在启动，请稍候再执行变更".into();
-                s.dirty = true; // 同下面两条：这条路径也不发 Job，不置 dirty 就投影不出来
-                return;
+            // 需要先问"是否重装"时不派发，把框弹出来；确认走下面的
+            // `on_reinstall_confirmed`，两条路径共用 `request_install`。
+            let Some(version) = request_install(&state, &send, true) else { return };
+            if let Some(w) = win_weak.upgrade() {
+                w.set_reinstall_version(version.to_string().into());
+                w.set_reinstall_prompt_visible(true);
             }
-            // ⚠ 必须传【实际在运行】的端口（若有），而不是偏好端口。
-            // 若 dsh web 跑在非偏好端口上（例如上次用了 8080、偏好仍是 3080），
-            // 传偏好端口会让 TR-1 去停一个空端口 —— 真正持锁的实例还在，
-            // 事务照样撞上 Windows 文件锁，TR-1 就形同虚设。
-            let port = s.web.port().unwrap_or(s.preferred_port);
-            s.busy = true;
-            s.busy_label = "准备中…".into();
-            drop(s);
-
-            send(Job::Transact {
-                origin: Origin { pm: owner, version: installed },
-                target: Target { pm: target_pm, version: target_version },
-                port,
-            });
         });
     }
 
     {
+        let send = send.clone();
         let state = state.clone();
-        win.on_pm_changed(move |idx| {
-            let mut s = state.borrow_mut();
-            if let Some(info) = s.env.available.get(idx as usize) {
-                s.selected_pm = Some(info.kind);
-                // ⚠ 必须置 dirty：本回调不改任何 Job，稳态下没有消息可排空，
-                // 而"DSH 在此！"（`pm-is-owner`）只在 project() 里推。
-                // 少了这一行，切到别的 PM 后状态里早已不是 owner，行尾那句
-                // 却停在上一帧的 true —— 且因为没有人再改它，**永远不会消失**。
-                // 与 on_version_changed / on_settings_changed / on_theme_mode_changed
-                // 同款（Ruling 90 第 3 条：回调改过状态就必须投影）。
-                s.dirty = true;
-            }
+        win.on_reinstall_confirmed(move || {
+            // ⚠ `confirm_reinstall = false`：这一条**不再问第二次**。
+            // 用户在框里点的就是〔重装〕，重复弹框等于点了没反应。
+            // 若这期间状态变了（例如探测发现 dsh 没了），request_install 自己会
+            // 走它那三条拒绝路径并给出提示。
+            let _ = request_install(&state, &send, false);
         });
     }
 

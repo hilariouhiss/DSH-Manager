@@ -110,7 +110,11 @@ pub struct PmInfo {
 
 #[derive(Clone, Debug, Default)]
 pub struct PmEnv {
-    pub available: Vec<PmInfo>,
+    // ⚠ 这里原有一个 `available: Vec<PmInfo>`。FR-11 修订（去掉 PM 选择器）之后它
+    // **没有任何读者了** —— 唯一用途就是填那个下拉框。"探测哪些 PM 装了"这件事
+    // 仍然发生，只是结果只服务于 `probe_env` 内部的 owner 判定（`owner_of` 与
+    // FR-3 第 3 步的退化路径），不再需要带出函数。留着它就是一个
+    // `field is never read` 警告 —— 本仓库的门槛是零警告、无死代码。
     pub owner: Option<Pm>,
     pub installed: Option<Version>,
     pub dsh_path: Option<PathBuf>,

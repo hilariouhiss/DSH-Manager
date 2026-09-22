@@ -232,7 +232,10 @@ pub fn probe_env() -> PmEnv {
     // FR-4 注：版本号在这里**不解析列表正文**——正常路径走 `dsh --version`
     // （`read_dsh_version_on_path` → `version_from_shim`）；只有退化路径
     // 才从列表里取（见上），因为此时 `dsh --version` 根本无从执行。
-    PmEnv { available, owner, installed, dsh_path }
+    //
+    // ⚠ `available` **不进返回值**（FR-11 修订后它没有任何外部读者了，理由见
+    // `model::PmEnv` 的注释）——它是本函数的局部变量，供上面的 owner 判定使用。
+    PmEnv { owner, installed, dsh_path }
 }
 
 /// 包名。只在本模块的退化路径里用；`model::Pm::{install,uninstall}_args` 里

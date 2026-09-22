@@ -100,7 +100,12 @@ export global Tokens {
     out property <length> r-lg: 22px;
     out property <length> r-md: 16px;
     out property <length> r-sm: 11px;
-    out property <length> font-hero: 27px;
+    // ⚠ 这里原有 `font-hero: 27px`，随版本主卡的大字号读数一起删除 ——
+    // 删掉读数后它没有任何消费者了（设计令牌也不留"以后可能用得上"的空壳）。
+    // ⚠ 写这句注释时踩过一坑：`theme.rs` 的 `parse_palette` 把**凡含 brush 类型
+    // 字样的行**都当令牌行（它就是这么从本文件里抠出调色板的），所以注释里连
+    // "那种令牌的尖括号写法"都不能出现 —— 一出现就被当成令牌行，报"缺冒号"。
+    // 删这个令牌不影响那条下限：它只数 brush 类型的行。
 
     // ── 控制面：所有可点元素共用同一套填充，不允许各自写白百分比 ─────────────
     // 收敛前散着 #FFFFFF08/0D/12/14/17/1F 六个值，四个按钮族各挑一个，
@@ -1129,19 +1134,18 @@ export component MainWindow inherits Window {
     in property <bool>   version-known: false;
     in property <bool>   up-to-date: false;
 
-    // ── 选择器（FR-10 / FR-11）──
-    in property <[string]> pm-options: [];
-    in-out property <int>    pm-index: 0;
+    // ── 选择器（FR-10 / FR-11 修订）──
+    // ⚠ PM 选择器**已删除**（连同 `pm-options` / `pm-index` / `pm-is-owner` 属性与
+    // `pm-changed` 回调）：跨 PM 迁移从界面撤下，变更一律作用于 owner PM
+    // （事务引擎仍保留跨 PM 能力，理由见 docs/ARCHITECTURE.md §4.2）。
     in property <[string]> version-options: [];
     in-out property <int>    version-index: 0;
 
-    /// 当前选中的包管理器是不是 dsh 的 owner（"DSH 在此！"只看这一件事）。
-    /// 由 project() 推：`selected_pm` 还没选过时 = owner 本身。
-    in property <bool> pm-is-owner: false;
-    /// 目标版本下拉里选的是不是**本机已装**的那个版本（行尾"当前"只看这一件事）。
-    /// 同样是 project() 推 —— 它和版本卡上的"已是最新/可更新"是两个不同的问题：
-    /// 这个说的是"选中的就是现在装着的"。
-    in property <bool> version-is-current: false;
+    /// owner PM 的**只读指示**（取代原来的下拉框）。哨兵值与 `installed-version`
+    /// 同款纪律：探测未完成是 "检测中…"，探测完成但没找到 dsh 是 "—" ——
+    /// 用 "—" 而不是空串：空串会让那一格看着像布局坏了；也**不得**在未探测时
+    /// 显示任何结论（SRS:786）。
+    in property <string> pm-label: "检测中…";
 
     // ── dsh web（FR-18）──
     in property <bool>   web-running: false;
@@ -1195,12 +1199,17 @@ export component MainWindow inherits Window {
     /// 默认 true：与 `state.json` 里"没记过"时的缺省一致，理由见
     /// `config::use_system_proxy()`（机器上没配代理时这一档与直连等价，缺省选它的代价是零）。
     in property <bool> use-system-proxy: true;
+    /// 目标版本与当前已装版本**相同**时的确认框（FR-12b）。由 Rust 在
+    /// `on_install_clicked` 里置真 —— 判据就是原先行尾"当前"那枚小字用的比较。
+    /// 取消 = 这次点击什么也不做（不派发事务）。
+    in-out property <bool> reinstall-prompt-visible: false;
+    /// 确认框正文里那个版本号（Rust 侧填已装版本号，避免在 Slint 里拼字符串）。
+    in property <string> reinstall-version: "";
     /// 当前展开的应用菜单：0 = 都没开 / 1 = 文件 / 2 = 帮助。
     /// 纯 UI 状态：菜单开着的时候只可能有一个，用一个 int 比两个 bool 少一半状态。
     in-out property <int> open-menu: 0;
 
     callback install-clicked();
-    callback pm-changed(int);
     callback version-changed(int);
     callback refresh-clicked();
     callback start-web();
@@ -1216,6 +1225,9 @@ export component MainWindow inherits Window {
     /// (行为下标, 是否记住)。第二个参数来自询问框的"记住选择"：
     /// 不勾就只管这一次，state.json 不动，下次关闭还会问。
     callback close-choice(int, bool);
+    /// 重装确认框里的〔重装〕。取消**不设回调** —— 它只把
+    /// `reinstall-prompt-visible` 置假，什么都不做（同关闭询问框的做法）。
+    callback reinstall-confirmed();
     /// 应用菜单「文件 → 退出」。与托盘菜单的"退出"走**同一条** Rust 路径
     /// （停掉自己启动的 dsh web 再退出事件循环），所以不经过"关闭时的行为"那一问。
     callback quit-app();
@@ -1296,18 +1308,14 @@ export component MainWindow inherits Window {
                     core-padding: 16px;
                     spacing: 0px;
 
-                    // 大字号读数。用等宽字体 + tabular 数字，版本号换位时不跳动。
-                    Text {
-                        text: root.probing ? "—" : root.installed-version;
-                        color: root.probing ? Tokens.ink-4 : Tokens.ink;
-                        font-family: Font.mono;
-                        font-size: Tokens.font-hero;
-                        font-weight: 600;
-                        letter-spacing: -1.2px;
-                        wrap: no-wrap;
-                        animate color { duration: Tokens.motion-slow; easing: ease-out-quint; }
-                    }
-                    Rectangle { height: 9px; }
+                    // ⚠ 这里原先是**大字号版本读数**（`font-hero` 等宽数字，该令牌已随它删除），
+                    // 已移除：
+                    // "当前装的是什么版本"改由操作卡的「包管理器 ｜ 当前版本」那一行承担 ——
+                    // 它就在「目标版本」正上方，选目标时可以直接上下对比。
+                    // 本卡因此从"读数卡"收敛为"**有没有新版**"卡：
+                    // 状态标签 + 通道最新，两件事都与"要不要升级"有关，不再重复版本号。
+                    // 删读数时连带删掉了它下面那根 9px 占位 —— 它的唯一作用就是给读数与
+                    // 标签行留距，读数没了它只会让卡片顶部空一块。
 
                     HorizontalLayout {
                         spacing: 7px;
@@ -1391,27 +1399,28 @@ export component MainWindow inherits Window {
                     // 两行左边缘就都从同一条线开始（下拉吃掉剩下的宽度）。
                     HorizontalLayout {
                         spacing: 10px;
-                        FieldLabel { text: "包管理"; width: 62px; }
-                        // ✅ 这里原先钉着 `height: 30px; min-width: 0px` 两条 hack，
-                        // 用来压住 Fluent ComboBox 自带的 `min-width: max(160px, …)`
-                        // 与 `min-height: max(32px, …)`。换成自己的组件后它们没有理由存在。
-                        GlassSelect {
-                            horizontal-stretch: 1;
-                            model: root.pm-options;
-                            current-index <=> root.pm-index;
-                            enabled: !root.busy;
-                            selected(i) => { root.pm-changed(i); }
-                        }
-                        // "dsh 装在这台机器的哪个 PM 上"原先挤在下拉的选中文字里
-                        // （npm  ·  dsh 安装于此），把下拉本身撑得很长；改到行尾，
-                        // 且只在**选中的这个 PM 就是 owner** 时才亮。
+                        FieldLabel { text: "包管理器"; width: 62px; }
+                        // 只读指示（FR-11 修订）：本程序不再提供 PM 选择器 ——
+                        // 从界面发起的变更一律作用于**当前 owner PM**，跨 PM 迁移已从
+                        // 界面撤下（引擎仍保留，见 ARCHITECTURE §4.2）。
+                        // ⚠ 文案必须与 `installed-version` 同款哨兵纪律：探测未完成时是
+                        // "检测中…"，此时**不得**显示"未检测到"（SRS:786）。
                         Text {
-                            visible: root.pm-is-owner;
-                            text: "DSH 在此！";
-                            color: Tokens.accent;
-                            font-family: Font.text;
-                            font-size: 11px;
-                            width: 58px;
+                            text: root.pm-label;
+                            color: root.probing || root.absent ? Tokens.ink-4 : Tokens.ink;
+                            font-family: Font.mono;
+                            font-size: 12.5px;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        // 右半回答"当前是什么版本"。它原先是大字号读数（本卡顶部），
+                        // 现在只在这里出现一次 —— 所以用正文色 + 等宽，不再用 ink-4。
+                        FieldLabel { text: "当前版本"; }
+                        Text {
+                            text: root.installed-version;
+                            color: root.probing || root.absent ? Tokens.ink-4 : Tokens.ink;
+                            font-family: Font.mono;
+                            font-size: 12.5px;
                             vertical-alignment: center;
                         }
                     }
@@ -1425,18 +1434,10 @@ export component MainWindow inherits Window {
                             enabled: !root.busy;
                             selected(i) => { root.version-changed(i); }
                         }
-                        // "← 当前"原先拼在下拉的选项文字里（把下拉撑长、还跟着走），
-                        // 现在和包管理行的"DSH 在此！"一样落在行尾，且只在
-                        // **选中的就是本机已装版本**时亮。
-                        Text {
-                            visible: root.version-is-current;
-                            text: "当前";
-                            color: Tokens.accent;
-                            font-family: Font.text;
-                            font-size: 11px;
-                            width: 30px;
-                            vertical-alignment: center;
-                        }
+                        // ⚠ 行尾那句"当前"已按需求删除（连同 `version-is-current` 属性）。
+                        // 它回答的是"我选中的是不是现在装着的"—— 这个问题现在由**点击时**的
+                        // 确认框回答（FR-12b）：选中的就是已装版本时，〔安装〕先弹
+                        // "是否重新安装"，而不是在行尾常驻一枚小字。
                     }
 
                     // ⚠ 这是分隔线，不是空行 —— 原先写成没有 background 的裸
@@ -2049,6 +2050,95 @@ export component MainWindow inherits Window {
                     font-family: Font.text;
                     font-size: 11.5px;
                     wrap: word-wrap;
+                }
+            }
+        }
+    }
+
+    // ═══════════════════════ 同版本重装的确认（FR-12b）═══════════════════
+    // 目标版本 == 已装版本时，〔安装〕不再静默地"装一个一模一样的"，先问一句。
+    // 点遮罩 / Esc / 右上角关闭 = 取消这次点击，什么都不做 —— 与关闭询问框同一套。
+    // 版本号由 Rust 填进 `reinstall-version`（不在 Slint 里拼字符串 —— 本文件里所有
+    // 面向用户的拼接都在 project() 完成，见"下拉里只放格式化字符串"那条约定）。
+    if root.reinstall-prompt-visible : Rectangle {
+        background: Tokens.overlay;
+        TouchArea { clicked => { root.reinstall-prompt-visible = false; } }
+        // ⚠ 空壳 FocusScope 必须自己抢焦点（同关闭询问框：不写这一行 Esc 是死的）。
+        FocusScope {
+            init => { self.focus(); }
+            key-pressed(e) => {
+                if (e.text == Key.Escape) { root.reinstall-prompt-visible = false; return accept; }
+                return reject;
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            cross-axis-alignment: center;
+            Bezel {
+                width: 400px;
+                core-padding: 20px;
+                spacing: 0px;
+
+                HorizontalLayout {
+                    spacing: 10px;
+                    Text {
+                        text: "重新安装";
+                        color: Tokens.ink;
+                        font-family: Font.display;
+                        font-size: 16px;
+                        font-weight: 600;
+                        letter-spacing: -0.2px;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    CloseButton { clicked => { root.reinstall-prompt-visible = false; } }
+                }
+                Rectangle { height: 12px; }
+                // ⚠ 拆成两句而不是一段话：原本写成
+                // "目标版本与当前已安装的版本相同（<版本>）。是否重新安装？"，
+                // 离屏探针实测**第二行只剩 17px 宽** —— 那个"？"被挤到第二行单独挂尾
+                // （正文带 y 384..394 的 x 聚类是 260..277）。版本号长度可变，所以
+                // 靠调整字号/宽度去凑是不稳的：把可变部分（版本号）单独放一行，
+                // 固定那句控制在一行内（23 个汉字 ≈ 287px < 内容宽度 360px）。
+                Text {
+                    text: "当前已是 " + root.reinstall-version;
+                    color: Tokens.ink;
+                    font-family: Font.mono;
+                    font-size: 12.5px;
+                    wrap: no-wrap;
+                }
+                Rectangle { height: 7px; }
+                Text {
+                    text: "目标版本与当前已安装的版本相同，是否重新安装？";
+                    color: Tokens.ink-2;
+                    font-family: Font.text;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                Rectangle { height: 18px; }
+                // ⚠ 强调放在**推荐动作**上，且它在最右（与关闭询问框同一条规则：
+                // 那边最右是"隐藏至托盘"，这里最右是"重装"）。重装是非破坏动作，
+                // 所以强调给它；取消保持普通样式。
+                HorizontalLayout {
+                    spacing: 9px;
+                    Rectangle { horizontal-stretch: 1; }
+                    PillButton {
+                        label: "取消";
+                        show-glyph: false;
+                        clicked => { root.reinstall-prompt-visible = false; }
+                    }
+                    PillButton {
+                        label: "重装";
+                        emphasis: true;
+                        show-glyph: false;
+                        clicked => {
+                            // 先关框再确认：确认会派发事务并把 busy 置真，
+                            // 框留着会挡住忙碌脉冲条与状态栏。
+                            root.reinstall-prompt-visible = false;
+                            root.reinstall-confirmed();
+                        }
+                    }
                 }
             }
         }
