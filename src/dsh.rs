@@ -144,22 +144,60 @@ fn is_html_heading(line: &str) -> bool {
     (1..=6).any(|n| lower.contains(&format!("<h{n}")))
 }
 
-/// FR-27 的强制预处理。
+/// 更新说明里一个块的角色。
 ///
-/// Slint 的 `StyledText` 官方 Currently Unsupported 列表包含 **Headings** 与
-/// **Other HTML tags**。而 DSH 的 release notes 通篇是 `### 新增功能` 这类 ATX
-/// 标题，且混有 `<h3 id="...">` 裸 HTML。不预处理就会原样显示成垃圾文本。
+/// ⚠ 下标与 `ui/app.slint` 的 `NoteBlock.kind` **一一对应**，改顺序要两边一起改
+/// （同 `CloseBehavior` 与 `close-behavior-index` 的约定）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoteKind {
+    /// 标题：比正文大一档 + 上方留白
+    Heading = 0,
+    /// 无序列表项：圆点由 Slint 侧单独一列画，文字悬挂缩进
+    Bullet = 1,
+    /// 普通段落
+    Paragraph = 2,
+}
+
+/// 更新说明的一个排版块。
 ///
-/// 只做三件事：剥离 HTML 标签、标题降级为粗体、**在标题前补一个空行**。
-/// 其余语法（粗体 / 斜体 / 行内代码 / **链接** / 列表）由 StyledText 原生支持，
-/// **不做干预** —— 尤其不要破坏链接。
+/// 为什么不再是一整段 `styled-text`：Slint 的 `StyledText` 官方 Currently
+/// Unsupported 列表里就有 **Headings**，而且它**没有字重属性、只有一个字号** ——
+/// 表达不了"标题比正文大"。列表同样不行：它把 markdown 列表渲染成行内的 `• `
+/// 前缀，换行后第二行会退回左边缘（没有悬挂缩进）。
+/// 于是块结构在 Rust 侧解析，Slint 侧按 kind 分别排版。
 ///
-/// 为什么补空行：`StyledText` 没有段落间距属性，但**空行**确实会渲染成一个约
-/// 14px 的段间距（实测：同样 9 行内容，紧凑排 143px、空行分隔 253px）。标题是
-/// 天然的分节边界，给它前面留一口气，长说明才读得下去；而列表项之间**不补** ——
-/// 那样每条之间多 14px，30 条的说明会凭空多出 400px 滚动量。
-pub fn preprocess_notes(md: &str) -> String {
-    let mut out = String::with_capacity(md.len() + 32);
+/// `text` 保留块内的**行内** markdown（粗体 / 链接 / 行内代码），由 StyledText
+/// 逐块解析 —— 这几种语法它原生支持，不要破坏。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NoteBlock {
+    pub kind: NoteKind,
+    pub text: String,
+}
+
+/// FR-27 的分块预处理：把 release notes 切成"标题 / 列表项 / 段落"三种块。
+///
+/// 这里只做结构识别，不做排版：字号、缩进、块间距都由 Slint 侧用设计令牌决定。
+/// 于是原先那个"在标题前补空行"的 hack 也删掉了 —— 块间距现在是布局给的，
+/// 不再依赖"空行能渲染出约 14px"这种间接效果。
+///
+/// 已知局限（诚实记录，未处理）：只认无序列表（`-` / `*` / `+`），且**不区分嵌套层级** ——
+/// 嵌套项会与顶层项排成一样。DSH 的 release notes 目前全是单层无序列表（"新增功能 /
+/// 体验优化 / 问题修复"三节），真需要时再补一个 `level` 字段。
+/// 有序列表（`1. `）按普通段落处理，编号原样留在文字里。
+pub fn parse_notes_blocks(md: &str) -> Vec<NoteBlock> {
+    let mut out: Vec<NoteBlock> = Vec::new();
+    // 连续的非列表、非标题行合并成**同一个**段落（markdown 的软换行），
+    // 空行才是段落边界 —— 这正是 GitHub 的分段规则。
+    let mut para = String::new();
+
+    fn flush(para: &mut String, out: &mut Vec<NoteBlock>) {
+        let text = para.trim_end();
+        if !text.is_empty() {
+            out.push(NoteBlock { kind: NoteKind::Paragraph, text: text.to_string() });
+        }
+        para.clear();
+    }
+
     for line in md.lines() {
         let stripped = strip_html(line);
         // 两种标题来源都要认：ATX（`### x`）与 HTML（`<h3>x</h3>`）。
@@ -169,24 +207,47 @@ pub fn preprocess_notes(md: &str) -> String {
         } else {
             heading_body(stripped.trim_start()).map(|r| r.trim())
         };
-        match heading {
-            Some(text) if !text.is_empty() => {
-                // ⚠ 只在这个标题**不是文首**、且上一行不是空行时补 —— 否则开头会
-                // 多出一条 14px 的空白，而连续两个标题之间会叠出 28px。
-                if !out.is_empty() && !out.ends_with("\n\n") {
-                    out.push('\n');
-                }
-                out.push_str("**");
-                out.push_str(text);
-                out.push_str("**\n");
-            }
-            _ => {
-                out.push_str(&stripped);
-                out.push('\n');
+        if let Some(text) = heading {
+            if !text.is_empty() {
+                flush(&mut para, &mut out);
+                // 粗体只能靠 markdown 给：StyledText 没有字重属性，`**` 是唯一的加粗途径
+                out.push(NoteBlock { kind: NoteKind::Heading, text: format!("**{text}**") });
+                continue;
             }
         }
+        let trimmed = stripped.trim();
+        // 空行 = 段落边界
+        if trimmed.is_empty() {
+            flush(&mut para, &mut out);
+            continue;
+        }
+        // 无序列表项：扔掉标记本身（圆点由 Slint 画，才做得出悬挂缩进）
+        if let Some(rest) = bullet_body(trimmed) {
+            flush(&mut para, &mut out);
+            out.push(NoteBlock { kind: NoteKind::Bullet, text: rest.to_string() });
+            continue;
+        }
+        if !para.is_empty() {
+            para.push('\n');
+        }
+        para.push_str(trimmed);
     }
+    flush(&mut para, &mut out);
     out
+}
+
+/// 无序列表项：`- x` / `* x` / `+ x`，返回标记之后的正文。
+/// `-` 后面必须有空白，否则 `-5 度` 这类正文会被误判成列表。
+fn bullet_body(s: &str) -> Option<&str> {
+    match s.chars().next() {
+        Some('-') | Some('*') | Some('+') => {}
+        _ => return None,
+    }
+    let rest = &s[1..];
+    if !rest.starts_with(' ') && !rest.starts_with('\t') {
+        return None;
+    }
+    Some(rest.trim_start())
 }
 
 /// 从 GitHub release 响应中取 `body`。纯函数，可单测。
@@ -668,46 +729,67 @@ mod tests {
     /// 不预处理的话，release notes 会显示成 `### 新增功能` 和
     /// `<h3 id="...">` 这样的垃圾文本。
     #[test]
-    fn preprocess_converts_headings_to_bold_and_strips_html() {
+    fn blocks_convert_headings_and_strip_html() {
         let input = "<h3 id=\"cn-x\">新增功能</h3>\n\n### 体验优化\n\n- 某条目\n";
-        let out = preprocess_notes(input);
-        assert!(!out.contains('<'), "HTML 标签应被剥离，得到 {out:?}");
-        assert!(!out.contains("###"), "ATX 标题应被转换，得到 {out:?}");
-        assert!(out.contains("**新增功能**"), "得到 {out:?}");
-        assert!(out.contains("**体验优化**"), "得到 {out:?}");
-        assert!(out.contains("- 某条目"), "列表语法应保持原样交给 StyledText");
+        let blocks = parse_notes_blocks(input);
+        assert_eq!(blocks.len(), 3, "两个标题 + 一条列表项，得到 {blocks:?}");
+        assert_eq!(blocks[0], NoteBlock { kind: NoteKind::Heading, text: "**新增功能**".into() });
+        assert_eq!(blocks[1], NoteBlock { kind: NoteKind::Heading, text: "**体验优化**".into() });
+        // ⚠ 列表标记必须被**去掉**：圆点由 Slint 单独一列画，留着标记就没法悬挂缩进
+        assert_eq!(blocks[2], NoteBlock { kind: NoteKind::Bullet, text: "某条目".into() });
+        for b in &blocks {
+            assert!(!b.text.contains('<'), "HTML 标签应被剥离，得到 {b:?}");
+            assert!(!b.text.contains("###"), "ATX 标记不该留在正文里，得到 {b:?}");
+        }
     }
 
     #[test]
-    fn preprocess_preserves_bilingual_nav_and_links() {
+    fn blocks_preserve_bilingual_nav_and_links() {
         // StyledText 原生支持链接，不该破坏它们
-        let input = "[中文](#cn-x) | [English](#en-x)\n";
-        let out = preprocess_notes(input);
-        assert!(out.contains("[中文](#cn-x)"), "链接应原样保留，得到 {out:?}");
+        let blocks = parse_notes_blocks("[中文](#cn-x) | [English](#en-x)\n");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].text, "[中文](#cn-x) | [English](#en-x)");
     }
 
     #[test]
-    fn preprocess_handles_empty_input() {
-        assert_eq!(preprocess_notes(""), "");
+    fn blocks_handle_empty_input() {
+        assert!(parse_notes_blocks("").is_empty());
+        assert!(parse_notes_blocks("\n\n  \n").is_empty(), "只有空白的输入不产出任何块");
     }
 
-    /// 分节空行：标题前补**恰好一个**空行，且不落在文首、不在连续标题间叠加。
+    /// 分段规则：空行才是段落边界，连续普通行属于**同一个**段落（markdown 软换行）。
     ///
-    /// 判别性：这条钉住的是"阅读体验"那部分改动 —— 漏了它，长说明里所有小节会
-    /// 糊成一整块（实测空行能渲染出约 14px 段间距，而没有空行就完全没有间隔）。
+    /// 判别性：这条钉住的是"块间距由布局给"这个改动 —— 若把每一行都当成独立段落，
+    /// 一条长说明会散成几十个块，每块之间都多一跳间距，读起来比原来更散。
     #[test]
-    fn preprocess_puts_exactly_one_blank_line_before_headings() {
-        let out = preprocess_notes("### 甲\n- 一条\n### 乙\n- 两条\n");
-        assert_eq!(out, "**甲**\n- 一条\n\n**乙**\n- 两条\n", "标题前应有且仅有一个空行");
-        assert!(!out.starts_with('\n'), "文首不该多出空行");
+    fn blocks_merge_soft_wrapped_lines_into_one_paragraph() {
+        let blocks = parse_notes_blocks("第一行\n第二行\n\n另一段\n");
+        assert_eq!(blocks.len(), 2, "得到 {blocks:?}");
+        assert_eq!(blocks[0].text, "第一行\n第二行", "软换行应留在同一个块里");
+        assert_eq!(blocks[0].kind, NoteKind::Paragraph);
+        assert_eq!(blocks[1].text, "另一段");
+    }
 
-        // 连续两个标题：不能叠成两个空行
-        let out2 = preprocess_notes("### 甲\n### 乙\n");
-        assert_eq!(out2, "**甲**\n\n**乙**\n");
+    /// `-` 后面没有空白就不是列表项，否则会吃掉正常正文。
+    #[test]
+    fn blocks_do_not_mistake_dashes_in_prose_for_bullets() {
+        let blocks = parse_notes_blocks("- 真列表项\n-5 度不是列表\n");
+        assert_eq!(blocks.len(), 2, "得到 {blocks:?}");
+        assert_eq!(blocks[0].kind, NoteKind::Bullet);
+        assert_eq!(blocks[0].text, "真列表项");
+        assert_eq!(blocks[1].kind, NoteKind::Paragraph);
+        assert_eq!(blocks[1].text, "-5 度不是列表");
+    }
 
-        // 标题前本来就有空行时，也不该再补一个
-        let out3 = preprocess_notes("- 一条\n\n### 乙\n");
-        assert_eq!(out3, "- 一条\n\n**乙**\n");
+    /// 列表标记的三种写法与有序列表的回退行为。
+    #[test]
+    fn blocks_accept_all_unordered_markers_and_keep_ordered_literal() {
+        let blocks = parse_notes_blocks("* 星号\n+ 加号\n1. 有序\n");
+        assert_eq!(blocks.len(), 3, "得到 {blocks:?}");
+        assert_eq!(blocks[0], NoteBlock { kind: NoteKind::Bullet, text: "星号".into() });
+        assert_eq!(blocks[1], NoteBlock { kind: NoteKind::Bullet, text: "加号".into() });
+        // 有序列表按普通段落处理：编号原样留在文字里（已知局限，见函数注释）
+        assert_eq!(blocks[2], NoteBlock { kind: NoteKind::Paragraph, text: "1. 有序".into() });
     }
 
     #[test]

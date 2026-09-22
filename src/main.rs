@@ -304,14 +304,23 @@ fn project(state: &AppState, win: &MainWindow, tray: &AppTray) {
     win.set_port_text(state.preferred_port.to_string().into());
 
     win.set_notes_status(state.notes_status());
-    // ⚠ `from_markdown` 返回 `Result<StyledText, StyledTextFromMarkdownError>`，
-    // 不是 `StyledText`（签名已核实）。必须处理。
-    // 解析失败时降级为**纯文本而不是空** —— 否则会出现"状态显示 ok 但说明区一片空白"
-    // 的矛盾。`from_plain_text` 不返回 Result（同样已核实）。
-    win.set_notes_text(
-        slint::StyledText::from_markdown(&state.notes.body)
-            .unwrap_or_else(|_| slint::StyledText::from_plain_text(&state.notes.body)),
-    );
+    // FR-27：说明按**块**推给界面（标题 / 列表项 / 段落各自排版），不再是一整段
+    // styled-text —— Slint 的 StyledText 不支持标题、也没有字重，一整段做不到
+    // "标题比正文大"与"列表悬挂缩进"。理由详见 dsh::parse_notes_blocks。
+    //
+    // ⚠ 逐块解析：`from_markdown` 返回 `Result<StyledText, …>`（签名已核实），
+    // 必须处理。解析失败时降级为**纯文本而不是空** —— 否则会出现"状态显示 ok
+    // 但说明区一片空白"的矛盾，或者某一段静默消失。`from_plain_text` 不返回 Result。
+    win.set_notes_blocks(ModelRc::from(Rc::new(VecModel::from(
+        dsh::parse_notes_blocks(&state.notes.body)
+            .into_iter()
+            .map(|b| NoteBlock {
+                kind: b.kind as i32,
+                text: slint::StyledText::from_markdown(&b.text)
+                    .unwrap_or_else(|_| slint::StyledText::from_plain_text(&b.text)),
+            })
+            .collect::<Vec<_>>(),
+    ))));
 
     win.set_log_lines(ModelRc::from(state.log.clone()));
     win.set_busy(state.busy);
@@ -400,7 +409,10 @@ fn drain(rx: &Receiver<UiMsg>, state: &Rc<RefCell<AppState>>, tx: &Sender<Job>) 
                                     {
                                         push_log(&s, format!("更新说明缓存写入失败（不影响本次显示）：{e}"));
                                     }
-                                    s.notes.body = dsh::preprocess_notes(&body);
+                                    // ⚠ 状态里存**原始 markdown**，不在这里预处理：
+                                    // 分块是纯展示推导，跟 project() 里其它派生量一样
+                                    // 每次投影现算（见 dsh::parse_notes_blocks）。
+                                    s.notes.body = body;
                                     s.notes.status = Some(NotesStatus::Ok);
                                 }
                                 Err(NotesError::Missing) => {
@@ -536,7 +548,8 @@ fn request_notes(state: &Rc<RefCell<AppState>>, send: impl Fn(Job), version: Ver
     if let Some(body) = config::load_notes(&version.to_string()) {
         let mut s = state.borrow_mut();
         s.notes.version = Some(version);
-        s.notes.body = dsh::preprocess_notes(&body);
+        // 同上：缓存里就是原始 markdown，分块留到投影时做
+        s.notes.body = body;
         s.notes.status = Some(NotesStatus::Ok);
         // ⚠ 这条路径**不发任何消息**：不置 dirty 的话，说明区会一直停在
         // Loading（回调已经把 notes 重置过了），缓存等于没命中。

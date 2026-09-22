@@ -28,6 +28,18 @@ import { ListView, ScrollView, AboutSlint, Palette } from "std-widgets.slint";
 
 export enum NotesStatus { loading, ok, missing, failed }
 
+/// 更新说明里的一个排版块。由 Rust 侧的 `dsh::parse_notes_blocks` 切好推过来 ——
+/// Slint 的 `StyledText` 不支持标题（官方 Currently Unsupported 列表里有 Headings），
+/// 也没有字重属性，一整段文字表达不了"标题比正文大"，列表也做不出悬挂缩进。
+///
+/// ⚠ `kind` 的下标与 `src/dsh.rs` 的 `NoteKind` **一一对应**，改顺序要两边一起改
+/// （同 `close-behavior-index` 与 `CloseBehavior` 的约定）：
+///   0 = 标题 / 1 = 无序列表项 / 2 = 普通段落
+export struct NoteBlock {
+    kind: int,
+    text: styled-text,
+}
+
 // ── 设计令牌 ────────────────────────────────────────────────────────────────
 // 一处定义，全局引用。升级路径：将来若做主题切换，只需把这里的常量
 // 换成 `in` 属性并由 Rust 写入。
@@ -955,6 +967,76 @@ component GlassSelect inherits Rectangle {
     }
 }
 
+// ── 更新说明的一个块（GitHub 的排版）──────────────────────────────────────
+// 三种角色共用一套令牌，字号/缩进/间距按 kind 分：
+//   标题   = 15px + Tokens.ink（粗体由 Rust 侧给的 `**…**` 提供）+ 上方留白
+//   列表项 = 圆点单独一列 + 正文 —— 于是换行后的第二行挂在**文字**下（悬挂缩进），
+//            而不是退回左边缘（那正是 StyledText 内置列表做不到的事）
+//   段落   = 12.5px + Tokens.ink-2
+// 链接仍由 StyledText 自己渲染（蓝 + 下划线，与改动前一致），色值走 Tokens.good。
+component NoteText inherits StyledText {
+    in property <int> kind: 2;
+    default-font-family: Font.text;
+    default-font-size: root.kind == 0 ? 15px : 12.5px;
+    default-color: root.kind == 0 ? Tokens.ink : Tokens.ink-2;
+    link-color: Tokens.good;
+    horizontal-stretch: 1;
+}
+
+component NoteBlockView inherits VerticalLayout {
+    in property <int> kind: 2;
+    in property <styled-text> text;
+    callback link-clicked(string);
+
+    spacing: 0px;
+
+    // 块间距**按角色分档**，一律由块自己在上方留白给出（容器的 spacing 是 0）：
+    //   · 标题  14px —— GitHub 的小节标题是"隔开上一段"的，不是紧贴
+    //   · 段落   8px
+    //   · 列表项 3px —— 列表要紧凑。上一版给所有块统一 7px，30 条说明的列表项之间
+    //     全都多出一档空气，读起来比 GitHub 散得多。
+    // ⚠ 用 if 而不是 visible：Slint 里不可见元素照样占布局位置，那样每一块都会白留一档
+    // （同 PillButton、说明区三态那两处的坑）。
+    if root.kind == 0 : Rectangle { height: 14px; }
+    if root.kind == 2 : Rectangle { height: 8px; }
+    if root.kind == 1 : Rectangle { height: 3px; }
+
+    if root.kind == 1 : HorizontalLayout {
+        spacing: 7px;
+        alignment: start;
+        // ⚠ 圆点要跟**首行**对齐，所以是 cross-axis: start 而不是默认的 stretch
+        // —— 列表项占三四行时，圆点该留在第一行旁边。
+        cross-axis-alignment: start;
+        // 圆点用 Rectangle 画，不用 "•" 字形：字形的粗细与高低**随字体而变**
+        // （实测默认字体下它偏小、还浮在首行中心之上），这里要的是可控的对齐。
+        // 外盒 10×17（17px = 12.5px 正文的行高），圆点 4px 在其中居中
+        // → 圆点中心正好落在首行的视觉中心。加上 7px 间距，正文左边缘落在 17px 处，
+        // 换行后的第二行也挂在这一列 —— 这就是悬挂缩进的"挂"。
+        Rectangle {
+            width: 10px;
+            height: 17px;
+            Rectangle {
+                x: 3px;
+                y: 6px;
+                width: 4px;
+                height: 4px;
+                border-radius: 2px;
+                background: Tokens.ink-3;
+            }
+        }
+        NoteText {
+            kind: root.kind;
+            text: root.text;
+            link-clicked(link) => { root.link-clicked(link); }
+        }
+    }
+    if root.kind != 1 : NoteText {
+        kind: root.kind;
+        text: root.text;
+        link-clicked(link) => { root.link-clicked(link); }
+    }
+}
+
 // ── 键值行（关于对话框用）───────────────────────────────────────────────────
 component MetaRow inherits HorizontalLayout {
     in property <string> k: "";
@@ -1025,8 +1107,11 @@ export component MainWindow inherits Window {
     in-out property <string> port-text: "3080";
 
     // ── 更新说明（FR-27）──
-    // styled-text 是 Slint 的内建属性类型，对应 Rust 的 slint::StyledText。
-    in property <styled-text> notes-text;
+    // 按**块**推：每块自带 kind（标题/列表项/段落），由 Rust 侧切好。
+    // ⚠ 这里从 `styled-text` 改成块数组是刻意的 —— 一整段 StyledText 不支持标题、
+    // 也没有字重，做不到 GitHub 那种"标题比正文大 + 列表悬挂缩进"，理由见
+    // dsh::parse_notes_blocks 与 NoteBlock 的注释。
+    in property <[NoteBlock]> notes-blocks: [];
     in property <NotesStatus> notes-status: NotesStatus.loading;
 
     // ── 日志与忙碌态（FR-15 / FR-28）──
@@ -1520,23 +1605,18 @@ export component MainWindow inherits Window {
                         // 单行、左右各溢出卡片 1190px 被裁掉；而 1275 字的正文（高 442px）
                         // 会从卡片上方 -148px 开始，开头 10 行看不见。
                         // 套一层 VerticalLayout 后正文才既贴左、又按卡片宽度换行、又从顶部开始。
+                        //
+                        // ⚠ 这里 spacing 必须是 0：块间距按角色分档（标题 14 / 段落 8 /
+                        // 列表项 3），由 NoteBlockView 自己在上方留白给出。写成统一值
+                        // 就会在所有列表项之间也塞一档空气，比 GitHub 散得多。
+                        // 字号 / 字体 / 正文色 / 链接色统一在 NoteText 里，别在调用点重写。
                         VerticalLayout {
                             padding-left: 4px;
                             padding-right: 4px;
-                            StyledText {
-                                text: root.notes-text;
-                                // ── 阅读体验 ──
-                                // 字号 12 → 12.5px，字体与全应用一致（不写就跟 Window 默认，
-                                // 与界面其余部分不是同一支字）。
-                                default-font-family: Font.text;
-                                default-font-size: 12.5px;
-                                // 正文颜色：不写时 Slint 用主题前景色 —— 实测是接近纯白的
-                                // (226,226,226)，长文读起来发涩，也跟界面其余部分不一致。
-                                // 用 Tokens.ink-2（正文色，对比度约 7:1）与别处统一。
-                                default-color: Tokens.ink-2;
-                                // 链接色：Slint 的默认是纯蓝 #00f，落在近黑底上很刺眼，
-                                // 换成设计里那支信息蓝。
-                                link-color: Tokens.good;
+                            spacing: 0px;
+                            for block in root.notes-blocks : NoteBlockView {
+                                kind: block.kind;
+                                text: block.text;
                                 link-clicked(link) => { root.link-clicked(link); }
                             }
                         }

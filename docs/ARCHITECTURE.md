@@ -158,7 +158,7 @@
                         · latest_in(versions, alpha) → "0.1.6-alpha.2"
                         · latest == installed        → "✓ 已是最新"
                                     │
-用户选中某版本 ──► Job::FetchNotes ──► preprocess_notes ──► StyledText
+用户选中某版本 ──► Job::FetchNotes ──► parse_notes_blocks ──► [NoteBlock] ──► 逐块 StyledText
                                     │
 用户点"安装"  ──► Job::Transact { origin, target, port }
                                     │
@@ -336,7 +336,9 @@ export component MainWindow inherits Window {
     in property <string>   port-text:        "3080";
 
     // ---- 更新说明（FR-27）----
-    in property <styled-text> notes-text:    @markdown("");
+    // v1.4 起是**块数组**（标题 / 列表项 / 段落），不再是单段 styled-text：
+    // StyledText 不支持标题、也没有字重，做不到"标题比正文大 + 列表悬挂缩进"。
+    in property <[NoteBlock]> notes-blocks:  [];
     in property <NotesStatus> notes-status:  .loading;
 
     // ---- 日志与忙碌态（FR-15、FR-28）----
@@ -366,7 +368,13 @@ export enum NotesStatus { loading, ok, missing, failed }
 
 1. **下拉列表用格式化字符串而不是自定义 delegate**。下拉（v1.3 起为 `GlassSelect`，此前是 `ComboBox`）接受 `[string]`，把通道与"当前"标记直接拼进文案（`"0.1.6-alpha.2  (alpha)  ← 当前"`），省掉一整套自定义 delegate。SRS FR-10 只要求"标注通道"与"标识当前版本"，格式化字符串已满足。⚠️ v1.3 后通道后缀与"← 当前"已按用户要求移到行尾/标题，本条只保留"不写自定义 delegate"这一半。
 2. **日志用 `[string]` + `ListView`**，不用"整段文本"属性。原因：日志会持续增长，整段拼接是每次更新 O(n)；`VecModel` 追加是 O(1)，且 `ListView` 自带虚拟化。
-3. **`notes-text` 用 `styled-text` 类型**。Slint 的类型映射表中 `styled-text` 对应 `slint::StyledText`，由 `StyledText::from_markdown` 在 Rust 侧构造。
+3. **`notes-blocks` 是 `[NoteBlock]`，每块自带 kind 与一段 `styled-text`**（v1.4 改）。
+   原因：Slint 的 `StyledText` 官方 Currently Unsupported 列表里有 **Headings**，且它
+   **没有字重属性、只有一个字号** —— 单段文字表达不了"标题比正文大"；列表也只是渲染成
+   行内的 `• ` 前缀，换行后第二行退回左边缘（没有悬挂缩进）。所以**块结构在 Rust 侧
+   （`dsh::parse_notes_blocks`）解析**，Slint 侧按 kind 分别排版（`NoteBlockView`）。
+   块内的**行内** markdown 仍交给 `StyledText::from_markdown` 逐块解析（粗体 / 链接 /
+   行内代码它原生支持）。⚠ `NoteBlock.kind` 的下标与 `dsh::NoteKind` 一一对应。
 
 ### 3.3 AppTray 属性契约
 
@@ -414,7 +422,7 @@ fn project(state: &AppState, win: &MainWindow, tray: &AppTray) {
     win.set_version_options(model_from(&state.version_labels()));
     win.set_web_running(state.web.is_running());
     win.set_web_url(state.web.url().into());
-    win.set_notes_text(state.notes.styled());
+    win.set_notes_blocks(model_from(&state.note_blocks()));
     win.set_notes_status(state.notes.status());
     win.set_log_lines(state.log.clone().into());
     win.set_busy(state.tx.is_busy());
@@ -764,14 +772,16 @@ pub enum NotesError { Missing, Net(String) }
 **不处理的话**，这些会原样显示成 `### 新增功能` 和 `<h3 id="...">` 这样的垃圾文本。
 
 ```rust
-/// 把 GitHub release body 转成 StyledText 能正确渲染的形式。
-/// 只做三件事，不做完整 markdown 解析。
-pub fn preprocess_notes(md: &str) -> String {
+/// 把 GitHub release body 切成"标题 / 列表项 / 段落"三种块。
+/// 只做结构识别，不做排版（字号 / 缩进 / 块间距由 Slint 侧的设计令牌决定）。
+pub fn parse_notes_blocks(md: &str) -> Vec<NoteBlock> {
     // 1. 删除裸 HTML 标签（保留标签内的文本）：
-    //    <h3 id="cn-...">新增功能</h3>  →  新增功能
-    // 2. ATX 标题降级为粗体：  ### 新增功能  →  **新增功能**
-    // 3. 语言导航行 [中文](#cn-..) | [English](#en-..) 保留原样
-    //    （锚点在 StyledText 中无法跳转，但保留不影响可读性）
+    //    <h3 id="cn-...">新增功能</h3>  →  NoteBlock { Heading, "**新增功能**" }
+    // 2. ATX 标题同样识别：  ### 新增功能  →  NoteBlock { Heading, ... }
+    // 3. 无序列表去掉标记本身：  - 某条目  →  NoteBlock { Bullet, "某条目" }
+    //    （圆点交给 Slint 画，才做得出悬挂缩进）
+    // 4. 其余行按空行分段：空行才是段落边界，连续行留在同一个段落（markdown 软换行）
+    // 5. 语言导航行 [中文](#cn-..) | [English](#en-..) 保留原样，作为普通段落
 }
 ```
 
@@ -1075,7 +1085,7 @@ SRS §8.4 要求对核心逻辑做单元测试。以下逻辑被刻意设计为*
 | `latest_in(&[Version], Channel)` | FR-8 | **关键用例**：`[0.1.5-rc.2, 0.1.6-alpha.2]` + Alpha → `0.1.6-alpha.2`（防误降级） |
 | `find_dsh_on_path(dirs, exists)` | FR-3 | 传入假目录数组 + 假 `exists`，验证取第一个命中 |
 | `owner_of(shim, bins)` | FR-3 | 验证大小写不敏感、`dsh.exe` 与 `dsh.cmd` 都能命中 |
-| `preprocess_notes(&str)` | FR-27 | 输入真实 release notes 片段，验证 HTML 被剥离、标题变粗体 |
+| `parse_notes_blocks(&str)` | FR-27 | 输入真实 release notes 片段，验证 HTML 被剥离、标题成 Heading 块、列表标记被去掉、软换行合段 |
 | `is_safe_version(&str)` | NFR-6 | 验证字符集边界 |
 
 ### 6.2 事务引擎的失败路径测试
@@ -1208,3 +1218,4 @@ strip     = true
 | 1.1 | 2026-09-20 | 关闭 R-1 / R-2：补充 §2.4 实测证据；**修正 §4.5（原 §4.4）中被证伪的 `on_close_requested` 用法**；补充 std-widgets 导入要求与编译耗时实测；Q-2 / Q-3 结案 |
 | 1.2 | 2026-09-20 | **新增配置持久化设计**（Q-1 由"不做"改为"A + B 都做"）：**①** §1.3 模块图新增 `config.rs` 并说明其边界；**②** 新增 **§4.4 `src/config.rs` 详细设计**（`Loaded` 枚举的设计理由、**原子写入及其依据**、写入点收敛约束、单实例限制），原 §4.4 / §4.5 顺延为 §4.5 / §4.6；**③** §7.2 拒绝清单新增 `dirs`；**④** §9.2 Q-1 结案 |
 | 1.3 | 2026-09-21 | **组件样式统一**（§2.4.3、§3.2）：**①** 输入框 / 下拉框改为自绘 `GlassField` / `GlassSelect`，删掉两处压制 Fluent 的 `min-width: 0px; height: 30px;` 与端口框的三层嵌套 hack；**②** 新增语义令牌（`fill` / `fill-hover` / `fill-active` / `sunk` / `solid` / `overlay` / `accent-*` / `hairline-strong` / `motion-*` / `disabled`），收敛原先散落的 6 档白百分比与 5 档时长；**③** 抽出 `Flyout` / `Divider` / `SectionHeader` / `CloseButton` 四个共用件（三个对话框的关闭按钮原先各抄一份且都没有 hover）；**④** 修掉日志列表条目的水平居中（`width: 100%` + `Text.x = 0`，实测左边缘 183/147/92 → 38/38/38）；**⑤** 删除未使用的 `Button` 导入；**⑥** 新增 `FieldLabel`（表单字段标签，与字段正文**同字号 12.5px、同高 32px**，层次只靠颜色），`Eyebrow`（9.5px）收窄为分区标题 / 元信息键专用 —— 原先字段行拿 9.5px 眉标当标签，压在 12.5px 的字段文字旁边字号差一大截；**⑦** 下拉框与输入框**角色分开**：输入框是下凹槽（`sunk` + `hairline-strong`），下拉框是凸起控件面（`fill` + `hairline` + 悬停提亮），原先两者同一个壳、看起来都能打字；**⑧** 下拉箭头补 `cross-axis-alignment: center`（漏了它会被顶到字段上沿，同一坑 PillButton 注释里已记过） |
+| 1.4 | 2026-09-22 | **更新说明改为 GitHub 式分块排版**（FR-27，§2.2 数据流 / §3.2 要点 3 / §4.x 纯函数 / §8 测试表）：`preprocess_notes(&str) -> String` 换成 `parse_notes_blocks(&str) -> Vec<NoteBlock>`，属性 `notes-text: styled-text` 换成 `notes-blocks: [NoteBlock]`，新增 `NoteKind` / `NoteBlock` 与 Slint 侧的 `NoteBlockView`。**根因**：Slint 的 `StyledText` 不支持标题（官方 Currently Unsupported），也没有字重属性 ——单段文字做不到"标题比正文大"与"列表悬挂缩进"，只能把块结构交给 Rust 侧解析。随之删掉"标题前补空行"的 hack（块间距现在由布局给） |
