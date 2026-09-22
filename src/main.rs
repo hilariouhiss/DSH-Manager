@@ -536,6 +536,13 @@ fn drain(rx: &Receiver<UiMsg>, state: &Rc<RefCell<AppState>>, tx: &Sender<Job>) 
                 // §5.2：worker 已终止。必须明确告知，否则 UI 看起来正常
                 // 但所有操作都无响应 —— 这是最难排查的故障形态。
                 //
+                // ⚠ **本分支何时才可达（Task 6 之后）**：`drop(msg_tx)` 只是必要条件，
+                // 不再充分 —— 主题监视线程（`theme::spawn_watcher`）持有一个
+                // `Sender<UiMsg>` 克隆，**只要它活着**，`try_recv` 就返回不了
+                // `Disconnected`。它两条早退路径（`CreateEventW` 失败、等待失败）
+                // 丢弃 `tx` 之后，所有发送端才真的没了，本分支重新可达。
+                // （同理，Ruling 83：`dsh web` 的 reader 线程在子进程存活期间也各持一个克隆。）
+                //
                 // ⚠ 闩锁（Ruling 77）：所有发送端都丢弃之后，`try_recv` **永远**
                 // 返回 Disconnected，所以本分支一旦可达就会**每个 tick** 重新进入。
                 // 返回 true 就是 12.5 Hz 的全量 `project()`（NFR-4 要求空闲时
@@ -1444,13 +1451,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 系统主题监视。⚠ 必须在 `run()`（以及这个 Timer）之前起 —— 否则启动瞬间到
     // 事件循环就绪之间发生的变更会丢。消息走既有的 UiMsg 通道，由下面的 80ms timer 排空。
     //
-    // ⚠ 本行是 **Task 6** 落地的（计划原来把它排在 Task 8 Step 3）：不在这里起监视，
+    // ⚠ 本行是 **Task 6** 落地的（计划初稿把它排在 Task 8 Step 3）：不在这里起监视，
     // `spawn_watcher` 与 `UiMsg::SystemThemeChanged` 都无人构造，`cargo build` 实测报
     // 2 条 dead_code，直接违反 0 警告规则。**Task 8 不要再加第二个** —— 两条监视线程
     // 会各自武装同一把键、各自送一条消息（虽然 `drain` 的臂是幂等的，但那是白烧一份线程）。
     //
-    // ⚠ 代价（已知且刻意）：本线程持有 `msg_tx` 的一个克隆直到进程结束，于是
-    // §5.2 的"worker 已死"安全网不再可达 —— 完整说明见下方 `drop(msg_tx)` 处（Ruling 77）。
+    // ⚠ 副作用（已知且刻意）：监视线程持有一个 `msg_tx` 克隆，**只要它活着**，
+    // `msg_rx.try_recv()` 就不会返回 `Disconnected` —— §5.2 的"worker 已死"兜底分支
+    // 在这段时间里不可达。⚠ 但**不是永久**：监视线程有两条早退路径会丢弃 `tx`
+    // （`CreateEventW` 失败、等待失败），此后该分支重新可达，所以分支与 `worker_dead`
+    // 闩锁都保留。采纳理由与完整说明见下方 `drop(msg_tx)` 处（Ruling 18 / Ruling 83）。
     theme::spawn_watcher(msg_tx.clone());
 
     // 决策 3：80ms Timer 排空。实测 timer 精度 ±1.2ms，未被节流。
@@ -1544,15 +1554,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 配套的 `worker_dead` 闩锁在 `AppState` 里，否则这条分支一旦可达就会
     // 每个 tick 重复触发。
     //
-    // ⚠⚠ **Task 6 之后，上面这条已经不足以让那个分支可达了**：上面的
-    // `theme::spawn_watcher()` 自己持有 `msg_tx` 的一个克隆直到进程结束，所以
-    // `try_recv` 现在**永远**返回不了 `Disconnected` —— §5.2 的安全网（连同
-    // `worker_dead` 闩锁）已不可达，这行 drop 不再是它的开关（Ruling 83 早已指出
-    // "worker 死了 + dsh web 在跑"时它就接不住，现在是不管什么情况都接不住）。
-    // 要同时保住两者，只能给主题消息单开一条通道并让 `drain` 同时排空两条 ——
-    // 那是对 `drain` 的结构性改动，不在 Task 6 范围。
-    // 这行 drop 仍然要留着：它正确表达了"main 不再需要这个发送端"，
-    // 也是将来拆分通道时的起点。
+    // ⚠ **Task 6 的监视线程让这条变得更弱了 —— 但不是失效，是带条件**：
+    // `theme::spawn_watcher()` 持有 `msg_tx` 的一个克隆，**只要它活着**，`try_recv`
+    // 就返回不了 `Disconnected`，于是这段 drop 单靠自己不再足以打开 §5.2 那个分支。
+    // 反过来同样成立：监视线程有两条早退路径会丢弃 `tx`（`CreateEventW` 失败、
+    // `WaitForSingleObject` 失败），此后所有发送端才真的没了，该分支**重新变得可达**。
+    // 所以分支与 `worker_dead` 闩锁都保留，这行 drop 也保留 —— 它正确表达了
+    // "main 不再需要这个发送端"。Ruling 83 早已指出该兜底本来就不可靠
+    // （"worker 死了 + dsh web 在跑"时同样接不住），真正的保护是 worker 外层的
+    // `catch_unwind` + 显式 `Log`/`Failed`，那不受本改动影响（采纳理由见 Ruling 18）。
+    // 要让这段 drop 重新成为唯一开关，只能给主题消息单开一条通道并让 `drain` 同时
+    // 排空两条 —— 那是对 `drain` 的结构性改动，不在 Task 6 范围。
     drop(msg_tx);
 
     // FR-23 修订版的关闭语义（隐藏 / 退出 / 每次询问）连同询问框一起挂在
