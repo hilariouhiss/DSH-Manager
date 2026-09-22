@@ -3,6 +3,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::theme::ThemeMode;
+
 /// 关闭主窗口时的行为。FR-23 修订版：**首次关闭时询问一次**，选中的结果
 /// 记在这里，之后可在"设置"里随时改。
 ///
@@ -60,6 +62,8 @@ pub struct StateFile {
     pub running_port: Option<u16>,
     /// `None` = 从没问过（首次关闭要弹询问框）。见 `CloseBehavior`。
     pub close_behavior: Option<CloseBehavior>,
+    /// `None` = 从没设过 = 跟随系统。见 `ThemeMode`。
+    pub theme_mode: Option<ThemeMode>,
 }
 
 #[derive(Debug)]
@@ -96,6 +100,10 @@ pub fn load_from(path: Option<&Path>) -> Loaded {
             .get("close_behavior")
             .and_then(|x| x.as_str())
             .and_then(CloseBehavior::parse),
+        theme_mode: v
+            .get("theme_mode")
+            .and_then(|x| x.as_str())
+            .and_then(ThemeMode::parse),
     })
 }
 
@@ -147,6 +155,7 @@ pub fn save_to(path: &Path, s: &StateFile) -> Result<(), String> {
         "preferred_port": s.preferred_port,
         "running_port": s.running_port,
         "close_behavior": s.close_behavior.map(CloseBehavior::as_str),
+        "theme_mode": s.theme_mode.map(ThemeMode::as_str),
     });
     let text = serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?;
     write_atomic(path, &text)
@@ -286,6 +295,7 @@ pub fn update_at(path: &Path, f: impl FnOnce(&mut StateFile)) -> Result<(), Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::ThemeMode;
 
     fn tmp(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("dsh-mgr-test-{name}-{}", std::process::id()))
@@ -378,6 +388,7 @@ mod tests {
                 preferred_port: Some(3080),
                 running_port: Some(8080),
                 close_behavior: None,
+                theme_mode: None,
             },
         )
         .unwrap();
@@ -404,6 +415,7 @@ mod tests {
             preferred_port: Some(8080),
             running_port: Some(9090),
             close_behavior: Some(CloseBehavior::Quit),
+            theme_mode: None,
         };
         save_to(&p, &s).unwrap();
         match load_from(Some(&p)) {
@@ -426,7 +438,12 @@ mod tests {
     #[test]
     fn save_leaves_no_tmp_file_behind() {
         let p = tmp("notmp.json");
-        let s = StateFile { preferred_port: Some(1), running_port: None, close_behavior: None };
+        let s = StateFile {
+            preferred_port: Some(1),
+            running_port: None,
+            close_behavior: None,
+            theme_mode: None,
+        };
         save_to(&p, &s).unwrap();
         let leftover = p.with_extension("json.tmp");
         assert!(!leftover.exists(), "原子写入不得残留 .tmp 文件");
@@ -436,7 +453,12 @@ mod tests {
     #[test]
     fn update_preserves_other_field() {
         let p = tmp("update.json");
-        let s = StateFile { preferred_port: Some(3080), running_port: None, close_behavior: None };
+        let s = StateFile {
+            preferred_port: Some(3080),
+            running_port: None,
+            close_behavior: None,
+            theme_mode: None,
+        };
         save_to(&p, &s).unwrap();
         update_at(&p, |s| s.running_port = Some(8080)).unwrap();
         match load_from(Some(&p)) {
@@ -481,14 +503,22 @@ mod tests {
         let _ = std::fs::remove_file(&p);
         let _ = std::fs::remove_dir_all(&tmp_dir);
 
-        let baseline =
-            StateFile { preferred_port: Some(3080), running_port: None, close_behavior: None };
+        let baseline = StateFile {
+            preferred_port: Some(3080),
+            running_port: None,
+            close_behavior: None,
+            theme_mode: None,
+        };
         save_to(&p, &baseline).unwrap();
 
         // 占住 .tmp 路径，使"写临时文件"必然失败
         std::fs::create_dir_all(&tmp_dir).unwrap();
-        let different =
-            StateFile { preferred_port: Some(9999), running_port: Some(1), close_behavior: None };
+        let different = StateFile {
+            preferred_port: Some(9999),
+            running_port: Some(1),
+            close_behavior: None,
+            theme_mode: None,
+        };
         assert!(save_to(&p, &different).is_err(), "写 .tmp 失败时 save_to 必须报错");
 
         match load_from(Some(&p)) {
@@ -497,6 +527,73 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn theme_mode_roundtrips_through_json() {
+        let p = tmp("theme.json");
+        let s = StateFile {
+            preferred_port: None,
+            running_port: None,
+            close_behavior: None,
+            theme_mode: Some(ThemeMode::Dark),
+        };
+        save_to(&p, &s).unwrap();
+        match load_from(Some(&p)) {
+            Loaded::Ok(got) => assert_eq!(got.theme_mode, Some(ThemeMode::Dark)),
+            other => panic!("期望 Ok，得到 {other:?}"),
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// ⚠ 兼容性：旧版 state.json 只有三个字段。缺 key 必须读出 `None`
+    /// （= 跟随系统），**不得**当成损坏、也不得回落成某个固定主题。
+    #[test]
+    fn legacy_state_without_theme_mode_reads_as_none() {
+        let p = tmp("legacy.json");
+        std::fs::write(
+            &p,
+            r#"{"preferred_port": 3080, "running_port": null, "close_behavior": "quit"}"#,
+        )
+        .unwrap();
+        match load_from(Some(&p)) {
+            Loaded::Ok(s) => {
+                assert_eq!(s.theme_mode, None, "缺 key 应为 None（跟随系统）");
+                assert_eq!(s.preferred_port, Some(3080), "旧字段不得受影响");
+                assert_eq!(s.close_behavior, Some(CloseBehavior::Quit));
+            }
+            other => panic!("期望 Ok，得到 {other:?}"),
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn unrecognized_theme_mode_reads_as_none() {
+        let p = tmp("badtheme.json");
+        std::fs::write(&p, r#"{"theme_mode": "MINT"}"#).unwrap();
+        match load_from(Some(&p)) {
+            Loaded::Ok(s) => assert_eq!(s.theme_mode, None),
+            other => panic!("期望 Ok，得到 {other:?}"),
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 保存必须落 `theme_mode` 这个 key —— 否则"选了深色重启还是跟随系统"，
+    /// 而所有内存测试都看不出来。
+    #[test]
+    fn save_writes_theme_mode_key() {
+        let p = tmp("writetheme.json");
+        let s = StateFile {
+            preferred_port: None,
+            running_port: None,
+            close_behavior: None,
+            theme_mode: Some(ThemeMode::Light),
+        };
+        save_to(&p, &s).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(v.get("theme_mode").and_then(|x| x.as_str()), Some("light"));
         let _ = std::fs::remove_file(&p);
     }
 }
