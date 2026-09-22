@@ -41,7 +41,8 @@
 ```
 Windows 主题
    │  读：uxtheme 序号132 ShouldAppsUseDarkMode() && !高对比度   （与 winit 同源，F3）
-   │      取不到则回落 HKCU\...\Themes\Personalize\AppsUseLightTheme
+   │      ⚠ 三条失败路径（版本不达标 / 取不到模块 / 取不到序号）一律判**浅色** ——
+   │      与 winit 的 `unwrap_or(false)` 逐条对齐，**不读注册表**（理由见 §8 注）
    │  变：RegNotifyChangeKeyValue 监视该键（事件等待，不轮询）
    ▼
 src/theme.rs ── system_dark: bool ────┐
@@ -272,7 +273,7 @@ pub struct StateFile {
 
 ## 11. 实施顺序（供后续计划展开）
 
-1. `src/theme.rs`：探测（uxtheme 序号 132 + 高对比度 + 注册表回落）+ 监视线程 + `ThemeMode` 解析。**纯函数部分优先写单测**（注入 `system_dark` 与 mode，断言 `resolved_dark`）。
+1. `src/theme.rs`：探测（winit 版本门 → uxtheme 序号 132 → 高对比度，失败一律浅色）+ 监视线程 + `ThemeMode` 解析。**纯函数部分优先写单测**（注入 `system_dark` 与 mode，断言 `resolved_dark`）。
 2. `src/config.rs`：`ThemeMode` + `StateFile.theme_mode` + 兼容性测试。
 3. `ui/app.slint`：`export global Tokens` + `dark` 输入 + 45 个令牌加浅色分支 + 4 个新令牌 + 吸收 5 处字面量。
 4. `ui/app.slint`：设置面板加「主题」组 + `theme-mode-changed(int)` callback + `theme-mode` 输入。
@@ -287,6 +288,6 @@ pub struct StateFile {
 | 风险 | 缓解 |
 |---|---|
 | 浅色配色的**观感**只能上屏才判得准，表里的值可能需一轮微调 | 对比度门槛已先钉死（不会出现不可读）；观感微调属正常迭代，不改变结构 |
-| `uxtheme` 序号 132 是未文档化导出 | 与 winit 同源（F3）；取不到时回落注册表，两条路都有 |
+| `uxtheme` 序号 132 是未文档化导出 | 与 winit 同源（F3）；取不到时**判浅色**（与 winit 的 `unwrap_or(false)` 一致）。⚠ 不要改回注册表回落 —— 见 Ruling 17 |
 | 令牌从常量变表达式，可能影响渲染性能 | 条件表达式是 Slint 原生形状（F5），Fluent 自身就这么用；无额外机制 |
 | 45 行令牌改动面大，易漏 | 验证脚本解析实际文件值，漏改会让两套主题不匹配而被脚本/截图抓到 |
