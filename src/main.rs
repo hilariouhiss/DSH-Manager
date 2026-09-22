@@ -357,6 +357,13 @@ fn project(state: &AppState, win: &MainWindow, tray: &AppTray) {
     // ⚠ 必须每帧都推：设置面板改变的是 AppState，而"唯一点投影点"是本函数。
     win.set_close_behavior_index(state.close_behavior.index());
 
+    // ── 主题（Rust 是唯一真相源）──
+    // mode 推给界面画选中态；resolved 推给 Tokens 驱动全部颜色。
+    // ⚠ `Tokens` 是 `export global`，故 Rust 能拿到 setter：生成代码里
+    // `impl slint::Global<'a, MainWindow> for Tokens<'a>` + `pub fn set_dark`。
+    win.set_theme_mode(state.theme_mode.index());
+    win.global::<Tokens>().set_dark(theme::resolve(state.theme_mode, state.system_dark));
+
     // ── 推给托盘（独立实例，必须再推一次）──
     tray.set_web_running(state.web.is_running());
     tray.set_busy(state.busy);
@@ -1240,6 +1247,28 @@ fn wire_callbacks(
         });
     }
 
+    // ── 主题模式 ──
+    //
+    // 与「关闭行为」同款：只有一条投影路径（落 AppState → `project()` 推回），
+    // 点击不发任何 Job，所以必须置 dirty —— 稳态下没有消息可排空。
+    {
+        let state = state.clone();
+        win.on_theme_mode_changed(move |idx| {
+            let Some(mode) = ThemeMode::from_index(idx) else { return };
+            {
+                let mut s = state.borrow_mut();
+                s.theme_mode = mode;
+                s.dirty = true;
+            }
+            // 偏好立即落盘，设置面板里没有"保存"按钮。
+            // 写失败只记日志、不回滚 —— 回滚界面上的选择会让"点了没反应"，
+            // 而这次选择在本次运行里已经生效。
+            if let Err(e) = config::update(|f| f.theme_mode = Some(mode)) {
+                push_log(&state.borrow(), format!("主题设置保存失败（本次运行仍生效）：{e}"));
+            }
+        });
+    }
+
     // 首次关闭时那个询问框：两个单选项各带一次"是否记住"。
     {
         let state = state.clone();
@@ -1405,36 +1434,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // FR-23 修订：关闭窗口的行为（隐藏 / 退出 / 每次询问）与端口同源，都读 state.json。
     // 没有记录时是 `Ask` —— "首次关闭要询问"这条需求不需要额外的"是否问过"标志：
     // 没值就是没问过。
-    let (preferred_port, close_behavior, startup_note) = match config::load() {
+    let (preferred_port, close_behavior, theme_mode, startup_note) = match config::load() {
         config::Loaded::Ok(s) => (
             s.preferred_port.unwrap_or(3080),
             s.close_behavior.unwrap_or_default(),
+            s.theme_mode.unwrap_or_default(),
             None,
         ),
-        config::Loaded::Missing => (3080, CloseBehavior::default(), None),
+        config::Loaded::Missing => (3080, CloseBehavior::default(), ThemeMode::default(), None),
         // FR-32：记日志但不阻止启动 —— 端口回落缺省值
         config::Loaded::Corrupt(e) => (
             3080,
             CloseBehavior::default(),
+            ThemeMode::default(),
             Some(format!("state.json 损坏，使用缺省端口 3080：{e}")),
         ),
-        config::Loaded::NoLocation => (3080, CloseBehavior::default(), None),
+        config::Loaded::NoLocation => (3080, CloseBehavior::default(), ThemeMode::default(), None),
     };
 
     let win = MainWindow::new()?;
     let tray = AppTray::new()?;
 
-    // ⚠ 第三个实参现在是**缺省值**（= `Auto` = 跟随系统）。Task 8 会把它换成
-    // `config::load()` 里持久化的 `theme_mode` —— 那一步还要把 load 的元组扩成四元。
     let state = Rc::new(RefCell::new(AppState::new(
         preferred_port,
         close_behavior,
-        ThemeMode::default(),
+        theme_mode,
     )));
     push_log(&state.borrow(), "DSH Manager 启动");
     if let Some(note) = startup_note {
         push_log(&state.borrow(), note);
     }
+
+    // 首帧之前的初始主题。⚠ `Palette.color-scheme` 由 .slint 的 `changed` 处理器
+    // 跟着 `Tokens.dark` 走（见 ui/app.slint 的 MainWindow），这里只写 Tokens。
+    win.global::<Tokens>().set_dark(theme::resolve(theme_mode, theme::system_dark()));
 
     // 首帧：显示加载态，而不是误导性的"未检测到"。
     // ⚠ 这里原先写"约 290ms 空窗期"是**错的**：290ms（SRS:782）是 80ms timer
