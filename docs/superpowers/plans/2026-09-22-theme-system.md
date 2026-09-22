@@ -848,7 +848,16 @@ windows-sys = { version = "0.61", features = [
 - [ ] **Step 3b: 编译确认依赖本身没问题**
 
 Run: `cargo build 2>&1 | tail -6`
-Expected: 因 `system_dark` 未实现而报 `cannot find function`（Step 2 那条），**不得**出现 `unresolved import` 或 feature 相关错误。若报 feature 名不存在，说明 `"0.61"` 解析到了别的补丁版本，改回精确 `"0.61.2"`。
+Expected: **`Finished`，0 警告** —— 注意这里**不会**报 `cannot find function system_dark`，
+因为 `cargo build` 不编译 `#[cfg(test)]`，而引用它的那个测试在测试模块里。
+（初稿把这里写成"应报 Step 2 那条 `cannot find function`"是错的，Task 5 实测指出：
+`cargo build` 根本看不到那个引用。RED 只能从 `cargo test` 得到。）
+本步只用来看**依赖本身**是否就位：**不得**出现 `unresolved import` 或 feature 相关错误。
+若报 feature 名不存在，说明 `"0.61"` 解析到了别的补丁版本，改回精确 `"0.61.2"`。
+
+再 Run: `git diff Cargo.lock | grep -E "^\+" | grep -v "^+++"`
+Expected: 只多出一条 **依赖边**（`+ "windows-sys 0.61.2",`，挂在 dsh-manager 名下），
+**不得**出现新增的 crate 版本条目 —— 那才叫"新增编译单元"。
 
 - [ ] **Step 4: 写实现**
 
@@ -963,6 +972,16 @@ pub fn system_dark() -> bool {
 在 `src/theme.rs` 顶部加 `#[cfg(windows)] use std::os::windows::ffi::OsStrExt;`。
 
 ⚠ 三处需要核实后可能要微调（`windows-sys` 0.61 的签名细节）：`c"uxtheme.dll"` 需要 Rust 2021+ 的 C 字符串字面量（本仓库 edition 2024，可用）；`(&raw mut x).cast()` 需要 Rust 1.82+。若 `HIGHCONTRASTW` 的字段名不符，查 `windows-sys-0.61.2/src/Windows/Win32/UI/Accessibility/mod.rs` 后按其定义写。
+
+⚠ **过渡期的 `dead_code` 抑制**（Task 5 实测，不是推断）：`system_dark` 的消费者在 Task 6，所以本步落地后
+`cargo build` 会报 **4 条** dead_code（`system_dark` / `uxtheme_dark` / `registry_dark` / `PERSONALIZE_KEY`）。
+只需在 `system_dark` 上加**一处** `#[allow(dead_code)]` 即可全部消除 —— rustc 把带 allow 的项当作存活根，
+其私有被调者随之存活。**不要**加模块级或 crate 级 blanket。
+
+同时 **`#[cfg(not(windows))]` 的那个桩也要各加一处**：它没有任何消费者，非 Windows 构建同样会因
+0 警告规则而红，而保留该桩的全部意义就是让别处也能编译。这也是一处 allow，不是 blanket。
+
+⚠ 加了这一组 `use`（`OsStrExt`）之后，文件里既有抑制的行号会整体下移 —— 引用它们时**一律用 grep，不要用行号**。
 
 - [ ] **Step 5: 运行测试确认通过**
 
@@ -1396,14 +1415,17 @@ git commit -m "feat(theme): 明暗双主题接线（探测/监视/持久化/设�
 
 - [ ] **Step 1: 删除过渡期的 `dead_code` 抑制，并确认零警告**
 
-Task 1 Step 5 在 `src/theme.rs` 里加的**三行** `#[allow(dead_code)]`（`ThemeMode` 之前、
-`impl ThemeMode` 之前、`resolve` 之前）**必须在本步全部删除** —— 到这一步三批消费者
-（Task 2 / 6 / 8）都已落地，抑制已经没有存在理由。
+**本步要删掉 `src/theme.rs` 里所有 `#[allow(dead_code)]`** —— 到这一步三批消费者（Task 2 / 6 / 8）都已落地，
+抑制没有存在理由了。
+
+⚠ **不要按行号找，用 grep**。Task 5 在文件头部加了一组 `use`，把行号整体下移过，而且抑制的**条数**也不是
+常量：Task 1 加了三处（`ThemeMode` / `impl ThemeMode` / `resolve`），Task 5 又加了两处（`system_dark`
+与其非 Windows 桩）。实测当前为 5 处（`:21` `:36` `:73` `:97` `:188`），但以 grep 结果为准。
 
 Run: `grep -n "allow(dead_code)" src/theme.rs`
 Expected: **无输出**（`grep` 退出码 1）。
 
-⚠ 注意这里没有"只剩注释行"之说 —— 那段移除契约注释里**并不含** `allow(dead_code)` 这个字面量
+⚠ 注意这里没有"只剩注释行"之说 —— 移除契约的注释里**并不含** `allow(dead_code)` 这个字面量
 （Task 1 复审实测确认：注释命中数为 0），所以删干净后应当一个匹配都没有。
 **若仍有匹配，那就是还有没删的生效属性**，逐个删掉并重跑本步。
 
