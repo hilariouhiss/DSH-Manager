@@ -1,4 +1,7 @@
 /target
+# 发布产物（安装包）。可重新生成，不入库 —— 但它是"发布时要交出去的那个文件"，
+# 所以放仓库根的 dist/ 而不是 target/ 里（后者会被 cargo clean 顺手删掉）。
+/dist
 
 # SDD (subagent-driven-development) 工作区 —— 本地临时产物，不入库
 .superpowers/
