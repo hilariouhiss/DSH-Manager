@@ -7,6 +7,10 @@
 //! 这一点），`SlintContext::color_scheme()` 又只在 `private_unstable_api` 里。
 //! 所以"跟随系统"必须我们自己探测。
 
+// `registry_dark` 里 `OsStr::encode_wide` 的来源。
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+
 // ⚠ 过渡期抑制，**Task 9 Step 1 必须删除这三行**（那里有强制的删除步骤）。
 // 本模块的项分三批被消费：parse/as_str → Task 2，resolve → Task 6，
 // index/from_index → Task 8。在最后一个消费者到位之前，`cargo build` 会对尚未
@@ -79,6 +83,114 @@ pub fn resolve(mode: ThemeMode, system_dark: bool) -> bool {
     }
 }
 
+/// 个人化设置键。`AppsUseLightTheme` 是 DWORD：1 = 浅色，0 = 深色。
+#[cfg(windows)]
+const PERSONALIZE_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize";
+
+/// 当前系统是否为暗色。
+///
+/// **主路径与 winit 同源**：`uxtheme.dll` 的序号 132 导出（`ShouldAppsUseDarkMode`），
+/// 并同样排除高对比度。不同源的话，系统标题栏（winit 负责）与窗口主体（本函数
+/// 负责）会各说各话 —— 那正是本设计要避免的。取不到该导出时回落注册表读
+/// `AppsUseLightTheme`。
+// ⚠ 过渡期抑制：Task 6 的监视器是它的消费者，Task 9 连同文件顶部三处一起删除。
+#[allow(dead_code)]
+#[cfg(windows)]
+pub fn system_dark() -> bool {
+    use windows_sys::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, SPI_GETHIGHCONTRAST};
+
+    /// 高对比度下 winit 判定为浅色（`dark_mode.rs:126` 的 `!is_high_contrast()`），
+    /// 我们必须同样处理，否则高对比度用户会看到主体与标题栏不一致。
+    fn high_contrast() -> bool {
+        // HIGHCONTRASTW 在这个版本实现了 Default，用它而不是手写零值字段。
+        let mut hc = HIGHCONTRASTW {
+            cbSize: std::mem::size_of::<HIGHCONTRASTW>() as u32,
+            ..Default::default()
+        };
+        // SPI_GETHIGHCONTRAST = 66；失败时按"非高对比度"处理（winit 也是同向的保守处理）
+        let ok = unsafe {
+            SystemParametersInfoW(SPI_GETHIGHCONTRAST, hc.cbSize, (&raw mut hc).cast(), 0)
+        };
+        ok != 0 && hc.dwFlags & HCF_HIGHCONTRASTON != 0
+    }
+
+    if high_contrast() {
+        return false;
+    }
+    uxtheme_dark().unwrap_or_else(registry_dark)
+}
+
+/// `uxtheme.dll` 序号 132 导出。取不到（老系统）返回 `None`。
+#[cfg(windows)]
+fn uxtheme_dark() -> Option<bool> {
+    use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
+
+    // ⚠ 按序号取，不是按名字：该导出无名。`132 as *const u8` 是 winit 同款用法
+    // （winit-0.30.13/src/platform_impl/windows/dark_mode.rs:141）。
+    const ORDINAL: usize = 132;
+    type ShouldAppsUseDarkMode = unsafe extern "system" fn() -> windows_sys::core::BOOL;
+
+    unsafe {
+        let module = LoadLibraryA(c"uxtheme.dll".as_ptr().cast());
+        if module.is_null() {
+            return None;
+        }
+        let proc = GetProcAddress(module, ORDINAL as *const u8)?;
+        // ⚠ 故意不 FreeLibrary：该模块是进程级单例，且进程存活期内我们会反复调用。
+        // 释放它会在下次调用时重新加载 —— 那是纯粹的浪费，不是严谨。
+        let f: ShouldAppsUseDarkMode = std::mem::transmute(proc);
+        Some(f() != 0)
+    }
+}
+
+/// 回落：直接读注册表。序号 132 取不到时才走这里。
+#[cfg(windows)]
+fn registry_dark() -> bool {
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY_CURRENT_USER, HKEY, KEY_READ,
+        REG_DWORD,
+    };
+
+    let sub: Vec<u16> = std::ffi::OsStr::new(PERSONALIZE_KEY)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let name: Vec<u16> = std::ffi::OsStr::new("AppsUseLightTheme")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    unsafe {
+        let mut hkey: HKEY = std::ptr::null_mut();
+        if RegOpenKeyExW(HKEY_CURRENT_USER, sub.as_ptr(), 0, KEY_READ, &mut hkey) != 0 {
+            return false; // 读不到就当浅色：暗色是本应用的"特殊外观"，不该是猜错的默认
+        }
+        let mut val: u32 = 1;
+        let mut size = std::mem::size_of::<u32>() as u32;
+        let mut ty = 0u32;
+        let r = RegQueryValueExW(
+            hkey,
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut ty,
+            (&raw mut val).cast(),
+            &mut size,
+        );
+        RegCloseKey(hkey);
+        // AppsUseLightTheme == 0 表示深色
+        r == 0 && ty == REG_DWORD && val == 0
+    }
+}
+
+/// 非 Windows：不作探测，一律浅色（GC-1 声明只在 Windows 上验证）。
+// ⚠ 过渡期抑制：与 Windows 侧同因 —— Task 6 的监视器是它的消费者，Task 9 一并删除。
+#[allow(dead_code)]
+#[cfg(not(windows))]
+pub fn system_dark() -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,10 +258,14 @@ mod tests {
 
     /// `Tokens` 全局里应当出现的 brush 令牌数量下限。
     ///
-    /// ⚠ 这个下限不是凑数：`parse_palette` 对没有 `<brush>` 标记的行是 `continue`（因为块内
-    /// 合法地存在 `<length>` / `<duration>` / `<float>` 行），于是**某一行的 `<brush>` 标记
-    /// 被误删时会静默少覆盖一个令牌**。下限把"静默漏掉"变成"测试失败"。取 `>=` 而非 `==`，
-    /// 这样以后新增令牌不会误报，而丢令牌一定会被抓到。
+    /// ⚠ 下限守的是"**某个令牌行被整行删掉**"这一情形：`parse_palette` 只认带 `<brush>` 的行
+    /// （块内合法地存在 `<length>` / `<duration>` / `<float>` 行，不能因为不是 brush 就报错），
+    /// 于是被删掉的行不留任何痕迹 —— 40 变 39，那个令牌就静默失去对比度覆盖。
+    /// 取 `>=` 而非 `==`：以后新增令牌不会误报，而丢令牌一定会被抓到。
+    ///
+    /// ⚠ 但**不要**把"某行的 `<brush>` 标记被写坏"算作本断言的功劳：那种写法（如 `<brushX>`）
+    /// 会让 Slint 编译器先报 `Unknown type`，根本走不到测试。所以本下限是**纵深防御**，
+    /// 不是唯一一道防线（Task 3+4 实测确认：改坏标记时 build.rs 直接 panic）。
     const MIN_BRUSH_TOKENS: usize = 40;
 
     /// 从 `ui/app.slint` 的 Tokens 全局解析每个 brush 令牌的（暗值, 浅值）。
@@ -197,7 +313,7 @@ mod tests {
         if out.len() < MIN_BRUSH_TOKENS {
             return Err(format!(
                 "只解析出 {} 个 brush 令牌，少于下限 {MIN_BRUSH_TOKENS} —— \
-                 多半是某行的 `<brush>` 标记被改了，那些令牌会静默失去覆盖",
+                 多半是某行的整行被删掉或被跳过，那个令牌会静默失去覆盖",
                 out.len()
             ));
         }
@@ -298,5 +414,15 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// ⚠ 这条**不能**断言具体值 —— 值取决于跑测试时系统的主题设置。
+    /// 它能抓住的是：FFI 不崩、不吃到空指针、两次调用自洽。
+    /// 序号写错或 `GetProcAddress` 结果被误用时，这里会直接段错误而不是返回。
+    #[test]
+    fn system_dark_is_callable_and_stable() {
+        let a = system_dark();
+        let b = system_dark();
+        assert_eq!(a, b, "同一时刻两次探测必须一致");
     }
 }

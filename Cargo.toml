@@ -13,6 +13,25 @@ ureq = "3.4"
 serde_json = "1"
 semver = "1"
 
+# 系统主题探测与变更监视。⚠ 钉在 0.61 —— 该版本已在 lock 里（winit 等 12 处
+# 依赖使用它），故不新增 crate。手写等价 FFI 要跨 3 个 DLL 且自己管 HKEY/HANDLE
+# 成对释放，每处都是测试抓不到的泄漏机会。
+#
+# ⚠ `Win32_Security` 是 `CreateEventW` 的**必需** feature，不是可选：
+# windows-sys 把签名里带 `SECURITY_ATTRIBUTES` 的函数整体 cfg 在它后面
+# （已核实 windows-sys-0.61.2/src/Windows/Win32/System/Threading/mod.rs）。
+# 少了它 `CreateEventW` 根本不存在，而事件对象是"无竞态武装通知"的前提。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Accessibility",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
 [build-dependencies]
 # 同上：编译期嵌入图片时同样要能解栅格格式。
 slint-build = { version = "1.18", features = ["image-default-formats"] }
