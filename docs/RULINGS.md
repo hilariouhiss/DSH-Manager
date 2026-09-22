@@ -748,6 +748,11 @@ Task 17 的 `set_pm_index` / `set_version_index` / `set_port_text` **再也推�
 高亮行会与实际 `selected_version` 不一致 —— FR-10/FR-11 的"下拉显示当前值"失效。
 - 措施：三处改 `<=>` 双向绑定，三个根属性改 `in-out`（生成的 Rust API 不变：`set_*` 保留，另加 `get_*`）。
 - 代价若错：无（双向绑定正是这两个控件需要的语义）。
+- **后续（2026-09-21）**：Fluent 的 `ComboBox` / `LineEdit` 已换成自绘的 `GlassSelect` /
+  `GlassField`（见 ARCHITECTURE §2.4.3）。**本条结论对替换后的组件同样成立** ——
+  `GlassSelect` 内部照样会自己写 `current-index`（选项被点中时），
+  `GlassField` 内部的 `TextInput` 照样会自己写 `text`。所以三处 `<=>`
+  双向绑定**必须保持**，换成单向绑定会重现本条描述的问题。
 
 ### Ruling 72 — 【Minor，真实；裁决：随 Task 16 处理，且必须**实测**】说明区正文在 `ScrollView` 里**水平居中**。
 

@@ -21,7 +21,10 @@
 //    · 不支持背景贴图平铺：颗粒噪点无法用图片实现，故以渐变代替。
 // ════════════════════════════════════════════════════════════════════════════
 
-import { Button, ComboBox, LineEdit, ListView, ScrollView, AboutSlint, Palette } from "std-widgets.slint";
+// ⚠ 这里只留**还在用**的。Fluent 的输入框与下拉框已被本文件的 GlassField /
+// GlassSelect 取代（见 3xx 行起）—— 它们的圆角/内边距/箭头/弹层全是写死的，
+// 改不动，只能自己画。ListView / ScrollView 保留：虚拟化不能丢。
+import { ListView, ScrollView, AboutSlint, Palette } from "std-widgets.slint";
 
 export enum NotesStatus { loading, ok, missing, failed }
 
@@ -35,6 +38,7 @@ global Tokens {
     out property <brush> shell:         #FFFFFF06; // 外碗底
     out property <brush> hairline:      #FFFFFF12; // 1px 结构线
     out property <brush> hairline-soft: #FFFFFF0A;
+    out property <brush> hairline-strong: #FFFFFF33; // 输入类控件的描边（小面积上结构线看不见）
     out property <brush> inner-light:   #FFFFFF0E; // 内胎顶缘高光
 
     out property <brush> ink:           #EDEDF2;  // 主文字
@@ -51,13 +55,43 @@ global Tokens {
     out property <brush> cta-bottom:    #D9D9E0;
     out property <brush> cta-ink:       #0A0A0D;
 
-    out property <brush> glow-accent:   #6EE7B759; // 光晕本体（靠 opacity 动画）
     out property <brush> glow-mint:     #6EE7B71F;
     out property <brush> glow-blue:     #7AA2F717;
     out property <length> r-lg: 22px;
     out property <length> r-md: 16px;
     out property <length> r-sm: 11px;
     out property <length> font-hero: 27px;
+
+    // ── 控制面：所有可点元素共用同一套填充，不允许各自写白百分比 ─────────────
+    // 收敛前散着 #FFFFFF08/0D/12/14/17/1F 六个值，四个按钮族各挑一个，
+    // 于是"同一档悬停"在四个地方是四种亮度。
+    out property <brush> fill:        #FFFFFF0D; // 静止
+    out property <brush> fill-hover:  #FFFFFF17; // 悬停
+    out property <brush> fill-active: #FFFFFF1F; // 按压 / 已展开
+
+    // ── 槽与浮层 ──────────────────────────────────────────────────────────
+    out property <brush> sunk:        #00000059; // 下凹槽底（输入框 / 下拉框）
+    out property <brush> solid:       #16161C;   // 浮层底：不透明，才压得住下层文字
+    out property <brush> overlay:     #000000B8; // 模态遮罩
+
+    // ── 强调色的四档（静止填充 / 悬停填充 / 描边 / 徽标底）──────────────────
+    out property <brush> accent-fill:       #6EE7B71A;
+    out property <brush> accent-fill-hover: #6EE7B72E;
+    out property <brush> accent-line:       #6EE7B747;
+    out property <brush> accent-soft:       #6EE7B712;
+    out property <brush> warn-soft:         #E3B34112;
+
+    out property <brush> danger:      #F07178;   // 错误（日志行）
+    out property <brush> lamp-off:    #4A4A57;   // 熄灭的状态灯：暗，但仍看得见那颗灯
+
+    // ── 动效与状态 ────────────────────────────────────────────────────────
+    // 三档时长：读数变色 400ms / 配色切换 200ms / 按压回弹 150ms。
+    // 收敛前是 160/200/260/300/400 五档，差别全在"当时顺手写了多少"。
+    out property <duration> motion-slow:  400ms;
+    out property <duration> motion-hover: 200ms;
+    out property <duration> motion-tap:   150ms;
+    /// 不可用元素整体压暗的统一档位（收敛前 0.30 / 0.34 两个值）。
+    out property <float> disabled: 0.35;
 }
 
 // ── 排版 ────────────────────────────────────────────────────────────────────
@@ -107,14 +141,13 @@ component PillButton inherits Rectangle {
     /// ⚠ `label` 此时**仍然必须传** —— 它是无障碍树里那个按钮的名字。
     in property <bool> icon-only: false;
     in property <bool> emphasis: false; // false = ghost / true = 主 CTA
-    in property <bool> quiet: false;    // 更弱的三级样式（页脚）
     in property <bool> interactive: true;
 
     callback clicked();
 
     min-height: 38px;
     min-width: icon-only ? 38px : (emphasis ? 132px : 0px);
-    opacity: interactive ? 1 : 0.34;
+    opacity: interactive ? 1 : Tokens.disabled;
 
     // ⚠ 文字被藏起来之后，子元素里再没有任何东西能给无障碍树当名字 ——
     // 屏幕阅读器只会念到一个"无名按钮"。所以显式给 role + label。
@@ -123,13 +156,13 @@ component PillButton inherits Rectangle {
 
     background: emphasis
         ? @linear-gradient(180deg, Tokens.cta-top 0%, Tokens.cta-bottom 100%)
-        : (quiet ? transparent : #FFFFFF0D);
+        : Tokens.fill;
     border-radius: self.height / 2; // 胶囊：半径永远等于半高
-    border-width: emphasis ? 0px : (quiet ? 0px : 1px);
+    border-width: emphasis ? 0px : 1px;
     border-color: Tokens.hairline;
 
-    animate background { duration: 260ms; easing: ease-out-quint; }
-    animate opacity    { duration: 300ms; easing: ease-out-quint; }
+    animate background { duration: Tokens.motion-hover; easing: ease-out-quint; }
+    animate opacity    { duration: Tokens.motion-hover; easing: ease-out-quint; }
 
     // ⚠ Slint 1.18 里可以动画的只有「属性」。不存在 `animate scale`，
     // 也不存在 `transform: [ translate-x: … ]` 字面量 —— 已核实编译器源码，
@@ -144,8 +177,8 @@ component PillButton inherits Rectangle {
         height: 100%;
         transform-scale-x: touch.pressed && root.interactive ? 0.97 : 1;
         transform-scale-y: touch.pressed && root.interactive ? 0.97 : 1;
-        animate transform-scale-x { duration: 150ms; easing: ease-out-back; }
-        animate transform-scale-y { duration: 150ms; easing: ease-out-back; }
+        animate transform-scale-x { duration: Tokens.motion-tap; easing: ease-out-back; }
+        animate transform-scale-y { duration: Tokens.motion-tap; easing: ease-out-back; }
 
         HorizontalLayout {
             padding-left: icon-only ? 0px : (emphasis ? 18px : 16px);
@@ -161,7 +194,7 @@ component PillButton inherits Rectangle {
             // 余地）、图标井仍占 26px，实测把图标从正中挤偏。`if` 是"根本不存在"，才不占位。
             if !root.icon-only : Text {
                 text: root.label;
-                color: emphasis ? Tokens.cta-ink : (quiet ? Tokens.ink-3 : Tokens.ink);
+                color: emphasis ? Tokens.cta-ink : Tokens.ink;
                 font-family: Font.text;
                 font-size: 12.5px;
                 font-weight: emphasis ? 600 : 500;
@@ -177,18 +210,20 @@ component PillButton inherits Rectangle {
                 width: 26px;
                 height: 26px;
                 border-radius: 13px;
+                // 井比按钮本体亮一档 —— 井在按钮**里面**，同亮度就"陷"没了；
+                // 强调按钮是白底，井改用减暗才看得出层次。
                 background: emphasis
                     ? (touch.has-hover ? #0000001F : #00000024)
-                    : (touch.has-hover ? #FFFFFF1F : #FFFFFF12);
-                animate background { duration: 260ms; easing: ease-out-quint; }
+                    : (touch.has-hover ? Tokens.fill-active : Tokens.fill-hover);
+                animate background { duration: Tokens.motion-hover; easing: ease-out-quint; }
 
                 Rectangle {
                     width: 14px;
                     height: 14px;
                     x: touch.has-hover && root.interactive ? 7px : 6px;
                     y: touch.has-hover && root.interactive ? 5px : 6px;
-                    animate x { duration: 320ms; easing: ease-out-quint; }
-                    animate y { duration: 320ms; easing: ease-out-quint; }
+                    animate x { duration: Tokens.motion-hover; easing: ease-out-quint; }
+                    animate y { duration: Tokens.motion-hover; easing: ease-out-quint; }
                     Image { width: 100%; height: 100%; source: root.glyph; }
                 }
             }
@@ -206,7 +241,7 @@ component PillButton inherits Rectangle {
         hover when touch.has-hover && root.interactive : {
             background: emphasis
                 ? @linear-gradient(180deg, #FFFFFF 0%, #E4E4EA 100%)
-                : (quiet ? #FFFFFF08 : #FFFFFF14);
+                : Tokens.fill-hover;
         }
     ]
 
@@ -225,23 +260,23 @@ component ChipButton inherits Rectangle {
     callback clicked();
 
     min-height: 32px;
-    opacity: interactive ? 1 : 0.3;
-    background: accent ? #6EE7B71A : #FFFFFF0D;
+    opacity: interactive ? 1 : Tokens.disabled;
+    background: accent ? Tokens.accent-fill : Tokens.fill;
     border-radius: self.height / 2;
     border-width: 1px;
-    border-color: accent ? #6EE7B747 : Tokens.hairline;
+    border-color: accent ? Tokens.accent-line : Tokens.hairline;
 
-    animate background { duration: 260ms; easing: ease-out-quint; }
-    animate opacity    { duration: 300ms; easing: ease-out-quint; }
+    animate background { duration: Tokens.motion-hover; easing: ease-out-quint; }
+    animate opacity    { duration: Tokens.motion-hover; easing: ease-out-quint; }
 
     // 同 PillButton：按压反馈靠内层的 transform-scale，不存在的 `scale` 属性不用。
     Rectangle {
         width: 100%;
         height: 100%;
-        transform-scale-x: touch.pressed && root.interactive ? 0.95 : 1;
-        transform-scale-y: touch.pressed && root.interactive ? 0.95 : 1;
-        animate transform-scale-x { duration: 150ms; easing: ease-out-back; }
-        animate transform-scale-y { duration: 150ms; easing: ease-out-back; }
+        transform-scale-x: touch.pressed && root.interactive ? 0.97 : 1;
+        transform-scale-y: touch.pressed && root.interactive ? 0.97 : 1;
+        animate transform-scale-x { duration: Tokens.motion-tap; easing: ease-out-back; }
+        animate transform-scale-y { duration: Tokens.motion-tap; easing: ease-out-back; }
 
         HorizontalLayout {
             padding-left: 15px;
@@ -254,14 +289,14 @@ component ChipButton inherits Rectangle {
                 font-size: 12px;
                 font-weight: 500;
                 vertical-alignment: center;
-                animate color { duration: 260ms; easing: ease-out-quint; }
+                animate color { duration: Tokens.motion-hover; easing: ease-out-quint; }
             }
         }
     }
 
     states [
         hover when touch.has-hover && root.interactive : {
-            background: root.accent ? #6EE7B72E : #FFFFFF17;
+            background: root.accent ? Tokens.accent-fill-hover : Tokens.fill-hover;
         }
     ]
 
@@ -269,6 +304,9 @@ component ChipButton inherits Rectangle {
 }
 
 // ── 眉标：微型大写标签 ──────────────────────────────────────────────────────
+// 用途**仅限**分区标题与元信息键（"输出" / "通道最新" / 关于对话框的键）。
+// ⚠ 不要拿它当字段标签用：它只有 9.5px，压在 12.5px 的字段文字旁边会显得
+// 字号差一大截、也不在同一个视觉高度上（用户报过这条）。字段标签用 FieldLabel。
 component Eyebrow inherits Text {
     font-family: Font.text;
     font-size: 9.5px;
@@ -276,6 +314,17 @@ component Eyebrow inherits Text {
     letter-spacing: 2px;
     color: Tokens.ink-4;
     vertical-alignment: center;
+}
+
+// ── 字段标签：表单里"标签在左、控件在右"的那个标签 ───────────────────────────
+// 与字段正文**同字号、同高度**（12.5px / 32px），层次只靠颜色区分
+// （标签 ink-3、值 ink），于是标签和框体是齐平的，不再是一小一大两个东西。
+component FieldLabel inherits Text {
+    font-family: Font.text;
+    font-size: 12.5px;
+    color: Tokens.ink-3;
+    vertical-alignment: center;
+    height: 32px;
 }
 
 // ── 状态徽标（通道 / 是否最新）─────────────────────────────────────────────
@@ -318,9 +367,13 @@ component MenuTitle inherits Rectangle {
 
     height: 26px;
     min-width: 0px;
-    background: open ? #FFFFFF17 : (touch.has-hover ? #FFFFFF0D : transparent);
-    border-radius: 8px;
-    animate background { duration: 200ms; easing: ease-out-quint; }
+    // ⚠ 圆角只有两种语言，别再加第三种：
+    //   · 动作按钮（PillButton / ChipButton）→ 胶囊（高度的一半）
+    //   · 菜单与字段（本组件 / MenuAction / MenuPanel / GlassField / GlassSelect）→ Tokens.r-sm
+    // 收敛前这里写死 8px，于是菜单标题、字段、面板三者三种圆角。
+    background: open ? Tokens.fill-active : (touch.has-hover ? Tokens.fill : transparent);
+    border-radius: Tokens.r-sm;
+    animate background { duration: Tokens.motion-hover; easing: ease-out-quint; }
 
     // 无障碍：菜单标题就是一个按钮（与 PillButton 同一套路数）。
     accessible-role: button;
@@ -345,13 +398,18 @@ component MenuTitle inherits Rectangle {
 
 // 下拉里的一行。宽度由下拉面板给（VerticalLayout 的交叉轴默认 stretch），
 // 文字靠左、整行可点 —— 与原生菜单一致。
+// ⚠ 两个地方共用它：应用菜单（MenuPanel）与 GlassSelect 的选项面板。
+// 这就是"下拉框统一"的落点 —— 菜单和下拉不可能再长得不一样。
 component MenuAction inherits Rectangle {
     in property <string> label: "";
+    /// 当前选中项（只被 GlassSelect 用；应用菜单里恒为 false）。
+    in property <bool> current: false;
     callback picked();
 
     height: 30px;
-    background: touch.has-hover ? #FFFFFF12 : transparent;
-    animate background { duration: 160ms; easing: ease-out-quint; }
+    border-radius: 6px;
+    background: touch.has-hover ? Tokens.fill-hover : (current ? Tokens.fill : transparent);
+    animate background { duration: Tokens.motion-hover; easing: ease-out-quint; }
 
     accessible-role: button;
     accessible-label: root.label;
@@ -363,30 +421,108 @@ component MenuAction inherits Rectangle {
         alignment: start;
         Text {
             text: root.label;
-            color: touch.has-hover ? Tokens.ink : Tokens.ink-2;
+            color: touch.has-hover || root.current ? Tokens.ink : Tokens.ink-2;
             font-family: Font.text;
             font-size: 12px;
             vertical-alignment: center;
-            animate color { duration: 160ms; easing: ease-out-quint; }
+            animate color { duration: Tokens.motion-hover; easing: ease-out-quint; }
         }
     }
 
     touch := TouchArea { clicked => { root.picked(); } }
 }
 
+// ── 浮层底（Flyout）─────────────────────────────────────────────────────────
+// 应用菜单的下拉面板与 GlassSelect 的选项面板共用这一层：
+// 不透明的 solid 才压得住下面的正文，r-sm 圆角 + hairline 是"玻璃"的边，
+// 投影让它看起来是浮起来的而不是贴上去的。
+component Flyout inherits Rectangle {
+    background: Tokens.solid;
+    border-radius: Tokens.r-sm;
+    border-width: 1px;
+    border-color: Tokens.hairline;
+    drop-shadow-blur: 16px;
+    drop-shadow-offset-y: 8px;
+    drop-shadow-color: #00000080;
+}
+
+// ── 1px 结构线 ──────────────────────────────────────────────────────────────
+// 抽出来是因为它被抄错过一次：操作卡里那根写成了没有 background 的裸
+// Rectangle，于是那条分隔线**根本不存在**（而别处都是 hairline-soft）。
+component Divider inherits Rectangle {
+    height: 1px;
+    background: Tokens.hairline-soft;
+}
+
+// ── 区块表头（卡片内部的段落标题）──────────────────────────────────────────
+// 服务卡的"输出"与说明卡的"更新说明 · 版本号"原先是两段各自手写的行，
+// 一行 24px、一行 30px。
+component SectionHeader inherits HorizontalLayout {
+    in property <string> label: "";
+    /// 标题右侧的次要读数（版本号）。空串 = 不占位。
+    /// ⚠ 必须用 if 而不是 visible：Slint 里不可见元素照样占布局位置。
+    in property <string> trailing: "";
+    height: 30px;
+    spacing: 8px;
+    alignment: center;
+
+    Eyebrow { text: root.label; }
+    if root.trailing != "" : Text {
+        text: root.trailing;
+        color: Tokens.ink-4;
+        font-family: Font.mono;
+        font-size: 10px;
+        vertical-alignment: center;
+    }
+}
+
+// ── 关闭按钮（三个对话框共用）──────────────────────────────────────────────
+// 原先三个对话框各抄了一份 26px 圆圈：三份都没有 hover 反馈，也没有按压反馈 ——
+// 鼠标移上去毫无反应。抽成一处后它们不可能再各自漂移。
+component CloseButton inherits Rectangle {
+    callback clicked();
+
+    accessible-role: button;
+    accessible-label: "关闭";
+    accessible-action-default => { root.clicked(); }
+
+    width: 26px;
+    height: 26px;
+    border-radius: 13px;
+    background: touch.has-hover ? Tokens.fill-hover : Tokens.fill;
+    border-width: 1px;
+    border-color: Tokens.hairline;
+
+    animate background { duration: Tokens.motion-hover; easing: ease-out-quint; }
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        transform-scale-x: touch.pressed ? 0.9 : 1;
+        transform-scale-y: touch.pressed ? 0.9 : 1;
+        animate transform-scale-x { duration: Tokens.motion-tap; easing: ease-out-back; }
+        animate transform-scale-y { duration: Tokens.motion-tap; easing: ease-out-back; }
+
+        Image {
+            width: 13px; height: 13px;
+            source: @image-url("icons/close.svg");
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+        }
+    }
+
+    touch := TouchArea { clicked => { root.clicked(); } }
+}
+
 // 下拉面板本体。
 // ⚠ 高度必须自己算：它是 Window 的绝对定位子元素，而 Rectangle 的 height 默认
 // 取**父元素**高度 —— 不写就会从菜单栏一直通到窗口底部（实测踩过，截图上是一根
 // 长条）。高度 = 上下 padding 6*2 + 每项 30 + 项间 2。
-component MenuPanel inherits Rectangle {
+component MenuPanel inherits Flyout {
     in property <int> item-count: 1;
 
     width: 148px;
     height: 12px + item-count * 30px + (item-count - 1) * 2px;
-    background: #16161C;
-    border-radius: Tokens.r-sm;
-    border-width: 1px;
-    border-color: Tokens.hairline;
 
     VerticalLayout {
         padding: 6px;
@@ -418,9 +554,9 @@ component CheckRow inherits Rectangle {
             border-radius: 4px;
             background: checked ? Tokens.accent : transparent;
             border-width: 1px;
-            border-color: checked ? Tokens.accent : #FFFFFF33;
-            animate background { duration: 200ms; easing: ease-out-quint; }
-            animate border-color { duration: 200ms; easing: ease-out-quint; }
+            border-color: checked ? Tokens.accent : Tokens.hairline-strong;
+            animate background { duration: Tokens.motion-hover; easing: ease-out-quint; }
+            animate border-color { duration: Tokens.motion-hover; easing: ease-out-quint; }
             // ⚠ x/y 绝对定位在这里是允许的：父元素是 Rectangle（不是布局元素）。
             Image {
                 visible: root.checked;
@@ -515,12 +651,20 @@ component Bezel inherits Rectangle {
 //     （见 i-slint-compiler 的 layout.rs:allow_in_layout），该格宽度算成 0
 //   正文包 Rectangle 配 horizontal-stretch → Rectangle 拿不到拉伸，只有内容宽
 //
-// ⚠ 已知局限（诚实记录，未解决）：条目宽度由内容决定，而 ListView 会把
-// 内容尺寸的条目**水平居中**，所以单行日志目前悬在面板中间，而不是贴左。
-// 根因是 ListView 的 @children 落在内部 Flickable 里，Flickable 不会把子元素
-// 拉伸到视口宽度；而任何试图表达"条目宽度 = 视口宽度"的绑定都会与
-// content-width 形成环。升级路径：升级 Slint 后改用带 item-width 的列表，
-// 或自行用 Repeater + 固定行高实现滚动。左侧 2px 语义色条同理暂缓。
+// ⚠ 左对齐的解法（原先记为"未解决"，这里解掉了）：
+// 根因是条目**隐式宽度**（由内容定）会被 Flickable 居中。所以别跟隐式宽度较劲 ——
+// 给条目根一个**显式** `width: 100%`（= 父 Flickable 的视口宽），环就断了：
+//   条目宽 = 100% 父宽（显式，不反推） → 内容宽不再由子元素决定 → 无环
+// 再给 Text 写死 `x: 0` —— 非布局子元素默认在父元素里**居中**，
+// 不写这一行，文字会在一整行宽的条目里居中，看起来跟没修一样。两条缺一不可。
+//
+// ⚠ 与 RULINGS.md Ruling 72 的关系：那条说 "`width: 100%` 对直接的 flickable
+// 子元素也不够"。**在 StyledText 上它确实不够**（Ruling 72 的对象是隐式尺寸的
+// StyledText）。但同一个旋钮在这个条目上**实测有效**，两者的区别是根元素：
+// 这里是 Rectangle 配显式 width，不是隐式尺寸的叶子元素。
+// 实测（target/shot-before.png vs shot-step1.png，逐行扫亮像素）：
+//   修前三行文字左边缘 183 / 147 / 92（各按自己的宽度居中）
+//   修后三行 39 / 38 / 38 —— 与卡片内容框左边缘（x=38）齐平
 component LogLine inherits Rectangle {
     in property <string> raw-line: "";
     in property <bool> is-cmd:  raw-line.starts-with("$ ");
@@ -528,19 +672,282 @@ component LogLine inherits Rectangle {
     in property <bool> is-err:  raw-line.starts-with("ER:");
     in property <bool> is-warn: raw-line.starts-with("WR:");
 
+    width: 100%;
     height: 20px;
     background: transparent;
 
     Text {
+        x: 0;
         text: root.raw-line.replace-all("$ ", "").replace-all("✓ ", "").replace-all("ER:", "").replace-all("WR:", "");
         color: root.is-cmd ? Tokens.accent-ink
-             : root.is-err ? #F07178
+             : root.is-err ? Tokens.danger
              : root.is-ok ? Tokens.good
              : root.is-warn ? Tokens.warn
              : Tokens.ink-3;
         font-family: Font.mono;
         font-size: 11px;
         vertical-alignment: center;
+    }
+}
+
+// ── 玻璃输入框（取代 Fluent 的 LineEdit）────────────────────────────────────
+// 为什么自己画：Fluent 的 LineEdit 把 `min-width: max(160px, …)`、
+// `min-height: max(32px, …)`、4px 圆角、浅色底和自己的描边**全写死在组件体里**
+// （i-slint-compiler-1.18.0/widgets/fluent/lineedit.slint），而 fluent 的 Palette
+// 属性全是 `out`（只读）—— 改不动，只能在外面套框挡。挡出来的结果是
+// "外圆角 11px 套内圆角 4px"的双弧线，截图上一眼可见。
+// 这里直接在核心元素 TextInput 上起一层自己的壳，圆角/描边/字号全走同一套令牌。
+//
+// ⚠ 与 Fluent LineEdit 的**功能差异**（有意的，不是漏了）：
+//   右键菜单只做「复制 / 粘贴 / 全选」。本程序唯一的调用点是 4 位端口号，
+//   撤销 / 重做 / 剪切在那个场景没有意义。Ctrl+C/V/X 由 TextInput 自己处理，不受影响。
+component GlassField inherits Rectangle {
+    in-out property <string> text;
+    in property <string> placeholder-text: "";
+    in property <bool> enabled: true;
+    in property <TextHorizontalAlignment> text-align: center;
+    in property <string> font-family: Font.mono;
+    in property <length> font-size: 12.5px;
+
+    callback edited(string);
+
+    height: 32px;
+    background: Tokens.sunk;
+    border-radius: Tokens.r-sm;
+    border-width: 1px;
+    // 聚焦时整圈换成强调色 —— 键盘用户得看得见焦点落在哪。
+    border-color: input.has-focus ? Tokens.accent : Tokens.hairline-strong;
+    opacity: enabled ? 1 : Tokens.disabled;
+    animate border-color { duration: Tokens.motion-hover; easing: ease-out-quint; }
+
+    // 无障碍：壳负责对外报身份，内部的 TextInput 关掉自己那套（同 Fluent LineEditBase 的做法），
+    // 否则读屏会把同一个输入框念两遍。
+    accessible-role: text-input;
+    accessible-label: root.placeholder-text;
+    accessible-value <=> text;
+    accessible-enabled: root.enabled;
+    accessible-action-set-value(v) => { root.text = v; root.edited(v); }
+
+    // 输入区。
+    // ⚠ 这里**不需要**再套 FocusScope / TouchArea 去抢焦点：`TextInput` 在指针按下时
+    // 自己就会取焦点（i-slint-core `items/text.rs` 的 `ensure_focus_and_ime`），
+    // 实测点进去就有光标、能直接打字（喂 4 位端口号 → state.json 的 preferred_port
+    // 真的被改写，说明 edited → port-changed → Rust 这条链是通的）。
+    // 右键菜单那块 `ContextMenuArea` 铺满整个字段，但它只吃右键 —— 实测它压在
+    // TextInput 上层时左键照样进得去，所以不必像 Fluent 那样把它写成容器。
+    // 内缩 9px：壳自带 1px 描边，文字不能贴着它。
+    input := TextInput {
+        x: 9px;
+        y: 0px;
+        width: parent.width - 18px;
+        height: parent.height;
+        text <=> root.text;
+        enabled: root.enabled;
+        single-line: true;
+        horizontal-alignment: root.text-align;
+        vertical-alignment: center;
+        color: Tokens.ink;
+        selection-background-color: Tokens.accent-line;
+        selection-foreground-color: Tokens.ink;
+        font-family: root.font-family;
+        font-size: root.font-size;
+        accessible-role: none;
+
+        // ⚠ TextInput 的 edited 回调是**无参**的（Slint 1.18），文本要从 self.text 读
+        // —— 写成 `edited(t)` 会报 "only has 0 arguments"。
+        edited => { root.edited(self.text); }
+    }
+
+    // 占位符：TextInput 自己不画，得叠一层 Text（Fluent 的 LineEdit 也是这么做的）。
+    // ⚠ 要连 preedit-text 一起判空 —— 中文输入法正在拼字时 text 还是空的，
+    // 只看 text 会让占位符跟候选字叠在一起。
+    if root.text == "" && input.preedit-text == "" : Text {
+        x: 9px;
+        width: parent.width - 18px;
+        height: parent.height;
+        text: root.placeholder-text;
+        color: Tokens.ink-4;
+        font-family: root.font-family;
+        font-size: root.font-size;
+        horizontal-alignment: root.text-align;
+        vertical-alignment: center;
+        accessible-role: none;
+    }
+
+    ContextMenuArea {
+        enabled: root.enabled;
+        Menu {
+            MenuItem { title: "复制"; enabled: !root.text.is-empty; activated => { input.copy(); } }
+            MenuItem { title: "粘贴"; enabled: root.enabled; activated => { input.paste(); } }
+            MenuItem { title: "全选"; enabled: !root.text.is-empty; activated => { input.select-all(); } }
+        }
+    }
+}
+
+// ── 玻璃下拉框（取代 Fluent 的 ComboBox）────────────────────────────────────
+// 与 GlassField 同一个壳，右侧挂一枚本项目自己的箭头（icons/chevron-down.svg）。
+// 为什么自己画：Fluent ComboBox 的 3px 圆角、11px 内边距、自带箭头
+// （_dropdown.svg）、`min-width: max(160px, …)` 全部写死在组件体里，
+// 两个调用点都被迫写 `min-width: 0px; height: 30px` 去压它。
+//
+// 弹层用核心元素 PopupWindow —— 它就是 Fluent ComboBox 用的那一个（独立窗口，
+// 能溢出主窗口边界、自带"点外面就关"、x/y 由运行时换算成绝对坐标），
+// 但内容 100% 由本文件画：面板底 = Flyout，选项行 = MenuAction，
+// 于是**菜单和下拉框不可能再长得不一样**（同一枚行组件）。
+component GlassSelect inherits Rectangle {
+    in property <[string]> model: [];
+    in-out property <int> current-index: 0;
+    in property <bool> enabled: true;
+
+    callback selected(int);
+
+    /// 最多露出几行，超出就滚动 —— 版本列表是 npm registry 的全量版本，会长。
+    private property <int> max-visible: 6;
+    private property <int> visible-count: min(model.length, max-visible);
+    /// 越界（模型变短 / 还没选过）时给空串，不要让下拉显示成空白脏值。
+    private property <string> current-value:
+        (current-index >= 0 && current-index < model.length) ? model[current-index] : "";
+
+    height: 32px;
+    // ⚠ 下拉框**不是**输入框，两者必须一眼分得开：
+    //   · 输入框（GlassField）= 下凹的槽（`sunk` 更暗 + `hairline-strong` 描边）→ "这里有光标，能打字"
+    //   · 下拉框（本组件）  = 凸起的控件面（`fill` 与按钮同一档 + `hairline` 描边 + 悬停提亮）
+    //     → "这里是个按钮，按下去出列表"
+    // 两边都沿用同一套令牌，所以这仍然是一套语言里的两种角色，而不是两种风格。
+    background: touch.has-hover && root.enabled ? Tokens.fill-hover : Tokens.fill;
+    border-radius: Tokens.r-sm;
+    border-width: 1px;
+    // 展开时和聚焦时同样亮起（is-open 由运行时维护，正是为"下拉开着"设计的）
+    border-color: (popup.is-open || keys.has-focus) ? Tokens.accent : Tokens.hairline;
+    opacity: enabled ? 1 : Tokens.disabled;
+    animate background { duration: Tokens.motion-hover; easing: ease-out-quint; }
+    animate border-color { duration: Tokens.motion-hover; easing: ease-out-quint; }
+
+    accessible-role: combobox;
+    accessible-enabled: root.enabled;
+    accessible-expandable: true;
+    accessible-expanded: popup.is-open;
+    accessible-value: root.current-value;
+    accessible-action-expand => { if root.model.length > 0 { popup.show(); } }
+
+    // 上移 / 下移选中项。到顶到底就不再重复触发 selected ——
+    // 每次按键都回调一次会让 Rust 侧白跑一轮重投影。
+    function move(delta: int) {
+        if (root.model.length == 0) { return; }
+        let next = (root.current-index + delta).clamp(0, root.model.length - 1);
+        if (next == root.current-index) { return; }
+        root.current-index = next;
+        root.selected(next);
+    }
+
+    HorizontalLayout {
+        padding-left: 11px;
+        padding-right: 11px;
+        spacing: 8px;
+        alignment: start;
+        // ⚠ 必须显式写 center：cross-axis 的默认值是 stretch，而箭头尺寸是写死的
+        // —— 不写这一行，那枚 12px 箭头会被顶到 32px 字段的**上沿**，
+        // 看起来是"挂在文字结尾的右上角"而不是贴着框体末尾（同一坑见 PillButton）。
+        cross-axis-alignment: center;
+        Text {
+            text: root.current-value;
+            color: Tokens.ink;
+            font-family: Font.text;
+            font-size: 12.5px;
+            vertical-alignment: center;
+            horizontal-alignment: left;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
+        Image {
+            width: 12px;
+            height: 12px;
+            source: @image-url("icons/chevron-down.svg");
+            // 展开时翻个个儿：箭头会说话，就不必再加一行文字说明状态
+            transform-rotation: popup.is-open ? -180deg : 0deg;
+            animate transform-rotation { duration: Tokens.motion-hover; easing: ease-out-quint; }
+        }
+    }
+
+    keys := FocusScope {
+        x: 0px;
+        y: 0px;
+        width: 100%;
+        height: 100%;
+        key-pressed(event) => {
+            if (!root.enabled) { return reject; }
+            if (event.text == Key.DownArrow) { root.move(1); return accept; }
+            if (event.text == Key.UpArrow) { root.move(-1); return accept; }
+            if (event.text == Key.Return) { popup.show(); return accept; }
+            return reject;
+        }
+        touch := TouchArea {
+            enabled: root.enabled;
+            clicked => { keys.focus(); if (root.model.length > 0) { popup.show(); } }
+        }
+    }
+
+    // ⚠ 不要在这里写 `init => { self.focus(); }`：弹层是在启动时就建好的独立
+    // 组件，init 抢焦点会让程序一打开就把焦点从主窗口夺走。Fluent 的 ComboBox
+    // 同样只靠 forward-focus 把焦点在**弹出时**引过去。
+    popup := PopupWindow {
+        x: 0px;
+        // 往下让 6px：贴着字段底边的话，弹层投影会糊在字段自己的描边上
+        y: root.height + 6px;
+        width: root.width;
+        // 高度 = 面板上下 padding 4*2 + 行高 30 * 行数 + 行间 2 * (行数 - 1)
+        height: 8px + visible-count * 30px + (visible-count - 1) * 2px;
+        close-policy: close-on-click-outside;
+        forward-focus: popup-keys;
+
+        Flyout {
+            width: 100%;
+            height: 100%;
+
+            popup-keys := FocusScope {
+                x: 0px;
+                y: 0px;
+                width: 100%;
+                height: 100%;
+                key-pressed(event) => {
+                    if (event.text == Key.DownArrow) { root.move(1); return accept; }
+                    if (event.text == Key.UpArrow) { root.move(-1); return accept; }
+                    if (event.text == Key.Return || event.text == Key.Escape) { popup.close(); return accept; }
+                    return reject;
+                }
+            }
+
+            // ⚠ 用核心 Flickable 而不是 std 的 ScrollView：后者那根滚动条是 Fluent
+            // 画死的（14px 宽、悬停还冒出上下箭头按钮），拿不掉。短列表（≤6 行）时
+            // 内容不超出视口，这里就是个不滚动的容器。
+            Flickable {
+                x: 1px;
+                y: 1px;
+                width: parent.width - 2px;
+                height: parent.height - 2px;
+                // 打开时先滚到**当前选中项**那一行 —— Fluent 的 ComboBox 就是这么做的
+                // （popup-scroll-y）。少了这一行，选中第 20 个版本再打开下拉，看到的是
+                // 前 6 行、高亮那一项在视口外，等于把"当前是哪个"藏了起来。
+                // 行高 30 + 行间 2 = 32px。
+                // ⚠ 已知特性（实测）：用户一滚轮，Flickable 会自己接管 content-y，
+                // 这条声明式绑定就失效了 —— 此后本轮程序里下拉都停在用户滚到的位置。
+                // Fluent 的 ComboBox 用的是同一套写法，行为一致，不是这里独有的坑。
+                content-y: -max(0, root.current-index - root.visible-count + 1) * 32px;
+                VerticalLayout {
+                    padding: 4px;
+                    spacing: 2px;
+                    for value[index] in root.model : MenuAction {
+                        label: value;
+                        current: index == root.current-index;
+                        picked => {
+                            root.current-index = index;
+                            popup.close();
+                            root.selected(index);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -676,9 +1083,9 @@ export component MainWindow inherits Window {
     property <bool> notes-loading: root.notes-status == NotesStatus.loading;
 
     // ═══ 氛围层（固定、不参与命中测试）═══
-    Orb { width: 560px; height: 560px; x: -180px; y: -220px; tint: #6EE7B71A; }
-    Orb { width: 640px; height: 640px; x: parent.width - 420px; y: 40px; tint: #7AA2F717; }
-    Orb { width: 520px; height: 520px; x: 140px; y: parent.height - 300px; tint: #6EE7B714; }
+    Orb { width: 560px; height: 560px; x: -180px; y: -220px; tint: Tokens.glow-mint; }
+    Orb { width: 640px; height: 640px; x: parent.width - 420px; y: 40px; tint: Tokens.glow-blue; }
+    Orb { width: 520px; height: 520px; x: 140px; y: parent.height - 300px; tint: Tokens.glow-mint; }
     // 顶部一线极淡的竖直渐变，让"顶光"方向与所有内高光一致
     Rectangle {
         width: 100%; height: 120px;
@@ -735,7 +1142,7 @@ export component MainWindow inherits Window {
 
                 // 版本主卡：数字是唯一的主角
                 Bezel {
-                    core-padding: 14px;
+                    core-padding: 16px;
                     spacing: 0px;
 
                     // 大字号读数。用等宽字体 + tabular 数字，版本号换位时不跳动。
@@ -747,7 +1154,7 @@ export component MainWindow inherits Window {
                         font-weight: 600;
                         letter-spacing: -1.2px;
                         wrap: no-wrap;
-                        animate color { duration: 400ms; easing: ease-out-quint; }
+                        animate color { duration: Tokens.motion-slow; easing: ease-out-quint; }
                     }
                     Rectangle { height: 9px; }
 
@@ -759,13 +1166,13 @@ export component MainWindow inherits Window {
                             visible: root.version-known && root.up-to-date;
                             label: "已是最新";
                             tint: Tokens.accent;
-                            fill: #6EE7B712;
+                            fill: Tokens.accent-soft;
                         }
                         Tag {
                             visible: root.version-known && !root.up-to-date;
                             label: "可更新";
                             tint: Tokens.warn;
-                            fill: #E3B34112;
+                            fill: Tokens.warn-soft;
                         }
                         Tag {
                             visible: root.probing;
@@ -791,7 +1198,7 @@ export component MainWindow inherits Window {
                     }
 
                     Rectangle { height: 10px; }
-                    Rectangle { height: 1px; background: Tokens.hairline-soft; }
+                    Divider { }
                     Rectangle { height: 9px; }
 
                     HorizontalLayout {
@@ -833,19 +1240,16 @@ export component MainWindow inherits Window {
                     // 两行左边缘就都从同一条线开始（下拉吃掉剩下的宽度）。
                     HorizontalLayout {
                         spacing: 10px;
-                        Eyebrow { text: "包管理"; width: 62px; }
-                        // ⚠ 必须钉死高度与最小宽度：Fluent ComboBox 自带
-                        // `min-width: max(160px, layout.min-height)` 与
-                        // `min-height: max(32px, …)`，实测它渲染成 62px 高、
-                        // 远宽于 160px，把同行标签挤成两截、卡片高度算飞。
-                        ComboBox {
+                        FieldLabel { text: "包管理"; width: 62px; }
+                        // ✅ 这里原先钉着 `height: 30px; min-width: 0px` 两条 hack，
+                        // 用来压住 Fluent ComboBox 自带的 `min-width: max(160px, …)`
+                        // 与 `min-height: max(32px, …)`。换成自己的组件后它们没有理由存在。
+                        GlassSelect {
                             horizontal-stretch: 1;
-                            height: 30px;
-                            min-width: 0px;
                             model: root.pm-options;
                             current-index <=> root.pm-index;
                             enabled: !root.busy;
-                            selected(v) => { root.pm-changed(self.current-index); }
+                            selected(i) => { root.pm-changed(i); }
                         }
                         // "dsh 装在这台机器的哪个 PM 上"原先挤在下拉的选中文字里
                         // （npm  ·  dsh 安装于此），把下拉本身撑得很长；改到行尾，
@@ -862,15 +1266,13 @@ export component MainWindow inherits Window {
                     }
                     HorizontalLayout {
                         spacing: 10px;
-                        Eyebrow { text: "目标版本"; width: 62px; }
-                        ComboBox {
+                        FieldLabel { text: "目标版本"; width: 62px; }
+                        GlassSelect {
                             horizontal-stretch: 1;
-                            height: 30px;
-                            min-width: 0px;
                             model: root.version-options;
                             current-index <=> root.version-index;
                             enabled: !root.busy;
-                            selected(v) => { root.version-changed(self.current-index); }
+                            selected(i) => { root.version-changed(i); }
                         }
                         // "← 当前"原先拼在下拉的选项文字里（把下拉撑长、还跟着走），
                         // 现在和包管理行的"DSH 在此！"一样落在行尾，且只在
@@ -886,7 +1288,9 @@ export component MainWindow inherits Window {
                         }
                     }
 
-                    Rectangle { height: 1px; }
+                    // ⚠ 这是分隔线，不是空行 —— 原先写成没有 background 的裸
+                    // Rectangle，于是这条线**根本不存在**（服务卡同位置是真线）。
+                    Divider { }
                     HorizontalLayout {
                         spacing: 9px;
                         // 两个字面按钮都只剩图标（图标本身已经说明动作），
@@ -933,12 +1337,16 @@ export component MainWindow inherits Window {
                     VerticalLayout {
                         spacing: 14px;
 
+                        // ⚠ 这两行**不要**写 alignment: center。
+                        // 收敛前它们是居中的，而同一张卡里的日志列表是左对齐的，
+                        // 于是同一张卡内两种对齐并存（另外三张卡的内容一律从内容框左边缘
+                        // 起排，操作卡的注释里也写着同一条规则）。现在的读法全卡统一：
+                        // **读数从左边起，尾随动作靠右收口**。
                         HorizontalLayout {
                             spacing: 10px;
-                            alignment: center;
                             StatusDot {
                                 lamp: root.web-starting ? Tokens.warn
-                                    : (root.web-running ? Tokens.accent : #4A4A57);
+                                    : (root.web-running ? Tokens.accent : Tokens.lamp-off);
                                 // 停止时不留光晕：一颗暗灯不该发光
                                 halo: root.web-running || root.web-starting;
                             }
@@ -963,37 +1371,19 @@ export component MainWindow inherits Window {
 
                         HorizontalLayout {
                             spacing: 9px;
-                            alignment: center;
-                            Eyebrow { text: "端口"; }
-                            Rectangle {
-                                width: 74px; height: 32px;
-                                border-radius: Tokens.r-sm;
-                                background: #00000059;
-                                border-width: 1px;
-                                border-color: Tokens.hairline;
-                                // ⚠ 必须用一层布局托住 LineEdit，两个坑一起解决：
-                                //   ① Fluent 的 LineEdit 自带 `min-width: max(160px, …)`。
-                                //      直接放在这个 74px 的外框里，它**不会**被裁 ——
-                                //      实测它渲染成 160×32，往右溢出 86px，把自带的浅色底
-                                //      与边框糊在"启动"按钮上（用户报的"白色遮罩侵入
-                                //      启动按钮"就是这个）；
-                                //   ② 光写 `min-width: 0px` 也不行：它会缩成内容宽
-                                //      （4 位端口号 ≈28px）并在外框里居中，正文被裁成一条。
-                                // 布局的交叉轴默认 stretch，会把子元素拉到布局自己的宽高，
-                                // 于是 LineEdit 正好铺满外框、文字居中、不再越界。
-                                VerticalLayout {
-                                    padding-left: 3px;
-                                    padding-right: 3px;
-                                    LineEdit {
-                                        min-width: 0px;
-                                        text <=> root.port-text;
-                                        enabled: !root.busy;
-                                        horizontal-alignment: center;
-                                        font-family: Font.mono;
-                                        font-size: 12.5px;
-                                        edited(t) => { root.port-changed(t); }
-                                    }
-                                }
+                            FieldLabel { text: "端口"; }
+                            // 一个 GlassField 就位。
+                            // 收敛前这里是三层：74px 外框 + 内层 VerticalLayout +
+                            // 两条 3px padding —— 全部是为了挡住 Fluent LineEdit 那个
+                            // `min-width: max(160px, …)`（不挡就往右溢出 86px，把自带的
+                            // 浅色底糊在"启动"按钮上）。自己画的组件宽度就是宽度，
+                            // 三层收成一层，连那条 hack 注释一起删掉了。
+                            GlassField {
+                                width: 74px;
+                                text <=> root.port-text;
+                                enabled: !root.busy;
+                                placeholder-text: "3080";
+                                edited(t) => { root.port-changed(t); }
                             }
                             Rectangle { horizontal-stretch: 1; }
                             // 三个服务动作改成图标按钮（原先是"启动/停止/打开"文字胶囊）。
@@ -1033,16 +1423,8 @@ export component MainWindow inherits Window {
                         // "输出"是这块区域（探测 / 安装事务 / dsh web 启停）干出来的东西，
                         // 挨着它看才有因果。
                         // ⚠ 右栏因此整个让给更新说明（长文阅读需要整列宽度与高度）。
-                        Rectangle { height: 1px; background: Tokens.hairline-soft; }
-                        HorizontalLayout {
-                            height: 24px;
-                            alignment: center;
-                            Eyebrow {
-                                text: "输出";
-                                // 居中：即使这一格被布局撑宽，字形也留在格子中间
-                                horizontal-alignment: center;
-                            }
-                        }
+                        Divider { }
+                        SectionHeader { label: "输出"; }
                         // ⚠ 【不要】用 ScrollView 包 ListView。ListView 自己就会滚动；
                         // 套一层 ScrollView 会让它按内容全高布局，从而破坏虚拟化 ——
                         // 日志上限 2000 行（GC-12），那就等于一次渲染 2000 个 Text。
@@ -1103,26 +1485,17 @@ export component MainWindow inherits Window {
                     vertical-stretch: 1;
                     // 独占整列后下限提一点：这是唯一的长文区，窗口再矮也别压成一条缝。
                     min-height: 260px;
-                    HorizontalLayout {
-                        height: 30px;
-                        spacing: 8px;
-                        alignment: center;
-                        Eyebrow {
-                            text: "更新说明" + (
-                                root.notes-status == NotesStatus.missing ? " · 该版本无更新说明" :
-                                root.notes-status == NotesStatus.loading ? " · 加载中…" :
-                                root.notes-status == NotesStatus.failed  ? " · 加载失败" : ""
-                            );
-                        }
-                        Text {
-                            visible: root.has-notes;
-                            text: root.version-index >= 0 && root.version-index < root.version-options.length
-                                ? root.version-options[root.version-index] : "";
-                            color: Tokens.ink-4;
-                            font-family: Font.mono;
-                            font-size: 10px;
-                            vertical-alignment: center;
-                        }
+                    SectionHeader {
+                        label: "更新说明" + (
+                            root.notes-status == NotesStatus.missing ? " · 该版本无更新说明" :
+                            root.notes-status == NotesStatus.loading ? " · 加载中…" :
+                            root.notes-status == NotesStatus.failed  ? " · 加载失败" : ""
+                        );
+                        // ⚠ 空串即不占位：原先用 visible 控制，而 Slint 里不可见元素
+                        // 照样占着它那格宽度（等宽字体的字距也算），标题会被推偏。
+                        trailing: root.has-notes && root.version-index >= 0
+                                  && root.version-index < root.version-options.length
+                                  ? root.version-options[root.version-index] : "";
                     }
                     // ⚠ 这三段内容必须用 `if` 而不是 `visible:` —— Slint 里**不可见的元素
                     // 照样占布局位置**：骨架屏（4 行 × 11px + 3 × 9px 间距 ≈ 71px）与空状态
@@ -1200,7 +1573,7 @@ export component MainWindow inherits Window {
             StatusDot {
                 lamp: root.busy ? Tokens.warn
                     : (root.web-starting ? Tokens.warn
-                    : (root.web-running ? Tokens.accent : #4A4A57));
+                    : (root.web-running ? Tokens.accent : Tokens.lamp-off));
                 halo: root.busy || root.web-running || root.web-starting;
             }
             Text {
@@ -1212,7 +1585,7 @@ export component MainWindow inherits Window {
                 font-family: Font.text;
                 font-size: 11.5px;
                 vertical-alignment: center;
-                animate color { duration: 300ms; easing: ease-out-quint; }
+                animate color { duration: Tokens.motion-slow; easing: ease-out-quint; }
             }
         }
     }
@@ -1260,7 +1633,7 @@ export component MainWindow inherits Window {
     // ═══════════════════════════ 关于（FR-29）═══════════════════════════
     // GC-10 / CON-8：AboutSlint 是 Slint 免版税许可的**强制署名义务**，不可删。
     if root.about-visible : Rectangle {
-        background: #000000B8;
+        background: Tokens.overlay;
         // 遮罩必须吃掉点击，否则会穿透到后面的按钮
         TouchArea { clicked => { root.about-visible = false; } }
         // Esc 关闭：模态的唯一无鼠标出口
@@ -1298,18 +1671,7 @@ export component MainWindow inherits Window {
                             vertical-alignment: center;
                         }
                         Rectangle { horizontal-stretch: 1; }
-                        Rectangle {
-                            width: 26px; height: 26px; border-radius: 13px;
-                            background: #FFFFFF0D;
-                            border-width: 1px; border-color: Tokens.hairline;
-                            Image {
-                                width: 13px; height: 13px;
-                                source: @image-url("icons/close.svg");
-                                x: (parent.width - self.width) / 2;
-                                y: (parent.height - self.height) / 2;
-                            }
-                            TouchArea { clicked => { root.about-visible = false; } }
-                        }
+                        CloseButton { clicked => { root.about-visible = false; } }
                     }
                     Rectangle { height: 4px; }
                     Text {
@@ -1319,7 +1681,7 @@ export component MainWindow inherits Window {
                         font-size: 11.5px;
                     }
                     Rectangle { height: 18px; }
-                    Rectangle { height: 1px; background: Tokens.hairline-soft; }
+                    Divider { }
                     Rectangle { height: 16px; }
 
                     VerticalLayout {
@@ -1331,7 +1693,7 @@ export component MainWindow inherits Window {
                     }
 
                     Rectangle { height: 18px; }
-                    Rectangle { height: 1px; background: Tokens.hairline-soft; }
+                    Divider { }
                     Rectangle { height: 16px; }
 
                     HorizontalLayout {
@@ -1346,7 +1708,7 @@ export component MainWindow inherits Window {
     // 目前只有一项（关闭行为）。做成一个独立面板而不是往主界面再塞一行控件，
     // 是因为状态栏那排按钮是"窗口级动作"，而设置是"程序级配置"，两者不该并排。
     if root.settings-visible : Rectangle {
-        background: #000000B8;
+        background: Tokens.overlay;
         TouchArea { clicked => { root.settings-visible = false; } }
         // ⚠ 空壳 FocusScope 必须自己抢焦点：默认只有"被点到"才会获得焦点
         // （focus-on-click），而这里没有任何可点的内容 —— 不写这一行，Esc 是死的
@@ -1379,21 +1741,10 @@ export component MainWindow inherits Window {
                         vertical-alignment: center;
                     }
                     Rectangle { horizontal-stretch: 1; }
-                    Rectangle {
-                        width: 26px; height: 26px; border-radius: 13px;
-                        background: #FFFFFF0D;
-                        border-width: 1px; border-color: Tokens.hairline;
-                        Image {
-                            width: 13px; height: 13px;
-                            source: @image-url("icons/close.svg");
-                            x: (parent.width - self.width) / 2;
-                            y: (parent.height - self.height) / 2;
-                        }
-                        TouchArea { clicked => { root.settings-visible = false; } }
-                    }
+                    CloseButton { clicked => { root.settings-visible = false; } }
                 }
                 Rectangle { height: 18px; }
-                Rectangle { height: 1px; background: Tokens.hairline-soft; }
+                Divider { }
                 Rectangle { height: 16px; }
 
                 Eyebrow { text: "关闭主窗口时"; }
@@ -1434,7 +1785,7 @@ export component MainWindow inherits Window {
     // 只有 `close-behavior-index` 还是"每次询问"时才可能被 Rust 置真。
     // 点遮罩或按 Esc = 放弃这次关闭，窗口留着（我们不替用户做决定）。
     if root.close-prompt-visible : Rectangle {
-        background: #000000B8;
+        background: Tokens.overlay;
         TouchArea { clicked => { root.close-prompt-visible = false; } }
         // ⚠ 空壳 FocusScope 必须自己抢焦点：默认只有"被点到"才会获得焦点
         // （focus-on-click），而这里没有任何可点的内容 —— 不写这一行，Esc 是死的
@@ -1451,7 +1802,7 @@ export component MainWindow inherits Window {
             alignment: center;
             cross-axis-alignment: center;
             Bezel {
-                width: 380px;
+                width: 400px;
                 core-padding: 20px;
                 spacing: 0px;
 
@@ -1468,18 +1819,7 @@ export component MainWindow inherits Window {
                     }
                     Rectangle { horizontal-stretch: 1; }
                     // 右上角关闭 = 与 Esc / 点遮罩同义：放弃这次关闭，窗口留着。
-                    Rectangle {
-                        width: 26px; height: 26px; border-radius: 13px;
-                        background: #FFFFFF0D;
-                        border-width: 1px; border-color: Tokens.hairline;
-                        Image {
-                            width: 13px; height: 13px;
-                            source: @image-url("icons/close.svg");
-                            x: (parent.width - self.width) / 2;
-                            y: (parent.height - self.height) / 2;
-                        }
-                        TouchArea { clicked => { root.close-prompt-visible = false; } }
-                    }
+                    CloseButton { clicked => { root.close-prompt-visible = false; } }
                 }
                 Rectangle { height: 14px; }
                 HorizontalLayout {

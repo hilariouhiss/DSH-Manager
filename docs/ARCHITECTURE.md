@@ -281,7 +281,7 @@ pub fn on_close_requested(&self, callback: impl FnMut() -> CloseRequestResponse 
 |---|---|
 | Slint 全量依赖冷编译 | **约 2 分钟**（依赖树含 winit / femtovg / accesskit / swash / resvg / fontique 等） |
 | 增量编译（仅改 `.slint`） | **4.3 – 8.2 秒** —— 界面迭代速度可接受 |
-| `ListView` / `ComboBox` 等 std-widgets | **不是语言内建元素**，必须 `import { ListView } from "std-widgets.slint";`，否则报 `Unknown element 'ListView'` |
+| `ListView` / `ScrollView` 等 std-widgets | **不是语言内建元素**，必须 `import { ListView } from "std-widgets.slint";`，否则报 `Unknown element 'ListView'`。输入框与下拉框自 v1.3 起不再用 std-widgets（见 §2.4.3） |
 
 **启动延迟与 Timer 精度**（对应 SRS NFR-2 的 1 秒预算）
 
@@ -364,7 +364,7 @@ export enum NotesStatus { loading, ok, missing, failed }
 
 **设计要点**：
 
-1. **下拉列表用格式化字符串而不是自定义 delegate**。`ComboBox` 接受 `[string]`，把通道与"当前"标记直接拼进文案（`"0.1.6-alpha.2  (alpha)  ← 当前"`），省掉一整套自定义控件。SRS FR-10 只要求"标注通道"与"标识当前版本"，格式化字符串已满足。
+1. **下拉列表用格式化字符串而不是自定义 delegate**。下拉（v1.3 起为 `GlassSelect`，此前是 `ComboBox`）接受 `[string]`，把通道与"当前"标记直接拼进文案（`"0.1.6-alpha.2  (alpha)  ← 当前"`），省掉一整套自定义 delegate。SRS FR-10 只要求"标注通道"与"标识当前版本"，格式化字符串已满足。⚠️ v1.3 后通道后缀与"← 当前"已按用户要求移到行尾/标题，本条只保留"不写自定义 delegate"这一半。
 2. **日志用 `[string]` + `ListView`**，不用"整段文本"属性。原因：日志会持续增长，整段拼接是每次更新 O(n)；`VecModel` 追加是 O(1)，且 `ListView` 自带虚拟化。
 3. **`notes-text` 用 `styled-text` 类型**。Slint 的类型映射表中 `styled-text` 对应 `slint::StyledText`，由 `StyledText::from_markdown` 在 Rust 侧构造。
 
@@ -1013,11 +1013,19 @@ fn main() {
 
 `ui/app.slint` 内含主窗口与托盘两个顶层组件，以及共享的 `NotesStatus` 枚举与少量样式常量。**不拆分多个 `.slint` 文件** —— 两个组件之间不允许有 Slint 层依赖，拆文件只会增加 `import` 噪音。
 
-⚠️ **`std-widgets` 必须显式导入**（实测确认，见 §2.4.3）。`ListView`、`ComboBox`、`Button`、`ScrollView` 等**都不是语言内建元素**：
+⚠️ **`std-widgets` 必须显式导入**（实测确认，见 §2.4.3）。`ListView`、`ScrollView`、`AboutSlint`、`Palette` 等**都不是语言内建元素**：
 
 ```slint
-import { Button, ComboBox, ListView, ScrollView, AboutSlint } from "std-widgets.slint";
+import { ListView, ScrollView, AboutSlint, Palette } from "std-widgets.slint";
 ```
+
+⚠️ **输入框与下拉框自 v1.3 起不再来自 `std-widgets`**。原用的 Fluent `LineEdit` / `ComboBox`
+把 `min-width: max(160px, …)`、`min-height: max(32px, …)`、3–4px 圆角、自带箭头与浅色底
+**写死在组件体里**（`i-slint-compiler-1.18.0/widgets/fluent/{lineedit,combobox}.slint`），
+而 fluent 的 `Palette` 属性全是 `out`（只读）——**从外部改不动**，此前只能靠外框遮挡，
+代价是"外圆角 11px 套内圆角 4px"的双弧线与两处 `min-width: 0px; height: 30px;` 压制 hack。
+现改为自绘的 `GlassField` / `GlassSelect`（`TextInput` 起壳 / `PopupWindow` 弹层），
+沿用同一套设计令牌。`ListView` / `ScrollView` **保留**：虚拟化不能丢。
 
 漏掉导入会报 `Unknown element 'ListView'`，且该错误发生在 `build.rs` 阶段，信息指向 `.slint` 行号而非 Rust 代码。
 
@@ -1199,3 +1207,4 @@ strip     = true
 | 1.0 | 2026-09-20 | 首版。基于 SRS v1.0 与全部实测环境数据 |
 | 1.1 | 2026-09-20 | 关闭 R-1 / R-2：补充 §2.4 实测证据；**修正 §4.5（原 §4.4）中被证伪的 `on_close_requested` 用法**；补充 std-widgets 导入要求与编译耗时实测；Q-2 / Q-3 结案 |
 | 1.2 | 2026-09-20 | **新增配置持久化设计**（Q-1 由"不做"改为"A + B 都做"）：**①** §1.3 模块图新增 `config.rs` 并说明其边界；**②** 新增 **§4.4 `src/config.rs` 详细设计**（`Loaded` 枚举的设计理由、**原子写入及其依据**、写入点收敛约束、单实例限制），原 §4.4 / §4.5 顺延为 §4.5 / §4.6；**③** §7.2 拒绝清单新增 `dirs`；**④** §9.2 Q-1 结案 |
+| 1.3 | 2026-09-21 | **组件样式统一**（§2.4.3、§3.2）：**①** 输入框 / 下拉框改为自绘 `GlassField` / `GlassSelect`，删掉两处压制 Fluent 的 `min-width: 0px; height: 30px;` 与端口框的三层嵌套 hack；**②** 新增语义令牌（`fill` / `fill-hover` / `fill-active` / `sunk` / `solid` / `overlay` / `accent-*` / `hairline-strong` / `motion-*` / `disabled`），收敛原先散落的 6 档白百分比与 5 档时长；**③** 抽出 `Flyout` / `Divider` / `SectionHeader` / `CloseButton` 四个共用件（三个对话框的关闭按钮原先各抄一份且都没有 hover）；**④** 修掉日志列表条目的水平居中（`width: 100%` + `Text.x = 0`，实测左边缘 183/147/92 → 38/38/38）；**⑤** 删除未使用的 `Button` 导入；**⑥** 新增 `FieldLabel`（表单字段标签，与字段正文**同字号 12.5px、同高 32px**，层次只靠颜色），`Eyebrow`（9.5px）收窄为分区标题 / 元信息键专用 —— 原先字段行拿 9.5px 眉标当标签，压在 12.5px 的字段文字旁边字号差一大截；**⑦** 下拉框与输入框**角色分开**：输入框是下凹槽（`sunk` + `hairline-strong`），下拉框是凸起控件面（`fill` + `hairline` + 悬停提亮），原先两者同一个壳、看起来都能打字；**⑧** 下拉箭头补 `cross-axis-alignment: center`（漏了它会被顶到字段上沿，同一坑 PillButton 注释里已记过） |
