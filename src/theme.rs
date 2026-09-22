@@ -16,14 +16,6 @@
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 
-// ⚠ 过渡期抑制，**Task 9 Step 1 必须删除这三行**（那里有强制的删除步骤）。
-// 本模块的项分三批被消费：parse/as_str → Task 2，resolve → Task 6，
-// index/from_index → Task 8。在最后一个消费者到位之前，`cargo build` 会对尚未
-// 被消费的项报 dead_code，而 Global Constraints 要求构建输出干净。
-// ⚠ 只标注这三个**已知待消费**的项，不用模块级 blanket —— 本文件是 Task 2/6/8
-// 都要改的地方，模块级会连真实死代码一起盖住（见 Task 1 评审的 Important 项）。
-// 仓库先例：docs/RULINGS.md Ruling 10（同一缺陷；那次用 crate 级，因为受影响项跨多个文件）。
-#[allow(dead_code)]
 /// 主题模式。
 ///
 /// ⚠ 下标即 UI 契约：`ui/app.slint` 的 `theme-mode` 用 0/1/2 表示这三档，
@@ -38,7 +30,6 @@ pub enum ThemeMode {
     Auto,
 }
 
-#[allow(dead_code)]
 impl ThemeMode {
     pub fn index(self) -> i32 {
         match self {
@@ -75,7 +66,6 @@ impl ThemeMode {
     }
 }
 
-#[allow(dead_code)]
 /// 把模式与系统态合成"现在该不该用暗色"。
 ///
 /// **这是主题的唯一判据** —— UI 不参与判断，`system_dark` 甚至不进 .slint。
@@ -90,9 +80,6 @@ pub fn resolve(mode: ThemeMode, system_dark: bool) -> bool {
 
 /// 个人化设置键。Task 6 的变更监视用它 —— **只用于通知，不用于取值**
 /// （取值一律走上面的 uxtheme 序号，理由见 `system_dark` 的文档）。
-///
-/// ⚠ 它的消费者在 Task 6，故需要一处过渡期抑制（Task 9 一并删除）。
-#[allow(dead_code)]
 #[cfg(windows)]
 const PERSONALIZE_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize";
 
@@ -112,8 +99,6 @@ const PERSONALIZE_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Themes
 /// ⚠ 因此本模块**不读注册表**。早先的 `registry_dark()` 回落已删除：
 /// 它只在上述失败路径上被触发，而那些路径恰恰是 winit 判浅色的路径 ——
 /// 回落不是安全网，是分叉源。（注册表在 Task 6 仍然要用，但只用于**变更通知**，不用于取值。）
-// ⚠ 过渡期抑制：Task 6 的监视器是它的消费者，Task 9 连同文件顶部三处一起删除。
-#[allow(dead_code)]
 #[cfg(windows)]
 pub fn system_dark() -> bool {
     use windows_sys::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
@@ -221,11 +206,7 @@ fn uxtheme_dark() -> Option<bool> {
 }
 
 /// 非 Windows：不作探测，一律浅色（GC-1 声明只在 Windows 上验证）。
-// ⚠ 过渡期抑制（Task 9 一并删除）：本桩原先没有任何消费者，故非 Windows 构建会报 dead_code。
-// ⚠ **别照抄 Windows 侧那句"Task 6 的监视器是它的消费者"** —— 本桩是空实现、自己不调任何东西，
-// 而 `spawn_watcher` 的非 Windows 版同样是空实现、也不调它。Task 6 之后它真正的无条件消费者是
-// `AppState::new`（`src/main.rs` 的 `system_dark: theme::system_dark()`）。
-#[allow(dead_code)]
+/// 它的消费者是 `AppState::new`（`src/main.rs` 的 `system_dark: theme::system_dark()`）。
 #[cfg(not(windows))]
 pub fn system_dark() -> bool {
     false

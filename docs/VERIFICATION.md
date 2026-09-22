@@ -321,3 +321,246 @@ NFR-6 的真实覆盖在 `safe_version_rejects_injection_attempts`、`is_safe_ve
      日志里不应出现 `事务开始`。用 `SendKeys` 连按 `{DOWN}` 驱动版本下拉，是 I-4 的输入手法
      （需要 `SetForegroundWindow` + UIA `SetFocus`；本会话桌面**未锁屏**，故可用）。
 
+---
+---
+
+# 主题系统验证记录（`feat/theme-system`，Task 9）
+
+日期 **2026-09-22**。被验证的代码：`feat/theme-system` 的工作树（Task 1–8 已合入，
+本轮改动：`src/theme.rs` 删 6 处 `#[allow(dead_code)]`、`ui/app.slint` 两处注释、
+`docs/` 三份文档）。基线声明为 **109 tests / 0 warnings**，本轮实测**复现**了该基线。
+
+⚠ 本记录**与上面的 `feat/implementation` 记录互不相干**，不要混读。
+上面的端口纪律那一套（3080 是 live server、观测一律用 3099）在本轮**同样成立**。
+
+**证据来源图例（本轮）**
+
+| 标记 | 含义 |
+|---|---|
+| **单测** | `cargo test` 中的具名单元测试（本轮 **109 passed**） |
+| **探针实测** | gitignored 的 `target/theme-probe/`：**编译真实的 `ui/app.slint`**、用 Slint 软件渲染器离屏渲染、直接读像素。原始输出留档于 `target/theme-probe-out.txt`（gitignored） |
+| **真机实测** | 启动**真实** `target/debug/dsh-manager.exe`，只用进程表 / 端口表 / 文件哈希观测，**不点击任何控件**，观测完即杀 |
+| **未执行/待人工** | **没有做，也没有代偿证据** —— 不得读成 PASS。逐条列在下面 |
+
+**本会话的环境约束（这是本轮验证方法被改写的原因）**
+
+| 项 | 值 |
+|---|---|
+| 桌面状态 | **已锁屏**：`GetForegroundWindow() == 0`、`LogonUI.exe` 在跑（Ruling 23，本轮复核一致） |
+| 后果 | `PrintWindow` + `PW_RENDERFULLCONTENT` 返回**全白位图**，且明暗两档的 **md5 完全相同** —— 一种"看起来成功"的失败；`CopyFromScreen` 截到的是锁屏桌面 |
+| 处置 | **本轮不产出任何截图**，改用离屏探针（证据更强）；屏幕上长什么样留作人工项 |
+| `dsh web` | 3080 监听 pid **23524**，全程未变（本轮每次观测前后都核对） |
+| `state.json` | `%APPDATA%\dsh-manager\state.json`，启动前/恢复后 sha256 均为 `c83231f3546f5c223673a08b81e0c8a51503025548efbf13d710431a9c126a4a`（80 字节） |
+
+---
+
+## 1. 过渡期抑制删除（Step 1）
+
+`#[allow(dead_code)]` 是 Task 1/5 为了让"尚未被消费的项"不破坏 0 警告规则而加的过渡脚手架。
+到 Task 9 三批消费者（Task 2 / 6 / 8）都已落地，本步把它们全部删除。
+
+| 检查 | 命令 | 结果 |
+|---|---|---|
+| 删除**前** | `grep -n "allow(dead_code)" src/theme.rs` | **6 处**：`:26`（`ThemeMode`）、`:41`（`impl ThemeMode`）、`:78`（`resolve`）、`:95`（`PERSONALIZE_KEY`）、`:116`（`system_dark` Windows）、`:228`（`system_dark` 非 Windows 桩） |
+| 删除**后** | `grep -n "allow(dead_code)" src/theme.rs` | **无输出，grep 退出码 1** ✅（契约注释里不含该字面量，故"零匹配"就是"零生效属性"） |
+| 构建 | `touch src/theme.rs ui/app.slint && cargo build 2>&1 \| grep -c "^warning"` | **0** ✅（强制重编译，非缓存命中） |
+| 死代码 | `grep -c "dead_code" <build 输出>` | **0** ✅ —— **没有真实死代码浮出来**，因此不存在"删代码 vs 恢复抑制"的抉择 |
+| 全量测试 | `cargo test` | **109 passed; 0 failed; 0 ignored**；输出中 `^warning` 计数 **0** ✅ |
+
+⚠ 计划 Task 9 brief 写的是"实测当前为 **5** 处（`:21` `:36` `:73` `:97` `:188`）"，**实际是 6 处**
+（brief 的列表漏了非 Windows 的 `system_dark` 桩那处，且行号已整体下移）。按 brief 要求的
+"以 grep 结果为准"处理，未按 brief 的行号/条数操作。
+
+**同时清掉的过期注释**（都是关于"过渡期抑制"本身的，抑制没了它们就是误导）：
+文件头 7 行"分三批被消费 / 只标注已知待消费项 / Ruling 10 先例"的整段说明、
+`PERSONALIZE_KEY` 上的"它的消费者在 Task 6"、`system_dark`(Windows) 上的"Task 6 的监视器是它的消费者"、
+非 Windows 桩上那三行"别照抄 Windows 侧那句"。
+非 Windows 桩的消费者事实（`AppState::new`）**保留**，它不是过渡期信息。
+
+---
+
+## 2. 验证矩阵
+
+### 2.1 能跑的都跑了
+
+| # | 项 | 仪器 | 结果 |
+|---|---|---|---|
+| M-1 | 构建 0 警告（强制重编） | `cargo build` | **0 warnings / 0 errors** ✅ |
+| M-2 | 全量单测 | `cargo test` | **109 passed / 0 failed / 0 warnings** ✅ |
+| M-3 | 暗色档 canvas 令牌真的生效 | 探针像素 (6,700) | `#08080F` —— 与 `Tokens.canvas` 的暗色**声明值逐位一致** ✅ |
+| M-4 | 浅色档 canvas 令牌真的生效 | 探针像素 (6,700) | `#EDEFF7` —— 与浅色**声明值逐位一致** ✅ |
+| M-5 | 翻转 `dark` 会让大范围绑定重算 | 探针模态色 | 暗档前三名 `#0F0F18`/`#0E0E17`/`#101019`；浅档 `#F8F9FC`/`#F7F8FB`/`#FCFCFD` ✅ |
+| M-5b | 强调色令牌 `accent` 的明暗两值都真的到了渲染 | 探针全帧最近邻 | 见下面的**限定说明** —— 方向成立，但**没有**精确落像素，故**不按"渲染色 == 令牌值"记账** ⚠ |
+| M-6 | 设置面板新增的「主题」组**没被裁** | 探针行扫描 | 面板内容行 **243..525**（窗口 0..779）→ 上下都留白 ✅ |
+| M-7 | `theme-mode` 真的驱动 ChipButton 选中态 | 探针同帧 diff | 同帧只改 `theme-mode`（0 ↔ 2）：**764 个像素不同**，bbox `x 260..619, y 453..484` —— 恰是 ChipButton 行 ✅ |
+| M-8 | 旧三字段 `state.json` 能启动、不崩、不被改写 | 真机启动 12 s | 见 §2.3 ✅ |
+| M-9 | `state.json` 还原、3080 未动、无残留进程 | 哈希 + 端口表 + 进程表 | 见 §2.3 ✅ |
+| M-10 | 旧文件兼容（解析层） | 单测 | `legacy_state_without_theme_mode_reads_as_none`、`unrecognized_theme_mode_reads_as_none`、`theme_mode_roundtrips_through_json`、`save_writes_theme_mode_key` 全绿 ✅ |
+
+探针（M-3..M-7）**编译的是真实的 `ui/app.slint`**（`target/theme-probe/build.rs` →
+`slint_build::compile("../../ui/app.slint")`），并且驱动顺序与 `src/main.rs` 一致：
+先 `MainWindow::new()`，再 `global::<Tokens>().set_dark(...)`。这几条**只**证明
+"翻转 dark 会大范围换色 + 新组未被裁 + 选中态被驱动"，**不**支持逐令牌正确性 ——
+后者归 Task 3+4 的对比度门槛测试（`both_palettes_meet_text_contrast_bars` 等）。
+
+**⚠ M-5b 的限定说明（这是一条"没测成"的记录，不是 PASS）。**
+brief 在截图路里要求"浅色档 `accent` 渲染色接近 `#59659B`、深色档接近 `#9AA6E8`"。
+离屏探针对**静态帧**做全帧最近邻，结果**对不上**：
+
+| 档 | 目标（令牌声明值） | 最接近的像素 | 曼哈顿距离 | 距离 ≤ 6 的像素 |
+|---|---|---|---|---|
+| 深色 | `#9AA6E8` | `#A5A6BC` | **55** | **0** |
+| 浅色 | `#59659B` | `#64657D` | **41** | **0** |
+
+（同一次扫描里，"最接近像素离**本档** accent 的距离 vs 离**另一档** accent 的距离"是
+55 vs 174 与 41 vs 226 —— **方向明确成立**，两档的强调色系确实不同。）
+
+**为什么对不上，以及为什么这不记成缺陷**：`Tokens.accent` 在本程序里几乎不裸用 ——
+它进的是 Orb 的 `tint`（`ui/app.slint:1309`/`1493`/`1773`，带光晕与 alpha 合成）、
+渐变中段（`:1600`）、以及聚焦态边框；而选中 Chip 用的是 **`accent-fill` / `accent-line` /
+`accent-ink`**（`:309`/`:312`/`:332`），`accent-fill` 的浅色版 alpha 只有 `0x14`（8%）。
+所以静态帧上**本来就**不该出现纯 `accent` 像素。
+**结论**：这条 readback 在离屏探针上**无法复现 brief 的预期**，本记录不声称它通过；
+"令牌值对不对"由 Task 3+4 的对比度门槛测试 + `parse_palette` 的下限测试负责（那些是逐令牌读值，
+比像素反推强）。
+
+### 2.2 ⭐ Fluent 控件同步——本轮的头条结论（Ruling 26）
+
+**问题。** `ui/app.slint` 的 Fluent 同步是
+`property <bool> is-dark: Tokens.dark;` + `changed is-dark => {…Palette.color-scheme…}` + `init => {…}`。
+但 `init` 在 `MainWindow::new()` 内执行，**早于** `main()` 的第一次 `set_dark()` ——
+那一刻 `Tokens.dark` 还是声明缺省值 `true`，所以 **`init` 那一行永远钉成 dark**。
+于是浅色档用户的 Fluent 控件（`ScrollView` 滚动条、`AboutSlint`）正确与否，
+**只**取决于之后 `set_dark(false)` 时 `changed is-dark` 是否真的触发。
+本项目已有三处"看起来对"的接线被实测推翻，故这一条**必须实测结案**。
+
+**方法。** 扩展离屏探针，在真实 `ui/app.slint` 上 `set_about_visible(true)`
+（`AboutSlint` 是 `std-widgets` 的**真** Fluent 控件），在 `dark=true` 与 `dark=false` 两档各渲一帧，
+读回同一批像素。两处独立信号：
+
+- **信号 A —— logo 药丸。** `AboutSlint` 的 logo 源在
+  `MadeWithSlint-logo-dark.svg` 与 `…-light.svg` 之间按
+  `Palette.color-scheme == ColorScheme.dark` 二选一（`i-slint-compiler-1.18.0/widgets/common/about-slint.slint:17-18`）。
+  两个 SVG 的主色**互补**（已读源码核实）：dark 版是 **white 底 + `#151D21` 字形**，
+  light 版是 **`#151D21` 底 + white 字形**。故只需数这两个颜色。
+- **信号 B —— 版本文字的默认前景色。** 那句 `Text { text: "Version 1.18.0…" }` **没有写 `color`**，
+  默认色来自 `StyleMetrics.default-text-color` = `FluentPalette.foreground`
+  （暗 `#FFFFFF` / 浅 `#000000E6`，`widgets/fluent/styling.slint:16-37`）。
+
+**测得的数字（`dark=true` vs `dark=false`，同一帧、同一批坐标）**
+
+信号 A —— AboutSlint logo 药丸，区域 `x∈[310,570) y∈[410,540)`，共 29900 px：
+
+| 档 | `white` 底像素 | `#151D21` 底像素 |
+|---|---|---|
+| `dark = true` | **23518** | **1701** |
+| `dark = false` | **1701** | **23518** |
+
+→ **两个计数精确互换**（23518 ↔ 1701，镜像）。
+
+信号 B —— 版本文字带 `x∈[330,550) y∈[540,572)`（先取带内众数色当底，再取亮度两端各 20 像素）：
+
+| 档 | 带内底色 | 最暗 20 像素 | 最亮 20 像素 |
+|---|---|---|---|
+| `dark = true` | `#0D0D16`（暗） | `#0D0D15`（＝底色，无暗于底的字形） | **`#E7E7E7`（近白字形）** |
+| `dark = false` | `#F7F8FB`（亮） | **`#2D2D2E`（近黑字形）** | `#F8F8FB`（＝底色） |
+
+逐点样例（`x = 240/280/320/360/400/440/480/520/560/600`）：
+
+```
+y=430  dark=true : #171721 #0F0F18 #0F0F18 #FFFFFF #FFFFFF #FFFFFF #FFFFFF #FFFFFF #0E0E17 #0E0E17
+y=430  dark=false: #F5F6F9 #FAFAFC #FAFAFC #151D21 #151D21 #151D21 #151D21 #151D21 #F9F9FC #F9F9FC
+y=470  dark=true : #171720 #0F0F17 #FFFFFF #FFFFFF #FFFFFF #151D21 #FFFFFF #FFFFFF #FFFFFF #0E0E16
+y=470  dark=false: #F4F5F8 #F9FAFC #151D21 #151D21 #151D21 #FFFFFF #151D21 #151D21 #151D21 #F8F9FC
+```
+
+**结论：`changed is-dark` 确实在之后的 `set_dark` 上触发了。两档的 Fluent 像素完全不同，
+浅色档拿到了浅色的 Fluent 配色。Ruling 26 的疑点被实测排除 —— 这不是缺口。**
+
+`#E7E7E7` 这个数字还能对上账：`FluentPalette.foreground` 在暗档是 `#FFFFFF`，
+做 `#FFFFFFE6`（α=0.902）合成到带内底色 `#0D0D16`（13）上得
+`255×0.902 + 13×0.098 ≈ 231 = 0xE7` —— 与观测到的 **`#E7E7E7` 逐位一致**，
+即浅色档那 20 个像素确实来自 `FluentPalette.foreground = #000000E6`，而非别的什么东西。
+
+**这一条恰好是"必须先测后信"的那条**：`init` 一行确实只兜构造那一刻（Ruling 26 的说法成立），
+但 `changed` 接住了它。因此 `ui/app.slint:1114` 的原注释（"`init` 那行负责首帧，
+`changed` 负责运行期切换，两者缺一不可"）把 `init` 说成能兜首帧是**不准的**，本轮已改准（见 §4）。
+
+⚠ **范围声明**：本项实测的是 **`AboutSlint`**（`ScrollView` 滚动条未单独采）。
+但两者读的是**同一个** `Palette.color-scheme` → `FluentPalette.dark-color-scheme` 链
+（`widgets/fluent/style-base.slint:22-35`、`widgets/fluent/styling.slint:16-37`），
+而这条链的**开关点**正是被实测到的那个属性。滚动条**未单独采样**，不必当成已实测。
+
+### 2.3 真机：旧三字段 `state.json`（M-8 / M-9）
+
+本机 `%APPDATA%\dsh-manager\state.json` **本身就是旧的三字段形式**（无 `theme_mode`）：
+
+```json
+{ "close_behavior": "quit", "preferred_port": null, "running_port": 3080 }
+```
+
+于是不必伪造夹具 —— 直接用它做端到端。做法：备份 → 原样启动真实二进制 → 12 s 后观测 → **强杀**
+（`Stop-Process -Force`，即 `TerminateProcess`，**不**走退出处理器，因此不会 taskkill 任何 `dsh web`）
+→ 还原备份 → 复验。
+
+| 观测 | 结果 |
+|---|---|
+| 启动 12 s 后进程 | **存活**（CPU 1.875 s、工作集 125 MB）→ **旧文件不会让它崩** ✅ |
+| 主窗口句柄 | `329010`（非 0）—— 注意：窗口**存在**但锁屏下 `PrintWindow` 取不到内容，这是 Ruling 23 的两回事，别混 |
+| 启动后 `state.json` | sha256 **未变**、大小仍 80 B → **程序不会在启动时改写旧格式文件** ✅ |
+| 还原后 `state.json` | sha256 = `c83231f3…`（**与备份逐字节一致**）、80 B → **还原检查通过** ✅ |
+| 3080 监听 pid | 前 `23524` / 后 `23524` → **未动** ✅ |
+| 残留 `dsh-manager.exe` | **0 个** ✅ |
+| 点击 | **一次都没点**（面板 / 托盘 / 任何控件都没碰） ✅ |
+
+⚠ **本节只证明了"不崩 + 不改写 + 不干扰 3080"**，**没有**证明"它以跟随系统启动" ——
+那需要看到界面或读到选中态，锁屏下两者都拿不到。启动时的档位取自
+`config::load()` → `theme_mode: None` → `ThemeMode::Auto`（单测 M-10 覆盖），
+再经 `resolve(Auto, system_dark())` —— 这条链是**代码审查 + 单测**，不是本轮观测。
+
+---
+
+## 3. 未执行 / 待人工 —— ⚠ 以下**没有**通过，只是没做
+
+**这一节里的任何一条都不得被读成 PASS。** 它们没有被代偿证据覆盖。
+
+| # | 项 | 为什么没做 | 交付给谁 |
+|---|---|---|---|
+| **H-1** | **真实点击路径**：点 ChipButton → `theme-mode-changed` 回调 → `config::update` 落盘 → 置 `dirty` → `project()` 推送 | bin crate 的**根无法被探针 `import`**（探针是一个独立的 `main.rs`，只能链接 Slint 生成的 UI 代码，拿不到 `src/main.rs`）。锁屏下也无法在真窗口上点。**四段各自**有先例（回调与落盘逐块照抄既有「关闭行为」那组、`config::update` 有单测、`dirty`/`project` 是既有机制），但**串起来端到端那一次从未跑过** | **人**：解锁会话里点一次三个 ChipButton，确认选中态 + 重启后仍是所选档。Ruling 25 已裁定此为已知缺口 |
+| **H-2** | **屏幕上的观感（两档各看一遍）** | 锁屏。截图不可用（`PrintWindow` 全白且两档 md5 相同；`CopyFromScreen` 截到锁屏桌面） | **人**：解锁后目视浅色档（重灾区：Fluent 控件的黑字 / 滚动条 / 「关于」的 MadeWithSlint logo）与深色档 |
+| **H-3** | **实时跟随**：应用以「跟随系统」运行，改系统主题（设置 → 个性化 → 颜色），确认**主体与系统标题栏同时**变化并记延迟 | 需要改**用户的系统主题设置**（一个真实的系统级副作用），且需目视窗口变化；锁屏下两者都不可行 | **人**：解锁后按上面步骤做一次，记录延迟 |
+| **H-4** | **持久化实测**：设置里选「深色」→ 退出 → 重启 → 仍是深色且三个 ChipButton 选中态正确 | 需要点击（同 H-1） | **人**：随 H-1 一次做完 |
+| **H-5** | **`ScrollView` 滚动条的 Fluent 配色**单独采样 | 见 §2.2 的范围声明：探针采的是 `AboutSlint`（同一 `Palette` 链，但不等于同一个控件） | 若要更硬的证据：探针里把 `notes-status` 设为 `ok` 并喂入超长 `notes-blocks` 让滚动条出现；或随 H-2 目视 |
+| **H-6** | **绑定真实性的"逐令牌"校验**（40 条令牌每条都真的跟着 `dark` 走） | 探针只采像素，不逐条读回属性 | Task 3+4 的对比度门槛测试覆盖"值对不对"；"绑定是否逐条成立"目前只有抽样 + 代码审查 |
+
+**另记两条不阻塞、也不属本轮范围的遗留**（来自 Task 7+8 评审的 Minor 分流，Ruling 27 定为"延到终审 triage"）：
+`src/main.rs:1470` 重复探测了一次 `system_dark()`（可直接读 `state.system_dark`）；
+新增的主题 ChipButton 行上方缺一条与「关闭行为」行同款的 rationale 注释。
+本轮**没有**改它们（不在 Task 9 brief 范围内，且都改行为/结构而不只是注释）。
+
+---
+
+## 4. 本轮改动的两处注释（Task 7+8 评审提出）
+
+| 位置（**改动前**的行号；改动后分别为 `:1114`、`:1905`） | 原说法 | 改成 | 依据 |
+|---|---|---|---|
+| `ui/app.slint:1114` | "`init` 那行负责首帧，`changed` 负责运行期切换，两者缺一不可" —— 把 `init` 说成能兜首帧 | 明说 `init` **不**负责同步（它在 `MainWindow::new()` 里跑，早于第一次 `set_dark()`，那时 `Tokens.dark` 还是缺省 `true`，故**永远**钉 dark）；运行期同步全靠 `changed`；并注明已由探针实测 | §2.2（Ruling 26） |
+| `ui/app.slint:1901` | "目前只有一项（关闭行为）" | "目前两组：关闭行为、主题" | 设置面板实际已有两组（`Eyebrow { text: "关闭主窗口时" }` 与 `Eyebrow { text: "主题" }`） |
+
+两处都只是注释，改后重新强编 + 全量测试：**0 警告 / 109 passed**（与改前一致）。
+
+---
+
+## 5. 本轮结论
+
+- 过渡期抑制 **6 处全部删除**，删除后 **构建 0 警告、0 条 `dead_code`**，**没有真实死代码浮出**。
+- 全量测试 **109 passed / 0 failed / 0 warnings** —— 与 Task 8 结束时的基线一致（无回归、无新增）。
+- **Ruling 26 的 Fluent 疑点已实测排除**：`changed is-dark` 确实触发，两档 Fluent 像素精确互换
+  （logo 药丸 23518 ↔ 1701，文字字形近白 ↔ 近黑）。
+- 真机在旧三字段 `state.json` 上启动 12 s：不崩、不改写该文件；`state.json` 已按备份**逐字节还原**；
+  3080 监听 pid `23524` 全程未变；**无残留进程**；**未点击任何控件**。
+- **6 项未执行（H-1 ~ H-6）**，其中 H-1 / H-2 / H-3 / H-4 需人在**解锁**会话里做 ——
+  它们**不是通过**，见 §3。
+- **1 项部分成立**（M-5b）：强调色的明暗区别方向成立，但 brief 期望的"渲染色 ≈ 令牌值"
+  在静态帧上**测不出来**（纯 `accent` 本来就不裸用），已按"没测成"记账，见 §2.1 的限定说明。
+

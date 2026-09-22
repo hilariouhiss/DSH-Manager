@@ -1048,3 +1048,146 @@ registry/WinINET crate；改由 SRS 与 `docs/VERIFICATION.md` 明确记为**环
 **尾注**：每个任务的评审包、修复轮报告与本账本原件都只存在于 SDD 草稿工作区
 （`.superpowers/sdd/IMPLEMENTATION-PLAN/`，git-ignored），**分支合并后即被删除**；
 它们引用的提交本身留在 git 历史里 —— 需要复核某条裁决时，按该条提到的 commit 号去查。
+
+---
+---
+
+# 主题系统的平台事实与设计后果（`feat/theme-system`）
+
+上面 101 条属于 `feat/implementation`。本节属于 **`feat/theme-system`**，记录的是那条分支的
+**平台事实**（不是本仓库的设计选择，是平台行为）与 **§5.2 可达性变化**。
+
+⚠ 本节裁决引用的是**另一条分支的编号序列**：原文在 git-ignored 的
+`.superpowers/sdd/2026-09-22-theme-system/progress.md`（到 Task 9 为止共 27 条）。
+**两套编号不共享序列** —— 本节的「Ruling 26」与上面的「Ruling 26」（Task 3 的 Produces 笔误）
+是两个不同的编号。引用时请写明分支。
+
+为什么平台事实要单独留档：本子系统里"看起来对"的接线被实测推翻过或差点被当成理所当然，
+而它们全都**不是读自家代码能看出来的**，只能在依赖源码里核实或实测。记下来是为了让下一个人不必重踩。
+
+---
+
+## 平台事实 1 — 应用**读不到**系统主题
+
+| 入口 | 结果 | 出处（已核实） |
+|---|---|---|
+| `SlintInternal.color-scheme` | **编译错误**：`Cannot access id 'SlintInternal'` | `i-slint-compiler-1.18.0/tests/syntax/lookup/global.slint:37`。该文件是编译器的**语法测试断言** —— 即这是被保证的行为，不是巧合 |
+| `NativeStyleMetrics.color-scheme` | 同上：`Cannot access id 'NativeStyleMetrics'` | 同文件 `:35` |
+| `SlintContext::color_scheme()` | 存在，但只在 `private_unstable_api` 下 | `i-slint-core-1.18.0/context.rs:252` |
+
+**设计后果。**
+
+1. **「跟随系统」必须自己探测** —— 于是有了 `src/theme.rs::system_dark()` 与它的监视线程。
+   这不是"没找现成 API"，而是**没有现成 API**。
+2. 反过来，**`Palette.color-scheme` 是可以写的**（见事实 3）：它是 `std-widgets` 的普通全局属性，
+   而 `SlintInternal` 不是。两件事容易混为一谈，别混。
+3. ⚠ 谁若哪天认为 `private_unstable_api` "能用"，先读仓库的 GC 约束：本仓库不接受依赖未稳定 API。
+
+---
+
+## 平台事实 2 — winit 的探测**只作用于系统标题栏**，用 `uxtheme.dll` 序号 132，**不读注册表**
+
+| 项 | 值 | 出处 |
+|---|---|---|
+| winit 的判据 | `should_apps_use_dark_mode() && !is_high_contrast()` | `winit-0.30.13/src/platform_impl/windows/dark_mode.rs:126-127` |
+| 系统态取值 | `LoadLibraryA("uxtheme.dll")` + `GetProcAddress(132 as PCSTR)` —— **按序号，不读注册表** | 同文件 `:130-135`（序号常量在 `:134`） |
+| 三条失败路径 | 版本不达标 / 取不到模块 / 取不到序号 → 一律判**浅色**（`unwrap_or(false)`；`try_theme` 收尾落 `Theme::Light`） | 同文件 `:61`/`:80`/`:153` |
+| 版本门槛 | `RtlGetVersion` + `status >= 0` + major==10 + minor==0 + build>=17763 | 同文件 `:46-53` |
+| 作用对象 | `try_theme()` → `SetWindowTheme(hwnd, "DarkMode_Explorer"/"")` + `SetWindowCompositionAttribute`，**只改窗口框架 / 标题栏** | 同文件 `:60-82`；调用点 `src/platform_impl/windows/window.rs:963` |
+| 能否强制 | winit **有** `Window::set_theme(Option<Theme>)`（能强制框架明暗）；但 **Slint 1.18 完全没有对等的公开 API** —— `i-slint-core-1.18.0/window.rs` 与 `slint-1.18.0/lib.rs` 里 `theme` 一词出现 **0 次** | 两文件的全文检索 |
+
+**设计后果。**
+
+1. **我们的探测必须与 winit 同源**，否则会出现"标题栏已变暗、主体还是浅色"（或反之）。
+   所以 `system_dark()` 是 winit 判据的**逐条镜像**：同一个 uxtheme 序号、同一个版本门槛
+   （**含 major/minor，不只是构建号**）、同样的高对比度排除、同样的"三条失败路径一律判浅色"。
+   **它刻意不读注册表** —— 早先有一版注册表回落，Ruling 17（本分支）已判定它不是安全网而是
+   **分叉源**（它只在 winit 判浅色的那几条路径上被触发，于是恰好制造出不一致），已删除。
+2. **强制明/暗改不动系统标题栏，是平台限制。** 用户选"深色"时主体变暗、标题栏仍按系统主题绘制。
+   这一点**必须向用户交代**（已在设置面板内写明），否则会被当成 bug 反复报。
+   ⚠ **别去试着"修"**：唯一的路是绕开 Slint 拿 HWND 直接调 `DwmSetWindowAttribute`，
+   那是在 UI 框架之外撬窗口，与本仓库的约束冲突，且升级 Slint 时必碎。
+3. ⚠ **维护契约**：若哪天 winit 放宽了它的判据（例如支持主版本不再是 10 的系统），
+   `dark_mode_supported()` 必须**同步放宽**，否则又分叉。该函数头部已写明这条。
+
+---
+
+## 平台事实 3 — `Palette.color-scheme` **只能**经 `changed` 处理器里的赋值切换
+
+**事实。** 在 `.slint` 组件体里把 Fluent 配色写成绑定是**语法错误**：
+
+```slint
+Palette.color-scheme: dark ? ColorScheme.dark : ColorScheme.light;   // ❌ Parse error
+```
+
+而写成 `changed` 处理器里的赋值则可用：
+
+```slint
+changed is-dark => { Palette.color-scheme = is-dark ? ColorScheme.dark : ColorScheme.light; }  // ✅
+```
+
+**成因（已在编译器源码核实）**：`i-slint-compiler-1.18.0/parser/element.rs:66` 的
+`parse_element_content` 只在 `SyntaxKind::Identifier` 且 `p.nth(1).kind() == SyntaxKind::Colon`
+时走进 `parse_property_binding`。限定名 `Palette.color-scheme` 的第 2 个 token 是 `.`（Dot），
+进不去绑定分支；而 `changed` 处理器体走的是**语句**路径，赋值天然可用。
+
+**设计后果。**
+
+1. **Fluent 配色同步只能写成"局部属性镜像 + `changed`"**：
+
+   ```slint
+   property <bool> is-dark: Tokens.dark;     // 活的绑定：Tokens.dark 一变它就变
+   changed is-dark => { Palette.color-scheme = is-dark ? dark : light; }
+   ```
+
+2. ⚠⚠ **`init => { … }` 那一行不构成同步，它只会永远写 dark。** `init` 在 `MainWindow::new()` 内执行，
+   早于 `main()` 的第一次 `set_dark()`；那一刻 `Tokens.dark` 还是**声明缺省值 `true`**。
+   于是浅色档的 Fluent 控件（`ScrollView` 滚动条 / `AboutSlint`）正确与否，
+   **完全取决于之后 `set_dark(false)` 时 `changed is-dark` 是否真的触发**。
+   这曾经只是"看起来对"的推理（Ruling 26 把它列为必测项）—— **Task 9 用离屏探针实测确认它确实触发**：
+   AboutSlint 的 logo 药丸与默认前景色在 `dark=true/false` 两档逐像素互换，数字见 `docs/VERIFICATION.md`。
+   **若删掉 `changed` 那一支，浅色档的 Fluent 控件会整片停在深色。**
+3. **不得**从 Rust 侧另找路子写 `Palette`：`FluentPalette` 是 `std-widgets` 的全局，
+   生成的 `MainWindow` 上不存在这个 global（Rust 侧没有访问器）—— 这正是"两条投影路径"的原因，
+   见 `docs/ARCHITECTURE.md` §4.7.2。
+
+---
+
+## §5.2 可达性变化 — 「worker 已死」兜底从无条件可达变为**条件可达**（已接受，不重构）
+
+**事实（Task 6 引入）。** 系统主题监视线程为了送 `UiMsg::SystemThemeChanged`，
+为**进程生命周期**持有一个 `Sender<UiMsg>` 克隆。后果：
+
+- `msg_rx.try_recv()` 再也不会返回 `Disconnected`（只有当**所有** sender 都丢弃时才会）；
+- 于是 `drain()` 里 §5.2 那条"worker 已死"兜底分支、以及配套的 `worker_dead` 闩锁，
+  **从无条件可达变为条件可达** —— 仅当监视线程自己 panic（或它的两条早退路径
+  `CreateEventW` 失败 / `WaitForSingleObject` 失败）因而释放那个 sender 时，才重新可达。
+
+这与 **Ruling 77**（`feat/implementation`）记的"该兜底按计划的写法永远不会触发"叠加：
+那条兜底被**进一步**收窄了。
+
+**决定：接受，不重构。** 依据是仓库自己的先例 —— Ruling 83 已判定那条兜底本就不可靠
+（`dsh::spawn_web` 的 reader 线程与 waiter 各持一个 sender，"worker 死了 + `dsh web` 在跑"
+这一最常见组合下它根本接不住），并把真正的保护换成了 worker 的**整圈 `catch_unwind` + 显式
+`Log`/`Failed`**（"让故障可见 —— GUI 子系统没有 stderr"）。那个保护**不受本改动影响**。
+为恢复一个已被判定不足的分支去把 `drain` 改成双通道轮询，不划算。
+
+**保留**分支与闩锁（不删）：监视线程若 panic，其 sender 随之释放，该分支仍可能重新可达；
+删掉它等于把这条本就变窄的路彻底堵死。`src/main.rs` 里相关注释已由"兜底有效"改为事实描述。
+
+**代价若错**：worker 崩溃时的提示能力比计划设想的更弱 —— 但 `catch_unwind` 那条路仍在，
+且它是本轮真正依赖的那条。
+
+---
+
+## 附：`state.json` 的向后兼容（本分支唯一改动的持久化契约）
+
+`feat/implementation` 的 `state.json` 是三字段（`preferred_port` / `running_port` / `close_behavior`）。
+本分支增第四键 `theme_mode`，取值 `"light"` / `"dark"` / `"auto"`：
+
+- **缺 key → `None` → `ThemeMode::Auto`（跟随系统）**。于是"默认跟随系统"这条需求不需要任何额外标志：
+  没记过就是跟随。**不得**把缺 key 当成文件损坏，也**不得**回落成某个固定主题。
+- **无法识别的值**（手改过、降级运行留下的）同样当"没记过"→ 跟随系统，比替用户猜一个固定主题安全。
+- 旧三字段文件照常可用：单测 `legacy_state_without_theme_mode_reads_as_none` 钉住
+  （且钉住旧字段不受影响）。Task 9 另用**真实二进制**在旧三字段文件上启动 12 秒做了端到端确认
+  （不崩、不重写该文件），见 `docs/VERIFICATION.md`。

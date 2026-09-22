@@ -1043,6 +1043,118 @@ import { ListView, ScrollView, AboutSlint, Palette } from "std-widgets.slint";
 
 ---
 
+### 4.7 主题子系统（`src/theme.rs` + `ui/app.slint` 的 `Tokens`）
+
+规格：`docs/superpowers/specs/2026-09-22-theme-system-design.md`。平台事实与设计后果见
+`docs/RULINGS.md` 的「主题系统的平台事实」一节；本轮实测见 `docs/VERIFICATION.md`。
+
+#### 4.7.1 职责边界
+
+`src/theme.rs` **只做三件事**，且都在 Rust 侧：
+
+| 项 | 职责 |
+|---|---|
+| `ThemeMode` + `index`/`from_index`/`as_str`/`parse` | 三档（浅色/深色/跟随系统）与它们在 UI、`state.json` 里的表示之间的双向映射 |
+| `resolve(mode, system_dark) -> bool` | **主题的唯一判据**：把"用户选的档"与"系统当前是不是暗色"合成"这一帧该不该用暗色" |
+| `system_dark()` / `spawn_watcher(tx)` | 系统态探测与变更监视（见 §4.7.4） |
+
+它**不**知道任何颜色：调色板是 `ui/app.slint` 里 `global Tokens` 的 40 条 brush 令牌，每条写成
+`dark ? #暗 : #浅` 的形状（`out property <brush> 名: dark ? #AAAAAA : #BBBBBB;`）。
+`Tokens` 是普通 Slint 全局，`dark` 由 Rust 的 `set_dark()` 写。
+
+#### 4.7.2 Rust 是唯一真相源，Slint 侧有**两条**投影路径
+
+真相只有一处：`AppState.theme_mode`（用户选择）+ `AppState.system_dark`（系统态），
+经 `resolve()` 得到布尔值。`project()` 每帧把它推给两个目标（`src/main.rs`）：
+
+```rust
+win.set_theme_mode(state.theme_mode.index());                              // ① 选中态
+win.global::<Tokens>().set_dark(theme::resolve(state.theme_mode, state.system_dark)); // ② 颜色
+```
+
+| 路径 | 目标 | 覆盖谁 |
+|---|---|---|
+| ① `theme-mode` (`<int>`) | 设置面板的 ChipButton 选中态 | 本程序自己的控件 |
+| ② `Tokens.dark` (`<bool>`) | 40 条 brush 令牌的取值 | 本程序自己的控件 |
+| ③ `Palette.color-scheme` | `std-widgets` 的 Fluent 控件（`ScrollView` 滚动条、`AboutSlint`…） | **不由 Rust 推**，见下 |
+
+**为什么②与③必须是两条**：③ 的目标 `Palette` 是 `std-widgets` 的全局，
+其实现是 `Palette.color-scheme <=> FluentPalette.color-scheme`，而 `FluentPalette` **没有**对用户代码
+可用的 Rust 访问器 —— 生成的 `MainWindow` 上不存在 `FluentPalette` 这个 global，
+`SlintInternal.color-scheme` 更是编译期就被拒绝（见 RULINGS）。于是③只能在 `.slint` 内部完成：
+
+```slint
+property <bool> is-dark: Tokens.dark;                 // 局部镜像，绑定是活的
+changed is-dark => {                                  // ← 运行期同步**只**靠这一条
+    Palette.color-scheme = is-dark ? ColorScheme.dark : ColorScheme.light;
+}
+init => { /* 只兜构造那一刻 */ }
+```
+
+⚠ **`init` 那一行不构成同步**：它在 `MainWindow::new()` 里跑，早于 `main()` 的第一次 `set_dark()`，
+那时 `Tokens.dark` 还是声明缺省值 `true` —— 所以它**永远**写 dark。浅色档的 Fluent 配色全部依赖
+`changed` 处理器在之后的 `set_dark()` 上真的触发。（离屏探针实测确认它确实触发，见 VERIFICATION。
+这条曾经只是"看起来对"，是本子系统里唯一一条必须先测后信的接线。）
+
+因此**不得**从 Rust 侧另找路子写 `Palette`，也**不得**删掉 `changed` 那一支 —— 两者都会让
+"本程序的颜色"与"Fluent 控件的颜色"分叉。
+
+#### 4.7.3 `system_dark` 刻意不进 `.slint`
+
+`system_dark`（"系统当前是不是暗色"）**没有**任何 `.slint` 属性与之对应，这是刻意的：
+
+- 一旦把它也做成 Slint 属性，就会有两个地方能判定主题（Rust 的 `resolve()` 与 Slint 里的某个表达式），
+  而**强制档下系统态变化不该改变结果**（选了"深色"就该一直是深色）—— 这种"哪个说了算"的分歧
+  正是本系统要避免的双真相源。
+- `resolve()` 的六格真值表已由单测钉住（`resolve_truth_table`），Slint 侧只消费它的**结果**。
+
+**下一个人不要"顺手"把它加上去。** 需要新语义时改 `resolve()`，不是在 UI 属性上加一条。
+
+#### 4.7.4 `UiMsg::SystemThemeChanged` 与 80 ms 排空
+
+监视在 **Task 6** 落地，链路是：
+
+```
+uxtheme 序号 132 (system_dark)          ← 与 winit 同源，决定标题栏与主体一致
+  ↑ 读值
+spawn_watcher 线程                       ← RegNotifyChangeKeyValue(REG_NOTIFY_CHANGE_LAST_SET) 阻塞等待
+  │ 先武装、再读值（顺序反了会永久漏掉落在窗口里的那次变更）
+  ↓ tx.send(UiMsg::SystemThemeChanged(bool))
+无界 mpsc 通道
+  ↓
+80 ms Timer → drain()
+  │ SystemThemeChanged(dark) 臂：s.system_dark = dark;
+  │   was = resolve(mode, 旧), now = resolve(mode, 新)
+  │   was != now → s.dirty = true; changed = true      ← 强制档下两者相等，不触发重绘，这是正确行为
+  ↓
+drain() 返回 true → 全量 project() → set_dark(resolve(...))
+```
+
+**与 80 ms 的关系**：监视线程只负责把"系统态变了"这件事**投递**出去，不直接碰 UI ——
+Slint 的属性只能在 UI 线程写。所有 `UiMsg` 都由 UI 线程上那个 80 ms `Timer` 一次性排空
+（架构决策 3），于是：
+
+- 同一次系统主题切换引发的多条消息（以及其它消息）被**合并成一帧**；
+- 监视线程本身在变更之间阻塞在 `WaitForSingleObject(INFINITE)` 上，**不轮询**（NFR-4 要求空闲近零 CPU）；
+- 消息是幂等的：重复的 `SystemThemeChanged(同一个值)` 因为 `was == now` 而不置 `dirty`，
+  不会白白触发一次全量 `project()`。
+
+⚠ **代价（已知并接受）**：监视线程为进程生命周期持有一个 `Sender<UiMsg>`，
+于是 `msg_rx.try_recv()` 再也不会返回 `Disconnected` —— `drain()` 里 §5.2 那条"worker 已死"兜底
+与 `worker_dead` 闩锁因此变成**条件可达**（仅当监视线程自己 panic 并释放 sender 时才重新可达）。
+真正的崩溃保护是 worker 的整圈 `catch_unwind` + 显式 `Log`/`Failed`，不受影响。见 RULINGS。
+
+#### 4.7.5 继承来的既有约束
+
+- **`Tokens` 的令牌数有下限测试**（`MIN_BRUSH_TOKENS = 40`）：`parse_palette` 只认带 `<brush>` 的行，
+  整行被删会静默失去对比度覆盖，故以 `>=` 下限兜住"丢令牌"。
+- **两套调色板都要过对比度门槛**（`both_palettes_meet_text_contrast_bars` /
+  `translucent_tiers_stay_visible_in_both_palettes`）：暗色侧不改，浅色侧按规格 §4.3 的权威值表。
+- **强制明/暗改不动系统标题栏**：标题栏由 winit 按**系统**主题绘制，本程序无公开 API 覆盖。
+  这是平台限制，已在设置面板里向用户交代。
+
+---
+
 ## 5. 错误处理设计
 
 ### 5.1 错误分类
@@ -1219,3 +1331,4 @@ strip     = true
 | 1.2 | 2026-09-20 | **新增配置持久化设计**（Q-1 由"不做"改为"A + B 都做"）：**①** §1.3 模块图新增 `config.rs` 并说明其边界；**②** 新增 **§4.4 `src/config.rs` 详细设计**（`Loaded` 枚举的设计理由、**原子写入及其依据**、写入点收敛约束、单实例限制），原 §4.4 / §4.5 顺延为 §4.5 / §4.6；**③** §7.2 拒绝清单新增 `dirs`；**④** §9.2 Q-1 结案 |
 | 1.3 | 2026-09-21 | **组件样式统一**（§2.4.3、§3.2）：**①** 输入框 / 下拉框改为自绘 `GlassField` / `GlassSelect`，删掉两处压制 Fluent 的 `min-width: 0px; height: 30px;` 与端口框的三层嵌套 hack；**②** 新增语义令牌（`fill` / `fill-hover` / `fill-active` / `sunk` / `solid` / `overlay` / `accent-*` / `hairline-strong` / `motion-*` / `disabled`），收敛原先散落的 6 档白百分比与 5 档时长；**③** 抽出 `Flyout` / `Divider` / `SectionHeader` / `CloseButton` 四个共用件（三个对话框的关闭按钮原先各抄一份且都没有 hover）；**④** 修掉日志列表条目的水平居中（`width: 100%` + `Text.x = 0`，实测左边缘 183/147/92 → 38/38/38）；**⑤** 删除未使用的 `Button` 导入；**⑥** 新增 `FieldLabel`（表单字段标签，与字段正文**同字号 12.5px、同高 32px**，层次只靠颜色），`Eyebrow`（9.5px）收窄为分区标题 / 元信息键专用 —— 原先字段行拿 9.5px 眉标当标签，压在 12.5px 的字段文字旁边字号差一大截；**⑦** 下拉框与输入框**角色分开**：输入框是下凹槽（`sunk` + `hairline-strong`），下拉框是凸起控件面（`fill` + `hairline` + 悬停提亮），原先两者同一个壳、看起来都能打字；**⑧** 下拉箭头补 `cross-axis-alignment: center`（漏了它会被顶到字段上沿，同一坑 PillButton 注释里已记过） |
 | 1.4 | 2026-09-22 | **更新说明改为 GitHub 式分块排版**（FR-27，§2.2 数据流 / §3.2 要点 3 / §4.x 纯函数 / §8 测试表）：`preprocess_notes(&str) -> String` 换成 `parse_notes_blocks(&str) -> Vec<NoteBlock>`，属性 `notes-text: styled-text` 换成 `notes-blocks: [NoteBlock]`，新增 `NoteKind` / `NoteBlock` 与 Slint 侧的 `NoteBlockView`。**根因**：Slint 的 `StyledText` 不支持标题（官方 Currently Unsupported），也没有字重属性 ——单段文字做不到"标题比正文大"与"列表悬挂缩进"，只能把块结构交给 Rust 侧解析。随之删掉"标题前补空行"的 hack（块间距现在由布局给） |
+| 1.5 | 2026-09-22 | **新增主题子系统**（`feat/theme-system`）：**①** 新增 **§4.7**（职责边界、Rust 唯一真相源、`Tokens.dark` 与 `Palette.color-scheme` **两条投影路径**及为何是两条、`system_dark` 刻意不进 `.slint`、`UiMsg::SystemThemeChanged` 与 80 ms 排空、§5.2 兜底变成条件可达的代价）；**②** `global Tokens` 的 40 条 brush 令牌改为双值（`dark ? #暗 : #浅`），暗色侧逐行不动；**③** `ThemeMode` 三档 + `resolve()` 唯一判据 + 与 winit 同源的 `system_dark()` + 无竞态监视线程；**④** `state.json` 增 `theme_mode`（缺 key = 跟随系统，旧三字段文件照常可用）；**⑤** 设置面板新增「主题」组（浅色/深色/跟随系统，强制档改不动系统标题栏已在面板内交代）；**⑥** 删掉全部 6 处过渡期 `#[allow(dead_code)]`，删除后仍是 0 警告、无真实死代码 |

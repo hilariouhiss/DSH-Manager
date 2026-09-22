@@ -1111,7 +1111,11 @@ export component MainWindow inherits Window {
     // 组件体里直接写 `Palette.color-scheme: …;` 是 Parse error（限定名走不进
     // parser 的绑定分支，见 parser/element.rs 的 parse_element_content），
     // 而 `changed` 里的赋值走的是语句路径，可用。
-    // `init` 那行负责首帧，`changed` 负责运行期切换，两者缺一不可。
+    // ⚠ `init` 那行**不**负责主题同步：它在 `MainWindow::new()` 里跑，早于 main()
+    // 的第一次 `set_dark()`，那时 `Tokens.dark` 还是声明缺省值 `true` —— 于是它**永远**
+    // 钉成 dark。运行期的同步全靠 `changed`：`set_dark()` 让 is-dark 变化后由它改写。
+    // （离屏探针实测：AboutSlint 的 logo 药丸与默认前景色在 dark=true/false 两档完全互换；
+    //   若删掉 `changed`，浅色档的 Fluent 控件会整片停在深色。见 docs/VERIFICATION.md。）
     property <bool> is-dark: Tokens.dark;
     changed is-dark => {
         Palette.color-scheme = is-dark ? ColorScheme.dark : ColorScheme.light;
@@ -1898,7 +1902,7 @@ export component MainWindow inherits Window {
     }
 
     // ═══════════════════════════ 设置 ═══════════════════════════════════
-    // 目前只有一项（关闭行为）。做成一个独立面板而不是往主界面再塞一行控件，
+    // 目前两组：关闭行为、主题。做成一个独立面板而不是往主界面再塞一行控件，
     // 是因为状态栏那排按钮是"窗口级动作"，而设置是"程序级配置"，两者不该并排。
     if root.settings-visible : Rectangle {
         background: Tokens.overlay;
