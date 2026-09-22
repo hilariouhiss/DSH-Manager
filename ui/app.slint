@@ -1189,6 +1189,12 @@ export component MainWindow inherits Window {
     /// ⚠ 与 src/theme.rs 的 `ThemeMode` 下标一一对应，改顺序要两边一起改。
     /// 默认 2：与 `state.json` 里没记过时的缺省（跟随系统）一致。
     in-out property <int> theme-mode: 2;
+    /// 出网是否走 Windows 系统代理（Ruling 89）。**只描述界面选中态** ——
+    /// 出网决策在 `dsh::agent()` 里（worker 线程），它自己读 state.json，
+    /// 两边同源所以不会分叉。
+    /// 默认 true：与 `state.json` 里"没记过"时的缺省一致，理由见
+    /// `config::use_system_proxy()`（机器上没配代理时这一档与直连等价，缺省选它的代价是零）。
+    in property <bool> use-system-proxy: true;
     /// 当前展开的应用菜单：0 = 都没开 / 1 = 文件 / 2 = 帮助。
     /// 纯 UI 状态：菜单开着的时候只可能有一个，用一个 int 比两个 bool 少一半状态。
     in-out property <int> open-menu: 0;
@@ -1203,6 +1209,10 @@ export component MainWindow inherits Window {
     callback port-changed(string);
     callback settings-changed(int);
     callback theme-mode-changed(int);
+    /// 系统代理开关。用 bool 而不是像上面两档那样用下标：那边是**三选一**
+    /// 才需要一个 int，两个状态本来就是布尔，多一个"下标 ↔ 枚举"的映射
+    /// 只是多一处能写错的地方。
+    callback proxy-toggled(bool);
     /// (行为下标, 是否记住)。第二个参数来自询问框的"记住选择"：
     /// 不勾就只管这一次，state.json 不动，下次关闭还会问。
     callback close-choice(int, bool);
@@ -2004,6 +2014,37 @@ export component MainWindow inherits Window {
                     // ⚠ 这里必须诚实交代标题栏的限制，否则用户会当成 bug 报：
                     // 强制档只改窗口内部，系统标题栏跟着的是**系统**设置。
                     text: "跟随系统时窗口与标题栏会一起变。选「浅色」「深色」只改窗口内部 —— 系统标题栏由 Windows 画，它跟的是系统设置，本程序无法覆盖。";
+                    color: Tokens.ink-4;
+                    font-family: Font.text;
+                    font-size: 11.5px;
+                    wrap: word-wrap;
+                }
+
+                Rectangle { height: 16px; }
+                Divider { }
+                Rectangle { height: 16px; }
+
+                Eyebrow { text: "网络代理"; }
+                Rectangle { height: 10px; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    ChipButton {
+                        label: "使用系统代理";
+                        accent: root.use-system-proxy;
+                        clicked => { root.proxy-toggled(true); }
+                    }
+                    ChipButton {
+                        label: "直连";
+                        accent: !root.use-system-proxy;
+                        clicked => { root.proxy-toggled(false); }
+                    }
+                }
+                Rectangle { height: 12px; }
+                Text {
+                    // ⚠ 必须交代"只影响本程序自己的出网"。`dsh web` 是**另一个进程**，
+                    // 它跟的是它自己的环境变量，本程序管不着 —— 不写清楚，
+                    // 用户会以为切了这一档 dsh web 的流量也跟着变（问过，见需求澄清）。
+                    text: "只影响本程序自己的出网（版本目录、更新说明）—— dsh web 是独立进程，不受这一档影响。读的是 Windows「Internet 选项」里的代理；机器上没配代理时与「直连」等价。";
                     color: Tokens.ink-4;
                     font-family: Font.text;
                     font-size: 11.5px;

@@ -7,6 +7,12 @@ use std::collections::BTreeMap;
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
+// ⚠ 这行 import 有消费者、别在清理里删掉：`system_proxy` 要把注册表子键编成宽字符串，
+// 而 `encode_wide` 是 `OsStrExt` 的 **trait 方法**、不是固有方法 —— 少了它报 E0599。
+// （`src/theme.rs` 顶部那条同款注释记的是同一个坑，那边是给 `spawn_watcher` 用的。）
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+
 use std::io::{BufRead, BufReader, Read};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
@@ -24,20 +30,221 @@ pub const USER_AGENT: &str = "dsh-manager";
 /// 出网失败时挂给用户的**自我解释**提示（控制器裁决）。
 ///
 /// 依据（评审轮 1 实测）：`ureq` 的默认 feature 集**不做系统代理发现**
-/// （它只读 `HTTP_PROXY`/`HTTPS_PROXY` 环境变量），而 GC-2 禁止为此引入
-/// 读注册表 / WinINET 的依赖。本机就撞上了这个组合：直连 api.github.com 得到
-/// HTTP 403（`X-RateLimit-Remaining: 0`，本机出口 IP 的小时配额），而系统代理
-/// `127.0.0.1:12450`（HKCU ProxyServer）返回 200 —— 于是**只有本程序**失败，
-/// 用户完全无从判断原因。既然不能自动发现代理，失败信息就必须自己说清楚。
+/// （它只读 `HTTP_PROXY`/`HTTPS_PROXY` 环境变量）。本机就撞上了这个组合：
+/// 直连 api.github.com 得到 HTTP 403（`X-RateLimit-Remaining: 0`，本机出口 IP 的
+/// 小时配额），而系统代理 `127.0.0.1:12450`（HKCU ProxyServer）返回 200 ——
+/// 于是**只有本程序**失败，用户完全无从判断原因。
+///
+/// ⚠ Ruling 89 之后本程序自己会读系统代理了（见 `system_proxy()`，默认就开着），
+/// 所以这句提示现在指向**两个**出口：设置面板那一档，和 `HTTPS_PROXY`。
+/// 仍然要留着 —— 用户把它关掉、或目标机器压根没配系统代理时，
+/// 这句话是唯一能说明"为什么只有这个程序上不了网"的东西。
 pub const PROXY_HINT: &str =
-    "（若本机仅允许通过系统代理出网，请设置 HTTPS_PROXY 后重启本程序）";
+    "（若本机仅允许通过代理出网，请在「设置」里选“使用系统代理”，或设置 HTTPS_PROXY 后重启本程序）";
 
 /// NFR-3：全局超时上限，超时后进入失败路径而非无限等待。
 pub fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(15)))
-        .build()
-        .into()
+    let mut builder = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(15)));
+    // ⚠ 只有在**确实解析出代理**时才覆盖 config：`config_builder()` 的缺省
+    // 是 `Proxy::try_from_env()`，显式传 `None` 会把环境变量那条路一起掐掉 ——
+    // 而 `HTTPS_PROXY` 正是 V-6 验过的、以及本机在 Ruling 89 之前唯一的出网方式。
+    if let Some(proxy) = resolve_proxy() {
+        builder = builder.proxy(Some(proxy));
+    }
+    builder.build().into()
+}
+
+/// 决定这次出网走哪个代理。**优先级：环境变量 > 系统代理 > 直连。**
+///
+/// 环境变量优先是刻意的：它在本需求之前就是唯一生效的方式（V-6 靠注入
+/// `HTTPS_PROXY` 才验成），任何已经在用它的人升级后行为必须**逐字不变**。
+/// 于是这个开关在语义上是纯加法 —— 它只可能**多给**一个候选，
+/// 不会从任何人手里拿走已经能用的那条路。
+fn resolve_proxy() -> Option<ureq::Proxy> {
+    ureq::Proxy::try_from_env().or_else(|| {
+        if crate::config::use_system_proxy() {
+            system_proxy()
+        } else {
+            None
+        }
+    })
+}
+
+/// 读 Windows「Internet 选项」里的系统代理。
+///
+/// ⚠ **不新增依赖、不改 `Cargo.toml`**：走的是 `HKCU\...\Internet Settings`
+/// 下的 `ProxyEnable` / `ProxyServer`，用的是**已启用**的
+/// `Win32_System_Registry` feature —— 与 `src/theme.rs` 的注册表监视同一套 API。
+/// （Ruling 89 里"被 GC-2 挡住"的只有 `winreg` crate 那条路；本函数走的这条
+/// 从来就没被挡住，当时只是没被挑出来。）
+///
+/// 任何一步失败都返回 `None`（= 这次出网不用代理），**绝不 panic**：
+/// 代理读不到是"退化成直连"，不是"上不了网"。
+#[cfg(windows)]
+fn system_proxy() -> Option<ureq::Proxy> {
+    use windows_sys::Win32::System::Registry::{
+        HKEY, HKEY_CURRENT_USER, KEY_READ, RegCloseKey, RegOpenKeyExW,
+    };
+
+    /// 与 `theme::PERSONALIZE_KEY` 同级的平台常量。
+    const INTERNET_SETTINGS: &str =
+        r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+
+    /// `&str` → 带结尾 NUL 的宽字符串（注册表 API 一律要 `PCWSTR`）。
+    fn wide(s: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    // ⚠ 两个 `read_*` 里的 `use` 不能提到函数顶部：嵌套 `fn` 是**独立的 item**，
+    // 看不见外层块的 `use`（实测 E0425 "cannot find value REG_SZ in this scope"）。
+    // 同理，`(unsafe { … }) == 0` 的括号是**必需**的 —— 块表达式在运算符左侧
+    // 会被解析成语句，去掉括号就报 "expected `()`, found `u32`"。
+
+    /// 读一个 `REG_SZ`。缺失 / 类型不对 / 空串都返回 `None`。
+    ///
+    /// 两段式（先问长度、再取内容）而不是写死缓冲区：`ProxyServer` 在多协议
+    /// 分列时（`http=…;https=…;ftp=…`）可以相当长，写死一个"够大"的值就是
+    /// 一个会静默截断的魔数 —— 截断出来的代理地址只会连不上，不会报错。
+    unsafe fn read_string(hkey: HKEY, name: &[u16]) -> Option<String> {
+        use windows_sys::Win32::System::Registry::{REG_SZ, RegQueryValueExW};
+
+        let mut ty: u32 = 0;
+        let mut len: u32 = 0;
+        let probe = unsafe {
+            RegQueryValueExW(
+                hkey,
+                name.as_ptr(),
+                std::ptr::null_mut(),
+                &mut ty,
+                std::ptr::null_mut(),
+                &mut len,
+            )
+        };
+        if probe != 0 || ty != REG_SZ {
+            return None;
+        }
+        // ⚠ `len` 是**字节**数（含结尾 NUL），不是字符数 —— 直接当 u16 个数用
+        // 会开出两倍大的缓冲区（无害），当元素数除以 2 才对（这里就是）。
+        let mut buf: Vec<u16> = vec![0; (len as usize).div_ceil(2)];
+        let read = unsafe {
+            RegQueryValueExW(
+                hkey,
+                name.as_ptr(),
+                std::ptr::null_mut(),
+                &mut ty,
+                buf.as_mut_ptr().cast(),
+                &mut len,
+            )
+        };
+        if read != 0 {
+            return None;
+        }
+        let s = String::from_utf16_lossy(&buf);
+        let s = s.trim_end_matches('\0').trim();
+        (!s.is_empty()).then(|| s.to_string())
+    }
+
+    /// 读 `ProxyEnable`（`REG_DWORD`）。**只有恰好为 1 才算开** —— 别写成
+    /// `!= 0`：注册表里手改出来的 2/3 之类不是"开"的合法编码。
+    unsafe fn read_enabled(hkey: HKEY, name: &[u16]) -> bool {
+        use windows_sys::Win32::System::Registry::{REG_DWORD, RegQueryValueExW};
+
+        let mut ty: u32 = 0;
+        let mut val: u32 = 0;
+        let mut len = std::mem::size_of::<u32>() as u32;
+        let read = unsafe {
+            RegQueryValueExW(
+                hkey,
+                name.as_ptr(),
+                std::ptr::null_mut(),
+                &mut ty,
+                (&raw mut val).cast(),
+                &mut len,
+            )
+        };
+        read == 0 && ty == REG_DWORD && val == 1
+    }
+
+    let mut hkey: HKEY = std::ptr::null_mut();
+    let opened = unsafe {
+        RegOpenKeyExW(HKEY_CURRENT_USER, wide(INTERNET_SETTINGS).as_ptr(), 0, KEY_READ, &mut hkey)
+    };
+    if opened != 0 {
+        return None;
+    }
+
+    // ⚠ 句柄必须成对释放 —— 本函数会被每次出网调用一次（见 `config::use_system_proxy`
+    // 的说明），漏掉就是每请求一个内核句柄泄漏。
+    let out = unsafe {
+        if read_enabled(hkey, &wide("ProxyEnable")) {
+            read_string(hkey, &wide("ProxyServer"))
+        } else {
+            None
+        }
+    };
+    unsafe { RegCloseKey(hkey) };
+
+    let raw = out?;
+    let addr = parse_proxy_server(&raw)?;
+    // Windows 的 `ProxyServer` 从**不带 scheme**（形如 `127.0.0.1:12450`），
+    // 而 ureq 需要它。补 `http://` 而不是 `https://`：这是"用 HTTP CONNECT
+    // 去建隧道"的普通代理，不是"代理服务器本身跑 TLS"。
+    let uri = if addr.contains("://") { addr } else { format!("http://{addr}") };
+    // 读到了但解析不了（用户手改坏了注册表）→ 退化成直连。
+    // 失败是**自我解释**的：直连不上时那两个 fetch_* 的错误串尾部就挂着
+    // PROXY_HINT，指回设置面板 —— 所以这里不需要再单独把原因兜出来。
+    ureq::Proxy::new(&uri).ok()
+}
+
+/// 非 Windows：没有"系统代理"这个东西（GC-1 只在 Windows 上验证）。
+#[cfg(not(windows))]
+fn system_proxy() -> Option<ureq::Proxy> {
+    None
+}
+
+/// 从 `ProxyServer` 的取值里挑出这次要用的那个地址。纯函数，可单测。
+///
+/// 两种形状都要认：
+/// - `127.0.0.1:12450` —— 所有协议共用一个（Ruling 89 实测的本机取值就是这个形状）；
+/// - `http=a:1;https=b:2;ftp=c:3` —— 按协议分列。
+///
+/// ⚠ **https 优先、http 兜底**：本程序只出 https（registry.npmjs.org 与
+/// api.github.com）。分列时不看 https 就会把 http 那项当成 https 的代理用。
+/// `ftp=` 之类的其它键直接忽略 —— 本程序不跑那些协议。
+///
+/// `ponytail:` 未解析 `ProxyOverride`（绕过列表）。上限：用户若把目标域名列进了
+/// 绕过列表，我们仍会走代理（该直连的走了代理，不是"该走代理的直连了"，
+/// 是安全的那一侧）。升级路径：ureq 的 `ProxyBuilder::no_proxy()` 能接住，
+/// 等真有人报这个问题再接。
+///
+/// ⚠ 同一族的第二个缺口，一并记在这里：**系统代理那条路上 `NO_PROXY` 不生效**
+/// （`Proxy::new` 不带 no_proxy）。只有当用户"没设任何 *_PROXY、只设了 NO_PROXY、
+/// 又配了系统代理"时才会撞上 —— 而那正是 `try_from_env()` 返回 `None`、
+/// 由系统代理接手的那一格。真要补，两处一起补。
+pub fn parse_proxy_server(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    // 没有 `=` 就是"一个地址管所有协议"的形状。也不要按 `:` 去猜 ——
+    // IPv6 字面量（`[::1]:8080`）里全是冒号。
+    if !raw.contains('=') {
+        return Some(raw.to_string());
+    }
+    let mut http = None;
+    for part in raw.split(';') {
+        let Some((key, val)) = part.split_once('=') else { continue };
+        let val = val.trim();
+        if val.is_empty() {
+            continue;
+        }
+        match key.trim().to_ascii_lowercase().as_str() {
+            "https" => return Some(val.to_string()),
+            "http" => http = Some(val.to_string()),
+            _ => {}
+        }
+    }
+    http
 }
 
 /// 纯函数，可用 fixture 单元测试。
@@ -847,5 +1054,79 @@ mod tests {
     #[test]
     fn parse_netstat_handles_empty_input() {
         assert_eq!(parse_netstat_pid("", 3080), None);
+    }
+
+    // ── 系统代理（Ruling 89）────────────────────────────────────────────────
+
+    /// 形状 ①：一个地址管所有协议 —— Ruling 89 实测的本机取值就是这个形状
+    /// （`127.0.0.1:12450`）。必须**原样**返回，不能按 `:` 去切。
+    #[test]
+    fn parse_proxy_server_passes_through_single_address() {
+        assert_eq!(parse_proxy_server("127.0.0.1:12450").as_deref(), Some("127.0.0.1:12450"));
+        assert_eq!(parse_proxy_server("  proxy.corp:8080  ").as_deref(), Some("proxy.corp:8080"));
+        // IPv6 字面量全是冒号 —— 只按 `=` 判形状的理由就在这一行
+        assert_eq!(parse_proxy_server("[::1]:7890").as_deref(), Some("[::1]:7890"));
+    }
+
+    /// ★ 判别性：形状 ②（按协议分列）必须挑 **https**，不是顺手取第一项。
+    ///
+    /// 它捕获的变异：把 `return Some(val)` 改成"取第一个非空项" —— 那样
+    /// `http=` 在前时会被当成 https 的代理用，而本程序只出 https。
+    /// 本机正好撞不上这个 bug（单地址形状），所以只有这条测试拦得住。
+    #[test]
+    fn parse_proxy_server_prefers_https_over_http_in_a_protocol_list() {
+        let raw = "http=10.0.0.1:8080;https=10.0.0.2:8443;ftp=10.0.0.3:21";
+        assert_eq!(parse_proxy_server(raw).as_deref(), Some("10.0.0.2:8443"));
+        // 大小写与空格都不得影响判定（注册表里的键名不保证大小写）
+        assert_eq!(
+            parse_proxy_server("HTTP=a:1; HTTPS = b:2").as_deref(),
+            Some("b:2")
+        );
+        // 顺序反过来也必须还是 https
+        assert_eq!(
+            parse_proxy_server("https=b:2;http=a:1").as_deref(),
+            Some("b:2")
+        );
+    }
+
+    /// 分列但**没有 https 项**时回落 `http=`；两者都没有则 `None`（→ 直连）。
+    #[test]
+    fn parse_proxy_server_falls_back_to_http_then_none() {
+        assert_eq!(parse_proxy_server("http=a:1;ftp=c:3").as_deref(), Some("a:1"));
+        assert_eq!(parse_proxy_server("ftp=c:3;socks=d:4"), None, "没有 http/https 项");
+        assert_eq!(parse_proxy_server("https=;http="), None, "空值不算数");
+    }
+
+    #[test]
+    fn parse_proxy_server_rejects_empty() {
+        assert_eq!(parse_proxy_server(""), None);
+        assert_eq!(parse_proxy_server("   "), None);
+    }
+
+    /// FFI 冒烟：`WinHttpGetIEProxyConfigForCurrentUser` 那套注册表读取不崩、
+    /// 不吃到空指针、两次调用自洽。
+    ///
+    /// ⚠ 与 `theme::system_dark_is_callable_and_stable` 同款，**不能**断言具体值
+    /// —— 值取决于跑测试这台机器的代理设置（CI 上多半是"没配代理"）。
+    /// 它能抓住的是句柄成对释放之外的东西：字段偏移写错、`REG_SZ` 判定写反、
+    /// `lpcbData` 当字符数用 —— 这些要么直接崩，要么返回垃圾。
+    #[cfg(windows)]
+    #[test]
+    fn system_proxy_is_callable_and_stable() {
+        let a = system_proxy();
+        let b = system_proxy();
+        assert_eq!(a.is_some(), b.is_some(), "同一时刻两次探测必须一致");
+        // 真读到了就必须是个能建出来的代理（解析不出 scheme 的那条回落在内部兜住）
+        if let Some(p) = a {
+            // ⚠ `ureq::Proxy` **没有** Debug（源码里只 derive 了 Clone/Eq/Hash/PartialEq），
+            // 所以这里断言的是它的 `uri()` —— 这也正是唯一值得断言的东西：
+            // 真读到了就必然是一个带 host 的地址（`Proxy::new` 在无 authority 时
+            // 直接 `Err(InvalidProxyUrl)`，那条路上本函数返回 `None`、不会走到这里）。
+            assert!(
+                p.uri().host().is_some_and(|h| !h.is_empty()),
+                "解析出的代理地址没有 host: {}",
+                p.uri()
+            );
+        }
     }
 }

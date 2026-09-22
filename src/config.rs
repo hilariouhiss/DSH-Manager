@@ -64,6 +64,8 @@ pub struct StateFile {
     pub close_behavior: Option<CloseBehavior>,
     /// `None` = 从没设过 = 跟随系统。见 `ThemeMode`。
     pub theme_mode: Option<ThemeMode>,
+    /// 出网是否走 Windows 系统代理。`None` = 从没设过 = **走**（见 `use_system_proxy()`）。
+    pub use_system_proxy: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -104,11 +106,36 @@ pub fn load_from(path: Option<&Path>) -> Loaded {
             .get("theme_mode")
             .and_then(|x| x.as_str())
             .and_then(ThemeMode::parse),
+        // 同款：认不出的值（缺 key、手改成字符串、将来降级运行）一律当"没记过"，
+        // 也就是回到缺省档（走系统代理），而不是替用户猜成直连。
+        use_system_proxy: v.get("use_system_proxy").and_then(|x| x.as_bool()),
     })
 }
 
 pub fn load() -> Loaded {
     load_from(state_path().as_deref())
+}
+
+/// 出网是否走系统代理。**没记过 / 文件缺失 / 文件损坏一律返回 `true`。**
+///
+/// ⚠ 缺省是"走"而不是"直连"，理由有两条：
+/// - 与 `theme_mode` 的"没值就是缺省档"同一约定。而在装了没配代理的机器上
+///   `ProxyEnable` 是 0，这一档自动退化成直连 —— 缺省选它的**代价是零**；
+/// - 反过来（缺省直连）等于把 Ruling 89 那个"只有本程序出不去网、用户完全
+///   无从判断原因"的坑，原样留给每一个没手动改过设置的人。
+///
+/// 消费者是 `dsh::agent()`，它跑在 **worker 线程**上，所以这里直接读文件而不是
+/// 经 AppState 传值：设置面板点完，下一次请求就生效，不需要重启；也就不存在
+/// 第二份真相需要同步（这正是"回调置 dirty → project() 推回 UI"那条路做不到的，
+/// 它只覆盖 UI 线程）。
+///
+/// 每次出网读一次 state.json 是刻意的懒：本程序一个会话里最多几次请求
+/// （目录一次、说明每版本一次且缓存一周），这点 I/O 远小于一次 TLS 握手。
+pub fn use_system_proxy() -> bool {
+    match load() {
+        Loaded::Ok(s) => s.use_system_proxy.unwrap_or(true),
+        _ => true,
+    }
 }
 
 pub fn state_path() -> Option<PathBuf> {
@@ -156,6 +183,7 @@ pub fn save_to(path: &Path, s: &StateFile) -> Result<(), String> {
         "running_port": s.running_port,
         "close_behavior": s.close_behavior.map(CloseBehavior::as_str),
         "theme_mode": s.theme_mode.map(ThemeMode::as_str),
+        "use_system_proxy": s.use_system_proxy,
     });
     let text = serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?;
     write_atomic(path, &text)
@@ -389,6 +417,7 @@ mod tests {
                 running_port: Some(8080),
                 close_behavior: None,
                 theme_mode: None,
+                use_system_proxy: None,
             },
         )
         .unwrap();
@@ -416,6 +445,7 @@ mod tests {
             running_port: Some(9090),
             close_behavior: Some(CloseBehavior::Quit),
             theme_mode: None,
+            use_system_proxy: None,
         };
         save_to(&p, &s).unwrap();
         match load_from(Some(&p)) {
@@ -443,6 +473,7 @@ mod tests {
             running_port: None,
             close_behavior: None,
             theme_mode: None,
+            use_system_proxy: None,
         };
         save_to(&p, &s).unwrap();
         let leftover = p.with_extension("json.tmp");
@@ -458,6 +489,7 @@ mod tests {
             running_port: None,
             close_behavior: None,
             theme_mode: None,
+            use_system_proxy: None,
         };
         save_to(&p, &s).unwrap();
         update_at(&p, |s| s.running_port = Some(8080)).unwrap();
@@ -508,6 +540,7 @@ mod tests {
             running_port: None,
             close_behavior: None,
             theme_mode: None,
+            use_system_proxy: None,
         };
         save_to(&p, &baseline).unwrap();
 
@@ -518,6 +551,7 @@ mod tests {
             running_port: Some(1),
             close_behavior: None,
             theme_mode: None,
+            use_system_proxy: None,
         };
         assert!(save_to(&p, &different).is_err(), "写 .tmp 失败时 save_to 必须报错");
 
@@ -538,6 +572,7 @@ mod tests {
             running_port: None,
             close_behavior: None,
             theme_mode: Some(ThemeMode::Dark),
+            use_system_proxy: None,
         };
         save_to(&p, &s).unwrap();
         match load_from(Some(&p)) {
@@ -589,11 +624,62 @@ mod tests {
             running_port: None,
             close_behavior: None,
             theme_mode: Some(ThemeMode::Light),
+            use_system_proxy: None,
         };
         save_to(&p, &s).unwrap();
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
         assert_eq!(v.get("theme_mode").and_then(|x| x.as_str()), Some("light"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// `use_system_proxy` 的读取契约。
+    ///
+    /// ⚠ 缺 key 必须是 `None`（= 没记过）而**不是** `Some(false)`：`None` 才代表
+    /// "用户可以什么都没选过"，`use_system_proxy()` 据此回落到缺省档（走系统代理）。
+    /// 若这里读成 `Some(false)`，"没记过"和"用户明确选了直连"就再也分不开 ——
+    /// 而两者的用户意图正好相反。
+    #[test]
+    fn use_system_proxy_absent_is_none_and_explicit_values_roundtrip() {
+        let p = tmp("proxy.json");
+        std::fs::write(&p, r#"{"preferred_port":3080}"#).unwrap();
+        match load_from(Some(&p)) {
+            Loaded::Ok(s) => assert_eq!(
+                s.use_system_proxy, None,
+                "缺 key 必须是 None（没记过），不能替用户猜成直连"
+            ),
+            other => panic!("期望 Ok，得到 {other:?}"),
+        }
+
+        for v in [true, false] {
+            save_to(&p, &StateFile { use_system_proxy: Some(v), ..Default::default() }).unwrap();
+            match load_from(Some(&p)) {
+                Loaded::Ok(s) => assert_eq!(s.use_system_proxy, Some(v), "{v} 应被原样读回"),
+                other => panic!("期望 Ok，得到 {other:?}"),
+            }
+        }
+
+        // ⚠ 落盘的必须是**真布尔**而不是字符串。写成 `"false"` 时 `as_bool()` 读回
+        // `None` → 又回落到"走代理" —— 用户关掉开关、重启后又自己打开了，
+        // 而上面那圈往返测试在写入侧也用字符串时会**照样全绿**。
+        save_to(&p, &StateFile { use_system_proxy: Some(false), ..Default::default() }).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("\"use_system_proxy\": false"), "落盘形状不对: {text}");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 认不出的类型（手改过、将来降级运行）当"没记过" ——
+    /// 与 `close_behavior` / `theme_mode` 同判据，不替用户做决定。
+    #[test]
+    fn non_bool_use_system_proxy_reads_as_none() {
+        let p = tmp("badproxy.json");
+        for bad in [r#"{"use_system_proxy": "yes"}"#, r#"{"use_system_proxy": 1}"#] {
+            std::fs::write(&p, bad).unwrap();
+            match load_from(Some(&p)) {
+                Loaded::Ok(s) => assert_eq!(s.use_system_proxy, None, "{bad} 应读成 None"),
+                other => panic!("期望 Ok，得到 {other:?}"),
+            }
+        }
         let _ = std::fs::remove_file(&p);
     }
 }

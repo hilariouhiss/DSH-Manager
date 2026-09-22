@@ -2,6 +2,11 @@
 
 对应 SRS v1.2 §8.2 / §8.3 的验证清单。日期：**2026-09-20**。
 
+> ⚠ **2026-09-22 增补**：SRS 已升至 **v1.3**，§8.2 新增 **V-27（系统代理，FR-33）**。
+> 本文件下方「已知限制与环境假设」的第 1 条（代理只认环境变量）随之**改为已解决**，
+> 但 **V-27 本身尚未人工执行** —— 它的第 ② 步（切「直连」后请求必须失败）是判别性的。
+> 本文档其余部分的数字（如 `cargo test` 的通过数）停留在各自写作时点，未随之重跑。
+
 被验证的代码：`feat/implementation` @ **`d8114ad`**（Task 19 的收尾提交）+ Task 20 的工作树改动
 （`src/main.rs` / `src/model.rs` / `src/pm.rs` / `src/txn.rs` / `src/dsh.rs` / `src/config.rs`，
 见本次提交信息），随后由 **`a646c9a`**（端到端验证记录）与 **最终修复轮**
@@ -245,11 +250,19 @@ NFR-6 的真实覆盖在 `safe_version_rejects_injection_attempts`、`is_safe_ve
 
 ## 已知限制与环境假设
 
-1. **代理只认环境变量**：`ureq` 的默认 feature 集**不做系统代理发现**，只读 `HTTP_PROXY` / `HTTPS_PROXY`；
+1. ~~**代理只认环境变量**~~ → **已解决（2026-09-22，Ruling 89 修订 · SRS FR-33）**。
+   *原记载（保留以说明来龙去脉）*：`ureq` 的默认 feature 集**不做系统代理发现**，只读 `HTTP_PROXY` / `HTTPS_PROXY`；
    GC-2 禁止为此引入读注册表 / WinINET 的依赖。因此两个出网函数（`dsh::fetch_catalog` / `dsh::fetch_notes`）
    的错误串尾部都挂了 `PROXY_HINT`（"若本机仅允许通过系统代理出网，请设置 HTTPS_PROXY 后重启本程序"）。
    本机实测就撞上过这个组合：直连 `api.github.com` 得 HTTP 403（出口 IP 配额），而系统代理返回 200 ——
    即**只有本程序会失败**，所以失败信息必须自己解释原因。
+   **现在的行为**：程序自己读系统代理（`dsh::system_proxy()`，走 `windows-sys` **已启用**的
+   `Win32_System_Registry`，**未新增依赖、未改 `Cargo.toml`** —— 当初"被 GC-2 挡住"的只有 `winreg` 那条路）。
+   设置面板新增「网络代理」一档：**使用系统代理（缺省）/ 直连**，优先级 **环境变量 > 系统代理 > 直连**，
+   所以本文件里 V-6 那条注入 `HTTPS_PROXY` 的验证路径**行为不变**。`PROXY_HINT` 保留，
+   只是改成同时指向设置面板与 `HTTPS_PROXY`（关掉这一档、或目标机器没配系统代理时，它仍是唯一的解释）。
+   实测：`system_proxy()` 读出 `http://127.0.0.1:12450/`，与注册表 `ProxyServer` 逐字一致。
+   **仍未做**：`ProxyOverride` 绕过列表（上限见 FR-33）。**待人工补验**：SRS §8.2 的 **V-27**（其第 ② 步为判别性步骤）。
 2. **托盘的 `Starting` 态不渲染**：`ui/app.slint` 的 `AppTray` 没有 `web-starting` 属性，托盘菜单的启用
    条件只看 `web-running`/`busy` → 从点击到就绪（正常约 2 s，超时路径最长 20 s）**托盘里的"启动"仍可点**。
    守卫（`start_pending` + 状态检查）会拒绝并写一条日志/状态栏（"已在启动或运行中，忽略重复的启动请求"），

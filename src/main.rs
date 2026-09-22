@@ -93,6 +93,13 @@ struct AppState {
     /// 见 `config::CloseBehavior` 与 `on_close_requested`。
     close_behavior: CloseBehavior,
     theme_mode: ThemeMode,
+    /// 出网是否走 Windows 系统代理（Ruling 89）。
+    ///
+    /// ⚠ **本字段只负责界面那一块的选中态**，不参与出网决策 —— `dsh::agent()`
+    /// 跑在 worker 线程上，它自己读 `config::use_system_proxy()`（同一份
+    /// state.json，所以两者不会分叉）。两者都写、都从同一个来源读，
+    /// 这样 worker 不必为了一个 bool 去跟 UI 线程要状态。
+    use_system_proxy: bool,
     /// 系统当前是否为暗色。**刻意只存在 Rust 侧** —— UI 拿不到也不需要，
     /// 它只需要知道 `resolve()` 之后的结果（那个进了 Tokens.dark）。
     system_dark: bool,
@@ -108,7 +115,12 @@ struct NotesState {
 }
 
 impl AppState {
-    fn new(preferred_port: u16, close_behavior: CloseBehavior, theme_mode: ThemeMode) -> Self {
+    fn new(
+        preferred_port: u16,
+        close_behavior: CloseBehavior,
+        theme_mode: ThemeMode,
+        use_system_proxy: bool,
+    ) -> Self {
         Self {
             env: PmEnv::default(),
             probed: false,
@@ -129,6 +141,7 @@ impl AppState {
             selected_version: None,
             close_behavior,
             theme_mode,
+            use_system_proxy,
             system_dark: theme::system_dark(),
             log: Rc::new(VecModel::default()),
         }
@@ -363,6 +376,10 @@ fn project(state: &AppState, win: &MainWindow, tray: &AppTray) {
     // `impl slint::Global<'a, MainWindow> for Tokens<'a>` + `pub fn set_dark`。
     win.set_theme_mode(state.theme_mode.index());
     win.global::<Tokens>().set_dark(theme::resolve(state.theme_mode, state.system_dark));
+
+    // ── 系统代理（Ruling 89）──
+    // 与「关闭行为」同款：设置面板改的是 AppState，唯一点投影点是本函数。
+    win.set_use_system_proxy(state.use_system_proxy);
 
     // ── 推给托盘（独立实例，必须再推一次）──
     tray.set_web_running(state.web.is_running());
@@ -1101,6 +1118,13 @@ fn wire_callbacks(
             let mut s = state.borrow_mut();
             if let Some(info) = s.env.available.get(idx as usize) {
                 s.selected_pm = Some(info.kind);
+                // ⚠ 必须置 dirty：本回调不改任何 Job，稳态下没有消息可排空，
+                // 而"DSH 在此！"（`pm-is-owner`）只在 project() 里推。
+                // 少了这一行，切到别的 PM 后状态里早已不是 owner，行尾那句
+                // 却停在上一帧的 true —— 且因为没有人再改它，**永远不会消失**。
+                // 与 on_version_changed / on_settings_changed / on_theme_mode_changed
+                // 同款（Ruling 90 第 3 条：回调改过状态就必须投影）。
+                s.dirty = true;
             }
         });
     }
@@ -1272,6 +1296,32 @@ fn wire_callbacks(
         });
     }
 
+    // ── 系统代理（Ruling 89）──
+    //
+    // 与「关闭行为」同款：只有一条投影路径（落 AppState → `project()` 推回），
+    // 点击不发任何 Job，所以必须置 dirty —— 稳态下没有消息可排空。
+    //
+    // ⚠ worker 侧的生效**不经过这里**：`dsh::agent()` 自己读
+    // `config::use_system_proxy()`。所以下面那次落盘不是"顺手持久化"，
+    // 而是这一档**唯一的生效机制** —— 落盘失败必须让用户看见。
+    {
+        let state = state.clone();
+        win.on_proxy_toggled(move |on| {
+            {
+                let mut s = state.borrow_mut();
+                s.use_system_proxy = on;
+                s.dirty = true;
+            }
+            // 偏好立即落盘，设置面板里没有"保存"按钮。
+            if let Err(e) = config::update(|f| f.use_system_proxy = Some(on)) {
+                push_log(
+                    &state.borrow(),
+                    format!("代理设置保存失败，本次运行未生效：{e}"),
+                );
+            }
+        });
+    }
+
     // 首次关闭时那个询问框：两个单选项各带一次"是否记住"。
     {
         let state = state.clone();
@@ -1437,23 +1487,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // FR-23 修订：关闭窗口的行为（隐藏 / 退出 / 每次询问）与端口同源，都读 state.json。
     // 没有记录时是 `Ask` —— "首次关闭要询问"这条需求不需要额外的"是否问过"标志：
     // 没值就是没问过。
-    let (preferred_port, close_behavior, theme_mode, startup_note) = match config::load() {
-        config::Loaded::Ok(s) => (
-            s.preferred_port.unwrap_or(3080),
-            s.close_behavior.unwrap_or_default(),
-            s.theme_mode.unwrap_or_default(),
-            None,
-        ),
-        config::Loaded::Missing => (3080, CloseBehavior::default(), ThemeMode::default(), None),
-        // FR-32：记日志但不阻止启动 —— 端口回落缺省值
-        config::Loaded::Corrupt(e) => (
-            3080,
-            CloseBehavior::default(),
-            ThemeMode::default(),
-            Some(format!("state.json 损坏，使用缺省端口 3080：{e}")),
-        ),
-        config::Loaded::NoLocation => (3080, CloseBehavior::default(), ThemeMode::default(), None),
-    };
+    //
+    // Ruling 89：系统代理那一档读同一份 state.json，缺省同样是"没记过" → 走系统代理。
+    // ⚠ 这里**不**复用 `config::use_system_proxy()`：那个函数会**再读一遍文件**，
+    // 而下面 `config::load()` 已经把这份快照拿在手里了 —— 读两遍就多一个
+    // "两次读取之间文件被改了"的窗口，界面显示 A、出网用 B。两边都从这一份快照取。
+    let (preferred_port, close_behavior, theme_mode, use_system_proxy, startup_note) =
+        match config::load() {
+            config::Loaded::Ok(s) => (
+                s.preferred_port.unwrap_or(3080),
+                s.close_behavior.unwrap_or_default(),
+                s.theme_mode.unwrap_or_default(),
+                s.use_system_proxy.unwrap_or(true),
+                None,
+            ),
+            config::Loaded::Missing => (
+                3080,
+                CloseBehavior::default(),
+                ThemeMode::default(),
+                true,
+                None,
+            ),
+            // FR-32：记日志但不阻止启动 —— 端口回落缺省值
+            config::Loaded::Corrupt(e) => (
+                3080,
+                CloseBehavior::default(),
+                ThemeMode::default(),
+                true,
+                Some(format!("state.json 损坏，使用缺省端口 3080：{e}")),
+            ),
+            config::Loaded::NoLocation => (
+                3080,
+                CloseBehavior::default(),
+                ThemeMode::default(),
+                true,
+                None,
+            ),
+        };
 
     let win = MainWindow::new()?;
     let tray = AppTray::new()?;
@@ -1462,6 +1532,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         preferred_port,
         close_behavior,
         theme_mode,
+        use_system_proxy,
     )));
     push_log(&state.borrow(), "DSH Manager 启动");
     if let Some(note) = startup_note {

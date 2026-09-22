@@ -2,9 +2,9 @@
 
 | 项目 | 内容 |
 |---|---|
-| 文档版本 | 1.2 |
-| 日期 | 2026-09-20 |
-| 关联文档 | [docs/SRS.md](SRS.md) v1.2（需求依据） |
+| 文档版本 | 1.6 |
+| 日期 | 2026-09-22 |
+| 关联文档 | [docs/SRS.md](SRS.md) v1.3（需求依据） |
 | 技术栈 | Rust 2024 edition + Slint 1.18 |
 | 状态 | 待实现 |
 
@@ -1256,7 +1256,14 @@ strip     = true
 | `serde_json` | 解析 registry 与 GitHub 响应 | 用 `Value` 取值即可，**不引入 `serde` derive** |
 | `semver` | 版本解析与比较 | 预发布版本排序必须正确（`0.1.6-alpha.2 > 0.1.5-rc.2`），手写易错 |
 
-**待验证（实现时确认）**：`ureq` 3.4 的默认 TLS 背后端。若默认使用 `rustls` + 内置根证书，则在无企业代理的环境下工作正常；若需系统证书库，需追加 feature。当前环境未配置代理（SRS §2.2.5），预期无问题。
+**已闭合（2026-09-22，原为"待验证"）**：`ureq` 3.4 的默认 TLS 后端**是** `rustls`，根证书用 **`webpki-roots`**（Mozilla 的静态根列表；ureq `lib.rs:235-237` 原话 *"By default, ureq uses Mozilla's root certificates via the webpki-roots crate"*）—— **不是**系统证书库。于是：
+
+- 原预期成立：**不需要**追加 feature 就能在没有系统证书库的环境下工作。
+- ⚠ 但**反过来说**：企业 / MITM 代理注入的证书，链到的是 **Windows 证书库**里的企业根，而 `webpki-roots` **不查那个库** → TLS 校验必然失败。
+- 这条风险因 **FR-33**（系统代理，SRS v1.3）从"理论"变成"**可达**"：程序现在默认把出网交给系统代理。**本机实测未触发**（2026-09-22：清空全部 `*_PROXY` 后 `dsh::fetch_catalog()` 经系统代理 `127.0.0.1:12450` 成功拿到 24 个版本，TLS 握手正常 ⇒ 该本地代理只做 CONNECT 隧道、不终止 TLS）。**换一台机器不保证**，所以留在这里。
+- 升级路径：`ureq` 的 **`platform-verifier`** feature（`rustls-platform-verifier`，改走 OS 证书库）。代价是给依赖树加一个 crate —— 按 GC-2 需先走一次依赖评审，故**本次不做**。
+
+> ⚠ 本段原写"当前环境未配置代理（SRS §2.2.5），预期无问题"。**那个前提是错的** —— 本机配了系统代理 `127.0.0.1:12450`（SRS §2.2.5 已于 v1.3 更正）。结论仍然成立，但**理由**必须换成上面这条实测：否则一旦某台机器上的代理真的做中间人，这句"预期无问题"会把人带偏。
 
 ### 7.2 明确拒绝的依赖
 
@@ -1337,3 +1344,4 @@ strip     = true
 | 1.3 | 2026-09-21 | **组件样式统一**（§2.4.3、§3.2）：**①** 输入框 / 下拉框改为自绘 `GlassField` / `GlassSelect`，删掉两处压制 Fluent 的 `min-width: 0px; height: 30px;` 与端口框的三层嵌套 hack；**②** 新增语义令牌（`fill` / `fill-hover` / `fill-active` / `sunk` / `solid` / `overlay` / `accent-*` / `hairline-strong` / `motion-*` / `disabled`），收敛原先散落的 6 档白百分比与 5 档时长；**③** 抽出 `Flyout` / `Divider` / `SectionHeader` / `CloseButton` 四个共用件（三个对话框的关闭按钮原先各抄一份且都没有 hover）；**④** 修掉日志列表条目的水平居中（`width: 100%` + `Text.x = 0`，实测左边缘 183/147/92 → 38/38/38）；**⑤** 删除未使用的 `Button` 导入；**⑥** 新增 `FieldLabel`（表单字段标签，与字段正文**同字号 12.5px、同高 32px**，层次只靠颜色），`Eyebrow`（9.5px）收窄为分区标题 / 元信息键专用 —— 原先字段行拿 9.5px 眉标当标签，压在 12.5px 的字段文字旁边字号差一大截；**⑦** 下拉框与输入框**角色分开**：输入框是下凹槽（`sunk` + `hairline-strong`），下拉框是凸起控件面（`fill` + `hairline` + 悬停提亮），原先两者同一个壳、看起来都能打字；**⑧** 下拉箭头补 `cross-axis-alignment: center`（漏了它会被顶到字段上沿，同一坑 PillButton 注释里已记过） |
 | 1.4 | 2026-09-22 | **更新说明改为 GitHub 式分块排版**（FR-27，§2.2 数据流 / §3.2 要点 3 / §4.x 纯函数 / §8 测试表）：`preprocess_notes(&str) -> String` 换成 `parse_notes_blocks(&str) -> Vec<NoteBlock>`，属性 `notes-text: styled-text` 换成 `notes-blocks: [NoteBlock]`，新增 `NoteKind` / `NoteBlock` 与 Slint 侧的 `NoteBlockView`。**根因**：Slint 的 `StyledText` 不支持标题（官方 Currently Unsupported），也没有字重属性 ——单段文字做不到"标题比正文大"与"列表悬挂缩进"，只能把块结构交给 Rust 侧解析。随之删掉"标题前补空行"的 hack（块间距现在由布局给） |
 | 1.5 | 2026-09-22 | **新增主题子系统**（`feat/theme-system`）：**①** 新增 **§4.7**（职责边界、Rust 唯一真相源、`Tokens.dark` 与 `Palette.color-scheme` **两条投影路径**及为何是两条、`system_dark` 刻意不进 `.slint`、`UiMsg::SystemThemeChanged` 与 80 ms 排空、§5.2 兜底变成条件可达的代价）；**②** `global Tokens` 的 40 条 brush 令牌改为双值（`dark ? #暗 : #浅`），暗色侧逐行不动；**③** `ThemeMode` 三档 + `resolve()` 唯一判据 + 与 winit 同源的 `system_dark()` + 无竞态监视线程；**④** `state.json` 增 `theme_mode`（缺 key = 跟随系统，旧三字段文件照常可用）；**⑤** 设置面板新增「主题」组（浅色/深色/跟随系统，强制档改不动系统标题栏已在面板内交代）；**⑥** 删掉全部 6 处过渡期 `#[allow(dead_code)]`，删除后仍是 0 警告、无真实死代码 |
+| 1.6 | 2026-09-22 | **新增出网代理（SRS v1.3 的 FR-33）并闭合 §7.1 的 TLS 待验证项**：**①** §7.1 的"待验证：`ureq` 3.4 的默认 TLS 后端"**已闭合** —— 默认是 `rustls` + **`webpki-roots`**（Mozilla 静态根，**非**系统证书库），随之记下它的反面：企业/MITM 代理注入的企业根**不被信任**，而该风险因 FR-33 从理论变为可达（本机实测未触发）；升级路径是 ureq 的 `platform-verifier` feature。**②** 更正本段原来引用的错误前提"当前环境未配置代理（SRS §2.2.5）"。**③** §7.1 依赖表**不变** —— FR-33 读系统代理走的是 `windows-sys` **已启用**的 `Win32_System_Registry` feature，**未新增依赖、未改 `Cargo.toml`**（GC-2 当初挡住的只有 `winreg` 那条路） |
