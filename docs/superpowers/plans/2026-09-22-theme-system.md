@@ -417,6 +417,14 @@ git commit -m "feat(theme): state.json 持久化 theme_mode，含旧文件兼容
 在 `src/theme.rs` 的 `mod tests` 内追加（顶部补 `use std::collections::BTreeMap;`）：
 
 ```rust
+    /// `Tokens` 全局里应当出现的 brush 令牌数量下限。
+    ///
+    /// ⚠ 这个下限不是凑数：`parse_palette` 对没有 `<brush>` 标记的行是 `continue`（因为块内
+    /// 合法地存在 `<length>` / `<duration>` / `<float>` 行），于是**某一行的 `<brush>` 标记
+    /// 被误删时会静默少覆盖一个令牌**。下限把"静默漏掉"变成"测试失败"。取 `>=` 而非 `==`，
+    /// 这样以后新增令牌不会误报，而丢令牌一定会被抓到。
+    const MIN_BRUSH_TOKENS: usize = 40;
+
     /// 从 `ui/app.slint` 的 Tokens 全局解析每个 brush 令牌的（暗值, 浅值）。
     ///
     /// ⚠ 只认 `out property <brush> 名字: dark ? #AAAAAA : #BBBBBB;` 这一形状，
@@ -442,9 +450,16 @@ git commit -m "feat(theme): state.json 持久化 theme_mode，含旧文件兼容
                 .ok_or_else(|| format!("令牌行缺冒号: {line}"))?;
             let name = name.trim().to_string();
             if !name.is_empty() {
-                let (dark_side, light_side) = val
+                // ⚠ 两段式切分，顺序不能反：值的形状是 `dark ? #暗 : #浅`，
+                // 所以 `?` 之前那一段是**条件本身**（` dark `），里面没有 `#`。
+                // 先按 `?` 验证形状，再在 `?` 之后那一段里按 `:` 分出明暗两值。
+                // （先按 `:` 再按 `?` 会去 ` dark ` 里找 hex，永远找不到 —— 那是本计划初稿的 bug。）
+                let (_, arms) = val
                     .split_once('?')
                     .ok_or_else(|| format!("令牌 {name} 没有明暗条件（期望 `dark ? 暗 : 浅`）: {line}"))?;
+                let (dark_side, light_side) = arms
+                    .split_once(':')
+                    .ok_or_else(|| format!("令牌 {name} 的明暗两值之间缺冒号: {line}"))?;
                 let (dark, light) = (
                     hex(dark_side).ok_or_else(|| format!("{name} 的暗色侧不是 hex: {line}"))?,
                     hex(light_side).ok_or_else(|| format!("{name} 的浅色侧不是 hex: {line}"))?,
@@ -452,8 +467,12 @@ git commit -m "feat(theme): state.json 持久化 theme_mode，含旧文件兼容
                 out.push((name, dark, light));
             }
         }
-        if out.is_empty() {
-            return Err("一个令牌都没解析出来".into());
+        if out.len() < MIN_BRUSH_TOKENS {
+            return Err(format!(
+                "只解析出 {} 个 brush 令牌，少于下限 {MIN_BRUSH_TOKENS} —— \
+                 多半是某行的 `<brush>` 标记被改了，那些令牌会静默失去覆盖",
+                out.len()
+            ));
         }
         Ok(out)
     }
@@ -518,8 +537,8 @@ git commit -m "feat(theme): state.json 持久化 theme_mode，含旧文件兼容
             let (d, l) = p.get(name).unwrap_or_else(|| panic!("缺 {name} 令牌")).clone();
             let rd = contrast(&d, &c_dark);
             let rl = contrast(&l, &c_light);
-            assert!(rd >= bar, "暗色 {name}={d} on {c_dark} 只有 {rd:.2f}，需 >= {bar}");
-            assert!(rl >= bar, "浅色 {name}={l} on {c_light} 只有 {rl:.2f}，需 >= {bar}");
+            assert!(rd >= bar, "暗色 {name}={d} on {c_dark} 只有 {rd:.2}，需 >= {bar}");
+            assert!(rl >= bar, "浅色 {name}={l} on {c_light} 只有 {rl:.2}，需 >= {bar}");
         }
     }
 
@@ -548,7 +567,7 @@ git commit -m "feat(theme): state.json 持久化 theme_mode，含旧文件兼容
                 let r = contrast(&comp, bg);
                 assert!(
                     r >= bar,
-                    "{label} {name}={val} 合成到 {bg} 得 {comp}，只有 {r:.3f}，需 >= {bar}"
+                    "{label} {name}={val} 合成到 {bg} 得 {comp}，只有 {r:.3}，需 >= {bar}"
                 );
             }
         }
@@ -675,13 +694,16 @@ export global Tokens {
 
     // ── 动效与状态（两套主题共用，不参与主题）──────────────────────────────
     // 三档时长：读数变色 400ms / 配色切换 200ms / 按压回弹 150ms。
+    // 收敛前是 160/200/260/300/400 五档，差别全在"当时顺手写了多少"。
     out property <duration> motion-slow:  400ms;
     out property <duration> motion-hover: 200ms;
     out property <duration> motion-tap:   150ms;
     /// 状态栏高度。⚠ 两处必须一致：主布局靠 `padding-bottom: Tokens.status-h`
-    /// 给贴底的状态栏让位，状态栏自己用它定高。
+    /// 给贴底的状态栏让位，状态栏自己用它定高 —— 不一致就会出现"内容压在栏上"
+    /// 或者"栏上方一条谁也解释不清的空白"。
     out property <length> status-h: 34px;
-    /// 不可用元素整体压暗的统一档位。用 opacity 表达，两套主题同样成立。
+    /// 不可用元素整体压暗的统一档位（收敛前 0.30 / 0.34 两个值）。
+    /// 用 opacity 表达，故两套主题同样成立，不需要按主题分叉。
     out property <float> disabled: 0.35;
 }
 ```
@@ -730,8 +752,12 @@ Expected: `both_palettes_meet_text_contrast_bars` 与 `translucent_tiers_stay_vi
 Run: `cargo build 2>&1 | tail -5`
 Expected: `Finished`，0 警告。
 
-Run: `grep -n '#[0-9A-Fa-f]\{6,8\}' ui/app.slint | awk -F: '$1>115'`
+Run: `awk '/^global Tokens \{/{inblk=1} /^\}/{inblk=0} !inblk' ui/app.slint | grep -n '#[0-9A-Fa-f]\{6,8\}'`
 Expected: 只剩注释行（`//` 开头）。**任何非注释行都是漏抽的字面量**，必须补成令牌。
+
+⚠ 这里用**块相对**的切法，而不是早先写的行号阈值 `awk -F: '$1>115'` —— 那个阈值在双主题改写后**已经过期**：
+令牌块本身从 `:43` 撑到 `:137`，`>115` 会把块内 7 行令牌定义当成"块外字面量"报出来，是个假阳性陷阱。
+块相对的切法不依赖行号，块怎么长都成立（Task 3+4 实测确认块外命中为空）。
 
 - [ ] **Step 6: 确认 `dark` 开关真的驱动了颜色（临时验证，随后还原）**
 
@@ -739,6 +765,9 @@ Run: `cargo test theme::tests::both_palettes_meet_text_contrast_bars 2>&1 | tail
 然后**手动**把 `canvas` 的浅色值 `#EDEFF7` 临时改成 `#000000`，重跑上面这条命令。
 
 Expected: **FAIL**，报"浅色 canvas 相关对比度不足"。这证明测试真的在读文件、真的会因错值而红（而不是恒真）。改回 `#EDEFF7`，重跑确认 PASS。
+
+⚠ 同时确认**浅色 `ink` 的报错数字**：`#191B2A` 落在 `#000000` 上对比度应约为 **1.23**（Task 3+4 实测值）。
+若报出的数字与此相差甚远，说明测试读的不是 `ui/app.slint` 的真实值 —— 那就是假绿，必须查清再提交。
 
 - [ ] **Step 7: 提交**
 
