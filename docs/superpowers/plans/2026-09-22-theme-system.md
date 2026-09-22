@@ -419,10 +419,14 @@ git commit -m "feat(theme): state.json 持久化 theme_mode，含旧文件兼容
 ```rust
     /// `Tokens` 全局里应当出现的 brush 令牌数量下限。
     ///
-    /// ⚠ 这个下限不是凑数：`parse_palette` 对没有 `<brush>` 标记的行是 `continue`（因为块内
-    /// 合法地存在 `<length>` / `<duration>` / `<float>` 行），于是**某一行的 `<brush>` 标记
-    /// 被误删时会静默少覆盖一个令牌**。下限把"静默漏掉"变成"测试失败"。取 `>=` 而非 `==`，
-    /// 这样以后新增令牌不会误报，而丢令牌一定会被抓到。
+    /// ⚠ 下限守的是"**某个令牌行被整行删掉**"这一情形：`parse_palette` 只认带 `<brush>` 的行
+    /// （块内合法地存在 `<length>` / `<duration>` / `<float>` 行，不能因为不是 brush 就报错），
+    /// 于是被删掉的行不留任何痕迹 —— 40 变 39，那个令牌就静默失去对比度覆盖。
+    /// 取 `>=` 而非 `==`：以后新增令牌不会误报，而丢令牌一定会被抓到。
+    ///
+    /// ⚠ 但**不要**把"某行的 `<brush>` 标记被写坏"算作本断言的功劳：那种写法（如 `<brushX>`）
+    /// 会让 Slint 编译器先报 `Unknown type`，根本走不到测试。所以本下限是**纵深防御**，
+    /// 不是唯一一道防线（Task 3+4 实测确认：改坏标记时 build.rs 直接 panic）。
     const MIN_BRUSH_TOKENS: usize = 40;
 
     /// 从 `ui/app.slint` 的 Tokens 全局解析每个 brush 令牌的（暗值, 浅值）。
@@ -752,12 +756,17 @@ Expected: `both_palettes_meet_text_contrast_bars` 与 `translucent_tiers_stay_vi
 Run: `cargo build 2>&1 | tail -5`
 Expected: `Finished`，0 警告。
 
-Run: `awk '/^global Tokens \{/{inblk=1} /^\}/{inblk=0} !inblk' ui/app.slint | grep -n '#[0-9A-Fa-f]\{6,8\}'`
+Run: `awk '/global Tokens \{/{inblk=1} /^\}/{inblk=0} !inblk' ui/app.slint | grep -n '#[0-9A-Fa-f]\{6,8\}'`
 Expected: 只剩注释行（`//` 开头）。**任何非注释行都是漏抽的字面量**，必须补成令牌。
+（当前应为 4 个命中，全部是文档注释里引用的 logo 锚点色。）
 
-⚠ 这里用**块相对**的切法，而不是早先写的行号阈值 `awk -F: '$1>115'` —— 那个阈值在双主题改写后**已经过期**：
-令牌块本身从 `:43` 撑到 `:137`，`>115` 会把块内 7 行令牌定义当成"块外字面量"报出来，是个假阳性陷阱。
-块相对的切法不依赖行号，块怎么长都成立（Task 3+4 实测确认块外命中为空）。
+⚠ 这个 awk 用**块相对**切法，而不是早先写的行号阈值 `awk -F: '$1>115'` —— 那个阈值在双主题改写后
+**已经过期**：令牌块从 `:43` 撑到 `:137`，`>115` 会把块内 7 行令牌定义当成"块外字面量"报出来。
+
+⚠⚠ 锚点**不能带 `^`**：声明行是 `export global Tokens {`（Task 4 把它从 `global` 改成了 `export global`），
+所以 `/^global Tokens \{/` 永远不匹配 —— `inblk` 恒为 0、`!inblk` 恒为真、整个文件穿透，
+实测会返回 **45** 个假阳性。必须是 `/global Tokens \{/`（或不带锚点）。
+这条是 Task 3+4 实测抓到的：我第一次修这个命令时正是把 `^` 加了进去，等于用一个 bug 换掉了另一个。
 
 - [ ] **Step 6: 确认 `dark` 开关真的驱动了颜色（临时验证，随后还原）**
 
