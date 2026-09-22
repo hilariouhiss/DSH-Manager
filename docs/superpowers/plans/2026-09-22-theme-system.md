@@ -1097,27 +1097,41 @@ git commit -m "feat(theme): Windows 系统主题探测（与 winit 同源 + 注�
 
 `AppState::new` 签名改为 `fn new(preferred_port: u16, close_behavior: CloseBehavior, theme_mode: ThemeMode) -> Self`，初始化列表加 `theme_mode,` 与 `system_dark: theme::system_dark(),`；`main()` 里的调用处补第三个实参（本步先传 `ThemeMode::default()`，Task 8 再改成读持久化值）。
 
-`drain()` 的 `match msg` 内加（⚠ 三次 `borrow()` 不能重叠，否则 `RefCell` 会 panic —— 先把值取出来再改）：
+`drain()` 的 `match msg` 内加。
+
+⚠⚠ **不要在这里再 borrow 一次。** `drain()` 在 `match` **之外**已经持有
+`let mut s = state.borrow_mut();`（`src/main.rs:371`，作用域覆盖整个 `match` —— 该函数自己在
+`src/main.rs:540` 的注释里写明"`s` 已在本轮结束处释放"）。所以本臂里任何 `state.borrow()` /
+`state.borrow_mut()` 都是**第二次**借用，而 `RefCell` 的借用是**运行期**检查的：
+编译期一声不吭，第一次切系统主题就在 80ms timer 回调里 panic。
+
+本计划初稿正是这么写的（一个内层 `state.borrow()` 加一个内层 `borrow_mut()`），
+Task 6 用一次性探针实测到 `panicked at src/main.rs:489:43: RefCell already mutably borrowed`。
+**正确写法是直接用在手的 `s`，先取值再改**：
 
 ```rust
             // 系统主题变了。⚠ 只有「跟随系统」档会因此改变外观：强制档下
             // resolved 不变，就不该置 dirty 触发一次无谓重绘。
+            //
+            // ⚠ **不在这里再 `state.borrow()`** —— 本臂之上 `drain` 已经持有
+            // `s`（`state.borrow_mut()`，作用域覆盖整个 `match`）。RefCell 的
+            // 借用是**运行期**检查的：多借一次编译期毫无提示，第一次切系统主题就
+            // 直接 panic（实测 "RefCell already mutably borrowed"）。
+            // 所以旧值一律从**已在手的** `s` 上取，先取完再改 —— 次序不变。
             UiMsg::SystemThemeChanged(dark) => {
-                let (mode, was) = {
-                    let s = state.borrow();
-                    (s.theme_mode, theme::resolve(s.theme_mode, s.system_dark))
-                };
-                let now = theme::resolve(mode, dark);
-                {
-                    let mut s = state.borrow_mut();
-                    s.system_dark = dark;
-                    if was != now {
-                        s.dirty = true;
-                    }
+                let was = theme::resolve(s.theme_mode, s.system_dark);
+                let now = theme::resolve(s.theme_mode, dark);
+                s.system_dark = dark;
+                if was != now {
+                    s.dirty = true;
                 }
                 changed |= was != now;
             }
 ```
+
+⚠ 这类"看着对、编译过、跑起来才炸"的缺陷本计划已出现过一次同类（D3 的解析器形状），
+共同点是**代码片段要与既有代码的上下文交互**：内层 borrow 的合法性取决于外层是否已持有借用。
+改这类片段时必须先把**所在函数的既有作用域**读一遍。
 
 - [ ] **Step 3: 编译确认变体已被穷尽处理**
 
