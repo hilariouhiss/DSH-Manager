@@ -199,7 +199,37 @@ pub fn resolve(mode: ThemeMode, system_dark: bool) -> bool {
 Run: `cargo test theme:: 2>&1 | tail -12`
 Expected: `test result: ok. 6 passed`
 
-- [ ] **Step 5: 提交**
+- [ ] **Step 5: 加过渡期的 `dead_code` 抑制（带移除契约）**
+
+⚠ **这一步是必需的，且理由已实测**：二进制 crate 里未被消费的 `pub` 项会触发 `dead_code`（本步会看到 3 条：
+`ThemeMode`、它的 4 个关联项、`resolve`）。消费者要等到 Task 2（`parse`/`as_str`）、Task 6（`resolve`）、
+Task 8（`index`/`from_index`）才到位，而 Global Constraints 要求 `cargo build` 0 警告 —— 两条在过渡期不可兼得。
+
+仓库先例：`docs/RULINGS.md` **Ruling 10** 处理过同一个缺陷（当时是 `model.rs` 的类型要到 Task 17 才被消费），
+措施是"一行带移除契约的 `#![allow(dead_code)]` + 最终任务里强制删除"。
+
+本计划的形态与那次不同：受影响项**只在一个模块里**（`src/theme.rs`），而 Ruling 10 选 crate 级正是因为
+当时"分布在 model.rs / pm.rs / dsh.rs 多个文件"。所以这里采用**模块级**、比先例更窄的写法，放在
+`src/theme.rs` 顶部（`//!` 文档注释之后、`use` 之前）：
+
+```rust
+// ⚠ 过渡期抑制，**Task 9 必须删除本行**（那里有强制的删除步骤）。
+// 本模块的项分三批被消费：parse/as_str → Task 2，resolve → Task 6，
+// index/from_index → Task 8。在最后一个消费者到位之前，`cargo build` 会对尚未
+// 被消费的项报 dead_code，而 Global Constraints 要求构建输出干净。
+// 仓库先例：docs/RULINGS.md Ruling 10（同一缺陷，当时用的是 crate 级写法，
+// 因为那时受影响项跨多个文件；本次只涉及本模块，故取更窄的模块级）。
+// ⚠ 本行只压"还没被消费"，**不得**用它掩盖真实死代码 —— 后者一律删除。
+#![allow(dead_code)]
+```
+
+Run: `cargo build 2>&1 | grep -c "^warning"`
+Expected: `0`
+
+再 Run: `cargo test 2>&1 | tail -4`
+Expected: `test result: ok. 101 passed`（95 + 6 新增）
+
+- [ ] **Step 6: 提交**
 
 ```bash
 git add src/theme.rs src/main.rs
@@ -1304,7 +1334,21 @@ git commit -m "feat(theme): 明暗双主题接线（探测/监视/持久化/设�
 - Modify: `docs/RULINGS.md`（记录平台事实与设计后果）
 - Modify: `docs/VERIFICATION.md`（记本轮实测）
 
-- [ ] **Step 1: 跑完整验证矩阵**
+- [ ] **Step 1: 删除过渡期的 `dead_code` 抑制，并确认零警告**
+
+Task 1 Step 5 在 `src/theme.rs` 顶部加的 `#![allow(dead_code)]` **必须在本步删除** —— 到这一步
+四批消费者（Task 2 / 6 / 8）都已落地，抑制已经没有存在理由。
+
+Run: `grep -n "allow(dead_code)" src/theme.rs`
+Expected: 只剩注释里提到它的那几行，**没有**生效的 `#![allow(dead_code)]` 行。
+
+删除后 Run: `cargo build 2>&1 | grep -c "^warning"`
+Expected: `0`。
+
+⚠ **若删掉后仍有 `dead_code` 警告**：那是**真实死代码**，按仓库规矩（Global Constraints「本仓库不接受
+allow 掩盖死代码」）删除该代码，**不得**恢复抑制行。这一点是 Ruling 10 的"代价若错"所指，由本步兜住。
+
+- [ ] **Step 2: 跑完整验证矩阵**
 
 **截图矩阵**（复用 `target/shot.ps1` 的做法：启动 → `PrintWindow` → 杀进程）。⚠ **不得点击任何控件**，且运行前后都要核对 `state.json` 与 `3080` 的 pid 未变：
 
@@ -1323,11 +1367,11 @@ git commit -m "feat(theme): 明暗双主题接线（探测/监视/持久化/设�
 
 Expected: 全部符合。任何不符都记进 `docs/VERIFICATION.md` 的备注，**不得**只写"通过"。
 
-- [ ] **Step 2: `docs/ARCHITECTURE.md` 加一节**
+- [ ] **Step 3: `docs/ARCHITECTURE.md` 加一节**
 
 新增主题子系统小节，至少覆盖：`src/theme.rs` 的职责边界、Rust 为唯一真相源、`Tokens.dark` 与 `Palette.color-scheme` 两条投影路径及为何是两条、`UiMsg::SystemThemeChanged` 与 80ms 排空的关系。**注明 `system_dark` 刻意不进 .slint**，以免下一个人"顺手"把它加到 UI 属性里从而出现两个真相源。
 
-- [ ] **Step 3: `docs/RULINGS.md` 记三条平台事实**
+- [ ] **Step 4: `docs/RULINGS.md` 记三条平台事实**
 
 按本仓库惯例（平台事实要留档，避免下一个人重新踩），逐条记录并写明设计后果：
 
@@ -1335,7 +1379,7 @@ Expected: 全部符合。任何不符都记进 `docs/VERIFICATION.md` 的备注�
 2. **winit 的探测只作用于系统标题栏**，且用的是 `uxtheme.dll` 序号 132 而非注册表（`winit-0.30.13/src/platform_impl/windows/dark_mode.rs:130`），Slint 也无公开 API 覆盖窗口主题。后果：① 我们的探测必须与 winit 同源，否则主体与标题栏不一致；② **强制明/暗改不动系统标题栏**是平台限制，必须在设置面板里向用户交代。
 3. **`Palette.color-scheme` 只能经 `changed` 处理器里的赋值切换**，绑定形态是 Parse error（成因：`parse_element_content` 只在 `Identifier Colon` 时走绑定分支，限定名进不去）。后果：Fluent 配色同步必须写成"局部属性镜像 + `changed`"。
 
-- [ ] **Step 4: 提交**
+- [ ] **Step 5: 提交**
 
 ```bash
 git add docs/
