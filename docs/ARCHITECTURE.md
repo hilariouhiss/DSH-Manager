@@ -2,9 +2,9 @@
 
 | 项目 | 内容 |
 |---|---|
-| 文档版本 | 1.6 |
+| 文档版本 | 1.7 |
 | 日期 | 2026-09-22 |
-| 关联文档 | [docs/SRS.md](SRS.md) v1.3（需求依据） |
+| 关联文档 | [docs/SRS.md](SRS.md) v1.4（需求依据） |
 | 技术栈 | Rust 2024 edition + Slint 1.18 |
 | 状态 | 待实现 |
 
@@ -128,6 +128,15 @@
   │ 命令表   │      │ 进程监督  │      │ 补偿逻辑 │   │ 读写     │
   └──────────┘      └──────────┘      └──────────┘   └──────────┘
         ▲                  ▲                  ▲              ▲
+        │                  │                  │              │
+        │            ┌─────┴──────┐           │              │
+        │            │ plugin.rs  │（v1.7 新增）│              │
+        │            │ 插件盘点   │           │              │
+        └────────────│ registry 查询│          │              │
+                     │ dsh plugin │           │              │
+                     │  命令转发  │           │              │
+                     └─────┬──────┘           │              │
+                           │                  │              │
         └──────────────────┼──────────────────┴──────────────┘
                            │
                     ┌──────┴───────┐
@@ -139,6 +148,10 @@
                     │ ui/app.slint │  MainWindow + AppTray
                     └──────────────┘
 ```
+
+**`plugin.rs` 的依赖方向**（v1.7）：它依赖 `model.rs`（类型）、`pm.rs`（`run_cmd`，带
+`CREATE_NO_WINDOW`）、`dsh.rs`（`agent()` —— 因此自动继承 FR-33 的系统代理）。
+**没有任何模块依赖它**，只有 `main.rs` 的 worker 调它 —— 与 `config.rs` 同为叶子。
 
 **依赖规则的唯一硬约束**：`model.rs` 不得依赖任何其他模块。它是纯数据类型层，这样 `txn.rs` 的单元测试可以只依赖 `model.rs` + 一个假 backend。
 
@@ -315,50 +328,94 @@ export component AppTray inherits SystemTrayIcon { ... }   // 恰好一个 Menu 
 
 ### 3.2 MainWindow 属性契约
 
+> ⚠ v1.7 按**实现的实际形状**重写。原块是动工前的契约，早已与代码不符：`pm-options` /
+> `pm-index` / `pm-is-owner` / `version-is-current` / `latest-version` / `installed-channel` /
+> `hide-to-tray` / `about-clicked` 都已在 v1.3~v1.7 中被删除，而主题、代理、关闭行为、
+> 重装确认、插件卡这 5 组从未写进来过。
+
 ```slint
 export component MainWindow inherits Window {
-    // ---- 版本信息（FR-9）----
-    in property <string>  installed-version: "检测中…";
-    in property <string>  installed-channel: "";
-    in property <string>  latest-version:    "";
-    in property <bool>    up-to-date:        false;
-    in property <bool>    version-known:     false;
+    // ---- 版本信息（FR-9 修订）----
+    in property <string>  installed-version: "检测中…";   // 哨兵："检测中…" / "未检测到 dsh"
+    in property <bool>    version-known:     false;       // 探测完成 && 已装 && 通道内最新已知
+    in property <bool>    up-to-date:        false;       // 操作卡右端的徽标只看这一件事
+    // ⚠ `latest-version` 属性已随左栏版本主卡删除：目标版本下拉的默认选中项就是通道最新版。
 
-    // ---- 选择器（FR-10、FR-11）----
-    in property <[string]> pm-options:       [];   // "npm · dsh 安装于此"
-    in property <int>      pm-index:         0;
-    in property <[string]> version-options:  [];   // "0.1.6-alpha.2  (alpha)  ← 当前"
-    in property <int>      version-index:    0;
+    // ---- 选择器（FR-10 / FR-11 修订）----
+    in property <[string]> version-options:  [];          // 裸版本号，降序
+    in-out property <int>  version-index:    0;
+    in property <string>   pm-label:         "检测中…";   // owner PM 的**只读指示**（原下拉框）
 
     // ---- dsh web（FR-18）----
     in property <bool>     web-running:      false;
+    in property <bool>     web-starting:     false;       // I-2：Starting 期间 running 仍是 false
     in property <string>   web-url:          "";
-    in property <string>   port-text:        "3080";
+    in-out property <string> port-text:      "3080";
 
     // ---- 更新说明（FR-27）----
-    // v1.4 起是**块数组**（标题 / 列表项 / 段落），不再是单段 styled-text：
-    // StyledText 不支持标题、也没有字重，做不到"标题比正文大 + 列表悬挂缩进"。
     in property <[NoteBlock]> notes-blocks:  [];
     in property <NotesStatus> notes-status:  .loading;
 
+    // ---- 插件卡（FR-34）----
+    in property <[PluginRow]> plugin-rows:   [];
+    in property <string>   plugin-summary:      "";       // 卡头 trailing：汇总
+    in property <string>   plugin-status-line:  "";       // 卡底左侧：状态（两处各管一件事）
+    in property <bool>     plugins-loading:     false;
+    in property <int>      plugin-updatable-count: 0;
+    in property <length>   plugin-card-height:  164px;    // Rust 按行数算，上限 6 行（§4.8.6）
+    in-out property <string> plugin-input:      "";       // 安装输入框
+    in-out property <bool>   plugin-remove-prompt-visible: false;
+    in property <string>     plugin-remove-name:    "";
+    in property <string>     plugin-remove-version: "";
+
     // ---- 日志与忙碌态（FR-15、FR-28）----
     in property <[string]> log-lines:        [];
-    in property <bool>     busy:             false;
+    in property <bool>     busy:             false;       // 版本事务与插件操作**共用**这一道闸门
     in property <string>   busy-label:       "";
     in property <string>   status-text:      "";
 
+    // ---- 关于（FR-29）与设置 ----
+    in property <string>   app-version: "";  in property <string> dsh-path: "";
+    in property <string>   owner-pm: "";     in property <string> current-port: "";
+    in-out property <int>  close-behavior-index: 2;   // 与 config::CloseBehavior 下标一一对应
+    in-out property <int>  theme-mode: 2;             // 与 theme::ThemeMode 下标一一对应
+    in property <bool>     use-system-proxy: true;    // 只描述界面选中态（决策在 dsh::agent）
+
+    // ---- 纯窗口本地 UI 状态（不进 AppState）----
+    in-out property <bool> about-visible: false;
+    in-out property <bool> settings-visible: false;
+    in-out property <bool> close-prompt-visible: false;
+    in-out property <bool> close-prompt-remember: true;
+    in-out property <bool> reinstall-prompt-visible: false;   // FR-12b
+    in property <string>   reinstall-version: "";
+    in-out property <int>  open-menu: 0;                      // 0=无 / 1=文件 / 2=帮助
+
     // ---- 回调 ----
-    callback install-clicked();
-    callback pm-changed(int);
+    callback install-clicked();          // 目标版本 == 已装版本时由 Rust 改成弹重装框
     callback version-changed(int);
-    callback refresh-clicked();
-    callback start-web();
-    callback stop-web();
-    callback open-web();
+    callback refresh-clicked();          // Probe + FetchCatalog + FetchPlugins
+    callback start-web();   callback stop-web();   callback open-web();
     callback port-changed(string);
-    callback hide-to-tray();
-    callback about-clicked();
+    callback settings-changed(int);      // 关闭行为
+    callback theme-mode-changed(int);
+    callback proxy-toggled(bool);
+    callback close-choice(int, bool);    // (行为下标, 是否记住)
+    callback reinstall-confirmed();      // FR-12b 的〔重装〕
+    callback plugin-install();           // FR-35：读 plugin-input，Rust 侧校验
+    callback plugin-update(int);         // FR-36：行下标
+    callback plugin-update-all();
+    callback plugin-remove(int);         // FR-37：行下标 → 只弹确认框
+    callback plugin-remove-confirmed();  // FR-37：确认框里的〔卸载〕→ 才派发
+    callback plugin-refresh();
+    callback quit-app();
     callback link-clicked(string);       // 来自 StyledText，交给系统浏览器
+}
+
+// ⚠ `PluginRow` 的**字段全是格式化好的字符串**（可更新与否、显示"未安装"还是"—"都由
+// Rust 侧算完）—— 与 `version-options` 同款约定：Slint 不做判断，也就不可能与状态分叉。
+export struct PluginRow {
+    name: string, spec: string, installed: string, latest: string,
+    updatable: bool, missing: bool,
 }
 
 export enum NotesStatus { loading, ok, missing, failed }
@@ -854,7 +911,6 @@ pub fn open_url(url: &str) -> Result<(), String> {
 **关于 `stdout` 就绪探测 vs 端口探测**：不解析 `dsh web` 的输出文本，因为那依赖 `dsh` 的输出格式（SRS AS-3 已将其列为假设）。TCP 探测只依赖"端口最终会监听"这一稳定事实。
 
 ### 4.4 `src/config.rs` — 配置持久化
-
 > 覆盖 SRS FR-30 / FR-31 / FR-32 / §3.8。
 
 #### 4.4.1 内存表示
@@ -1160,6 +1216,75 @@ Slint 的属性只能在 UI 线程写。所有 `UiMsg` 都由 UI 线程上那个
 
 ---
 
+### 4.8 `src/plugin.rs` — 第三方插件管理（v1.7 新增）
+
+规格：`docs/superpowers/specs/2026-09-22-plugin-manager-design.md`。需求：SRS v1.4 的 §3.9（FR-34 ~ FR-37b）与 NFR-12。
+
+#### 4.8.1 职责边界
+
+`plugin.rs` **只做四件事**：
+
+| 项 | 职责 |
+|---|---|
+| `profile_dir_from` / `profile_dir` | 定位 `%DSH_HOME%\profiles\web`（`DSH_HOME` 缺省 `%USERPROFILE%\.dsh`） |
+| `valid_spec` | 规格白名单（**信任边界**） |
+| `read_installed` / `parse_latest` / `fetch_latest` / `fill_latest` | 盘点已装 + 查 registry 最新版 |
+| `update_all_op` / `run_plugin`(+`_with`) / `fetch_all` | 汇总更新操作、转发 `dsh plugin` |
+
+它**不含 UI 逻辑，也不含"何时该拉取"的决策**（与 `config.rs` 同款边界）—— 那是 `main.rs` 的 worker 的事。
+
+#### 4.8.2 为什么是"转发 `dsh plugin`"而不是"直接调 pnpm"
+
+`dsh plugin` 会做三件本项目不该重新实现的事（spec F1~F3，对着
+`@deepseek-ai/dsh-plugin-manager` 的 `operations.js` 核实）：
+
+1. 持 **profile 写锁**（锁文件就是 profile 的 `package.json`）—— 运行中的 `dsh web`
+   的服务用的是**同一把**锁，所以转发天然与它互斥；
+2. 退出码 0 后跑 **reconcile**，把新装的依赖补进 `dsh.profile.bundles`、把已移除的清掉
+   —— 直接调 pnpm 会让卸载后的 bundle 列表留下悬挂项；
+3. 给出 `allowBuilds` / `minimumReleaseAge` 这类 pnpm 专属提示的原文。
+
+因此 **CON-5 的形态**是"变更一律经 `dsh plugin` 转发、只读两个 JSON 文件"，
+而不是 v1.3 时的"不得以任何方式干预"。
+
+#### 4.8.3 为什么"不停 `dsh web`"（推翻设计初稿的一条）
+
+设计初稿要求"变更前先停 `dsh web` + 弹窗确认"。**该前提经实测被证伪**：
+
+| 初稿的理由 | 实测 |
+|---|---|
+| profile 里有原生模块（node-pty 等），运行中的进程会锁住 `.node` 文件 | ❌ `find node_modules -name "*.node"` 在 web profile 里**一个都没有**；`allowBuilds` 里那三个名字是 DSH 写进模板的**白名单**，不是"已安装" |
+| — | `dsh plugin` 与运行中的服务**共用同一把写锁**；README 写明 CLI 改完之后由 HMR 监视器应用（`patchReload: live`）⇒ **不停服务是既定路径**，DSH 自带的 Web 插件页本身就跑在运行中的服务器里 |
+| — | 而"停 → 重启"的**真实代价**是杀掉用户正在跑的会话 |
+
+结论：不停服务、不弹窗，`Job::Transact` 的 TR-1 路径**逐字不动**。
+（这笔账完整记在 spec §13 的变更记录里，因为它演示了"一个未经核实的平台假设会怎样改变设计"。）
+
+#### 4.8.4 为什么这里用 `latest` tag 是对的（不要照抄 FR-8）
+
+**FR-8 禁止把 `latest` 当"最新"是针对 dsh 自身**：它有 alpha / rc / stable 三条通道，
+`dist-tags.latest`（0.1.5-rc.2）实测比已装的 alpha 版（0.1.6-alpha.2）**更旧**（SRS §2.2.5）。
+**第三方插件没有通道概念** —— `dist-tags.latest` 就是它语义正确的最新版。
+这条写两遍（代码注释 + 这里）是因为"下一个人顺手把它改成通道内最新"是最可能发生的退化。
+
+#### 4.8.5 并行查询与失败隔离
+
+`fill_latest` 用 `std::thread::scope` 每包一线程（NFR-12）：本机单次 registry 请求
+实测 4.1 s，6 个串行 ≈ 25 s。单包失败（超时 / 404 / 版本号非法）只让那一行显示"—"
+（`join().unwrap_or(None)` 连线程 panic 也一并隔离）。
+
+#### 4.8.6 UI 侧的两条接缝
+
+- **卡高由 Rust 算**（`plugin_card_height(rows)`，上限 6 行）：Slint 里 `ListView`
+  没有可读的内容高度，而用 `ScrollView` 包它会破坏虚拟化（日志区已记过这条坑）。
+  ⚠ 常量 `ROW` 必须与 `ui/app.slint` 的 `PluginRowView.height` **同一个数** ——
+  探针实测过 46 vs 40 的差别：多算 6px/行会让 `ListView` 比内容高 36px，最后一行与
+  汇总行之间凭空多出 63px 空白。
+- **不可见元素照样占位**：行内的「已是最新」/「最新版未知」两句用 `visible:`（尾随位置，
+  留白无害），而〔更新〕按钮与操作卡右端的状态徽标用 `if`（它们贴着右缘/会挤压邻项）。
+
+---
+
 ## 5. 错误处理设计
 
 ### 5.1 错误分类
@@ -1204,6 +1329,14 @@ SRS §8.4 要求对核心逻辑做单元测试。以下逻辑被刻意设计为*
 | `owner_of(shim, bins)` | FR-3 | 验证大小写不敏感、`dsh.exe` 与 `dsh.cmd` 都能命中 |
 | `parse_notes_blocks(&str)` | FR-27 | 输入真实 release notes 片段，验证 HTML 被剥离、标题成 Heading 块、列表标记被去掉、软换行合段 |
 | `is_safe_version(&str)` | NFR-6 | 验证字符集边界 |
+| `plugin::valid_spec(&str)` | FR-35 / §7 信任边界 | 表驱动：registry 规格通过；`file:` / `link:` / `git+` / `github:` / URL / 路径 / 空白 / 引号 / `^1.0.0` **逐条拒绝** |
+| `plugin::parse_latest(&str)` | FR-34 | 真实 packument 片段；缺 `dist-tags` / JSON 非法 / 版本号非法 → `None`（**不是** Err） |
+| `plugin::profile_dir_from(..)` | FR-34 | `DSH_HOME` 优先、回落 `USERPROFILE\.dsh`、两者皆无 → `None`、空串按"没设"处理 |
+| `plugin::read_installed(&Path)` | FR-34 | 在 tempdir 造假 profile：**不在 `dependencies` 里的目录不得出现**（spec F6 的回归钉子）；版本读不到 → `None` |
+| `plugin::update_all_op(&[PluginRow])` | FR-36 | 只收严格可更新的行；没有 → `None`（按钮禁用） |
+| `PluginOp::args(&str)` | FR-35~FR-37 | 四种操作的**精确**参数序列（与 `pm_command_table_is_exact` 同款粒度） |
+| `PluginRow::updatable()` | FR-34 | 已是最新 / 最新版未知 / 未安装 / **最新版更旧**（不得把降级当更新）四种否定情形 |
+| `plugin::run_plugin_with(..)` | FR-37b | 假 `dsh.cmd`：参数**逐字**到达进程；退出码非零是**结果**不是 `Err` |
 
 ### 6.2 事务引擎的失败路径测试
 
@@ -1345,3 +1478,4 @@ strip     = true
 | 1.4 | 2026-09-22 | **更新说明改为 GitHub 式分块排版**（FR-27，§2.2 数据流 / §3.2 要点 3 / §4.x 纯函数 / §8 测试表）：`preprocess_notes(&str) -> String` 换成 `parse_notes_blocks(&str) -> Vec<NoteBlock>`，属性 `notes-text: styled-text` 换成 `notes-blocks: [NoteBlock]`，新增 `NoteKind` / `NoteBlock` 与 Slint 侧的 `NoteBlockView`。**根因**：Slint 的 `StyledText` 不支持标题（官方 Currently Unsupported），也没有字重属性 ——单段文字做不到"标题比正文大"与"列表悬挂缩进"，只能把块结构交给 Rust 侧解析。随之删掉"标题前补空行"的 hack（块间距现在由布局给） |
 | 1.5 | 2026-09-22 | **新增主题子系统**（`feat/theme-system`）：**①** 新增 **§4.7**（职责边界、Rust 唯一真相源、`Tokens.dark` 与 `Palette.color-scheme` **两条投影路径**及为何是两条、`system_dark` 刻意不进 `.slint`、`UiMsg::SystemThemeChanged` 与 80 ms 排空、§5.2 兜底变成条件可达的代价）；**②** `global Tokens` 的 40 条 brush 令牌改为双值（`dark ? #暗 : #浅`），暗色侧逐行不动；**③** `ThemeMode` 三档 + `resolve()` 唯一判据 + 与 winit 同源的 `system_dark()` + 无竞态监视线程；**④** `state.json` 增 `theme_mode`（缺 key = 跟随系统，旧三字段文件照常可用）；**⑤** 设置面板新增「主题」组（浅色/深色/跟随系统，强制档改不动系统标题栏已在面板内交代）；**⑥** 删掉全部 6 处过渡期 `#[allow(dead_code)]`，删除后仍是 0 警告、无真实死代码 |
 | 1.6 | 2026-09-22 | **新增出网代理（SRS v1.3 的 FR-33）并闭合 §7.1 的 TLS 待验证项**：**①** §7.1 的"待验证：`ureq` 3.4 的默认 TLS 后端"**已闭合** —— 默认是 `rustls` + **`webpki-roots`**（Mozilla 静态根，**非**系统证书库），随之记下它的反面：企业/MITM 代理注入的企业根**不被信任**，而该风险因 FR-33 从理论变为可达（本机实测未触发）；升级路径是 ureq 的 `platform-verifier` feature。**②** 更正本段原来引用的错误前提"当前环境未配置代理（SRS §2.2.5）"。**③** §7.1 依赖表**不变** —— FR-33 读系统代理走的是 `windows-sys` **已启用**的 `Win32_System_Registry` feature，**未新增依赖、未改 `Cargo.toml`**（GC-2 当初挡住的只有 `winreg` 那条路） |
+| 1.7 | 2026-09-22 | **新增插件卡（SRS v1.4 的 §3.9 / FR-34~FR-37b / NFR-12）**，并把同期的两处界面改版一并落档：**①** §1.3 模块图加 `plugin.rs`（叶子模块，依赖 `model`/`pm`/`dsh`，无人依赖它），§1.4 数据流加插件一条；**②** 新增 **§4.8 `src/plugin.rs`**（职责边界、为何转发 `dsh plugin` 而非直调 pnpm、为何用 `latest` tag 是对的、并行查询与失败隔离、UI 侧两条接缝）；**③** `Job::FetchPlugins` / `Job::PluginOp` / `UiMsg::Plugins` / `UiMsg::PluginOpDone` 与 `PluginsState`；**④** 属性契约去掉 PM 三件套与 `version-is-current`/`latest-version`，加 `pm-label`、`reinstall-*`、`plugin-*` 共 9 项与 6 个回调；**⑤** §6.1 纯函数表补 7 行；**⑥** §7.1 依赖表**不变**（零新增依赖，`serde_json`/`ureq`/`semver`/`windows-sys` 都已在）。**⚠ 本条同时记录一笔被证伪的设计前提**：初稿要求"插件变更前先停 `dsh web`"，理由是"profile 里有原生模块、运行中的进程会锁住 `.node` 文件"—— 实测该前提为假（profile 内零个 `.node`），而 `dsh plugin` 与运行中的服务共用同一把 profile 写锁、CLI 改完由 HMR 应用 ⇒ 不停服务才是既定路径。详见 §4.8.3 与 spec §13 |

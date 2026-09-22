@@ -783,3 +783,87 @@ cd target/theme-probe && cargo run > ../theme-probe-out.txt
   **恒为 23524**；`dsh-manager.exe` **0 个残留**；主窗口控制列（启动/停止 dsh web、安装）与「退出」
   **一次都没点**。
 
+
+---
+
+## 6. 插件卡与操作卡改版（2026-09-22，v1.4/v1.7 同批）
+
+规格：`docs/superpowers/specs/2026-09-22-plugin-manager-design.md`；计划：`docs/superpowers/plans/2026-09-22-plugin-manager.md`。
+
+### 6.1 自动化证据
+
+| # | 项 | 证据 |
+|---|---|---|
+| P-1 | 单测 | `cargo test` **128/128** 通过（v1.3 基线 116 + 本轮 12：`plugin::*` 9 条、`model::plugin_op_*`/`updatable_*` 3 条） |
+| P-2 | 零警告 | `cargo build` **0 warning**（本仓库门槛：删了东西就要复查死代码） |
+| P-3 | 命令表精确性 | `plugin_op_args_are_table_driven` 断言四种操作的**确切参数序列**（与 `pm_command_table_is_exact` 同款粒度）—— 只断言"非空"的话，`add` 误写成 `remove` 也能通过 |
+| P-4 | 信任边界 | `valid_spec_rejects_non_registry_sources`：`file:` / `link:` / `git+` / `github:` / URL / 相对与绝对路径 / 空白 / 引号 / `@scope/p@1@2` / `^1.0.0` **逐条**断言拒绝 |
+| P-5 | spec F6 的回归钉子 | `read_installed_lists_only_dependencies_and_tolerates_missing_version`：`node_modules` 里**不在 `dependencies`** 的包不得出现（真机上就是 `@hilariouhiss/dsh-skill-kit`） |
+| P-6 | 降级不算更新 | `updatable_requires_both_versions_and_a_strictly_newer_latest`：已是最新 / 未知 / 未安装 / **latest 更旧** 四种否定情形 |
+| P-7 | 参数真的到了进程 | `run_plugin_forwards_args_verbatim_and_reports_exit_code`：假 `dsh.cmd` 回显 `ARGS:%*` + `exit /b 3` ⇒ 断言 stdout 含 `ARGS:plugin --profile web remove @s/p` **且** 退出码 3 是结果不是 `Err` |
+
+### 6.2 真机 UIA 读回（`dsh-manager.exe`，启动后 14 s）
+
+无障碍树里插件卡的实际内容（**顺序即版式顺序**）：
+
+```
+Text:插件            Text:6 个 · 1 个可更新
+Edit:@scope/name 或 @scope/name@1.2.3      Text:安装
+Text:@hilariouhiss/dsh-codegraph   Text:1.1.0 → 1.2.0   Text:^1.1.0   Text:更新  Text:卸载
+Text:@hilariouhiss/dsh-colgrep     Text:1.2.1 → 1.2.1   Text:1.2.1    Text:已是最新  Text:卸载
+…（其余四行同形，均"已是最新"+仅〔卸载〕）
+Text:全部更新        Text:刷新        Text:更新说明
+```
+
+- **真实数据**：`dsh-codegraph 1.1.0 → 1.2.0` 是 registry 经**系统代理**（FR-33）查回来的真更新，
+  汇总行"6 个 · 1 个可更新"与它一致；其余五行 `→ 同版本` + 「已是最新」。
+- **FR-36 的一条硬要求**：〔更新〕**只出现在真有更新的那一行**（spec §8.2 "禁用不如不显示"）——
+  首版实现成了恒显示 + 禁用，UIA 直接照出五行灰按钮，已改 `if` 并复测。
+- 同一棵树里 `包管理器 / npm / 当前版本 / 0.1.7-alpha.1 / 已是最新 / 目标版本 / …` 按新顺序出现，
+  `DSH 在此！`、行尾 `当前`、`通道最新` **均不在树里**（操作卡改版与版本主卡删除的回归检查）。
+
+### 6.3 离屏探针（`target/ui-probe/`，配方同 §2.4）
+
+编译的是**真实的** `ui/app.slint`。本轮量到的关键数字：
+
+| 位置 | 测量 | 判读 |
+|---|---|---|
+| 左栏首条带 | `y 78..99 高 22`，x 聚类 `30..78 103..123 189..237 249..343 355..417` | 高 22 = `Tag` 声明高度 ⇒ 版本主卡已删、徽标落在操作卡内且**贴住内容右缘**（416/417） |
+| 目标版本行 | `y 124..135`，x>197 处只有控件边框(417)与卡片边(434) | 行尾**无第三簇** ⇒ 「当前」提示确已移除 |
+| 右栏两卡 | 插件卡 header 52..76、安装行 79..110、6 行 116..347、汇总行 **374..405**；更新说明标题 **430..438** | 插件卡在**上**、更新说明在**下**；行距 40px |
+| 重装确认框 | 卡片 `y 307..474`、内容框 `[260,620)` | 400px 宽、水平居中（(780−167)/2 = 306.5）✓，未裁出窗口 |
+| 遮罩 | 卡片区之外 **9394/9394** 采样点比无对话框时更暗 | 遮罩确实覆盖全窗 |
+
+- 探针抓到并已修的两处：**①** 重装框正文的"？"被挤成第二行单独挂尾（带 x `260..277`）⇒ 拆成
+  "版本号一行 + 固定问句一行"，现两行 `260..411` / `261..529` 各自单行；**②** `plugin_card_height`
+  的行高常数 46 vs 实际 40 ⇒ `ListView` 比内容高 36px，最后一行与汇总行之间凭空多出 **63px** 空白
+  （带 y347 与 y410）⇒ 改 40 后汇总行上移到 y374。
+- ⚠ **探针不在仓库里**（`target/` gitignored，与 §2.4 同一处置）。重建配方见 §2.4；本轮新增的
+  采样点是"右栏两卡的竖向分配"与"行内 x 聚类"（`x_clusters` 函数）。
+
+### 6.4 环境限制（⚠ 影响下列端到端验证的执行者）
+
+本会话沙箱里 **pnpm 跑不起来**：`pnpm --version` 直接返回
+`The path cannot be traversed because it contains an untrusted mount point`，
+`dsh plugin …` 因此在沙箱里必然失败（用户在真实终端里可正常运行 —— 那份
+`dsh plugin --profile web list` 输出就是证据）。故 **V-P1 ~ V-P7 必须由用户在真实环境执行**。
+
+### 6.5 V-P1 ~ V-P7（待用户执行）
+
+| # | 步骤 | 通过判据 | 状态 |
+|---|---|---|---|
+| **V-P1** | 启动程序，看插件卡 | 6 行、包名与 `dsh plugin --profile web list` 逐条一致；已装版本 = `node_modules` 里的真实版本；最新版列在几秒内填好（并行，不是半分钟） | ⬜ |
+| **V-P2** | 点某行〔更新〕（选确有新版的） | 日志出现 `$ dsh.cmd plugin --profile web add <包>@<版>` 与 pnpm 输出；`package.json` 里该包规格真的变了；列表自动刷成"已是最新" | ⬜ |
+| **V-P3** | 输入 `@hilariouhiss/dsh-gitbash@1.0.1` 点〔安装〕 | 同上；`dependencies` 新增一条，且**新包自动进了 `dsh.profile.bundles`**（spec F3 的实证） | ⬜ |
+| **V-P4** | 点某行〔卸载〕→ 确认框 → 取消 | **什么都不发生**：`package.json` 未变、日志里没有命令 | ⬜ |
+| **V-P5** | 再点〔卸载〕→ 确认；**dsh web 正在运行时也要成功** | 依赖从 `dependencies` 移除、`dsh.profile.bundles` 里不再残留（F3）；**`dsh web` 进程未被打断**（F9 的核心断言） | ⬜ |
+| **V-P6** | 输入 `file:../../evil` 点〔安装〕 | 状态栏报"包规格不合法"，**日志里没有命令**、`package.json` 未变 | ⬜ |
+| **V-P7** | 〔全部更新〕 | **一次**命令、多条规格；全部更新完列表变"已是最新" | ⬜ |
+
+### 6.6 本轮未执行项
+
+- **真实 `dsh plugin` 的端到端**（V-P1~V-P7）：沙箱无 pnpm，见 §6.4。
+- **`minimumReleaseAge` / `allowBuilds` 拦截路径**：需要 pnpm 真拦一次才能测；设计上只把 pnpm 原文
+  送进日志（不代改 `pnpm-workspace.yaml`，spec §12 已知限制 3/4）。
+- **行内文本被裁切的情形**：探针里 `plugin-card-height` 由探针自己推（与产品常量同步），
+  "窗口被拉到很矮时两卡如何让位"只在设计层面定了规则（优先保更新说明的 `min-height`），未实测。
