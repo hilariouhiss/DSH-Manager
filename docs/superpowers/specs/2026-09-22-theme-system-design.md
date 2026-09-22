@@ -12,7 +12,9 @@
 - **不做每令牌的独立配置。** 模式是唯一开关。
 - **不换设计语言。** Ethereal Glass（hairline 玻璃、径向光晕、内高光）在浅色下逐条翻译，不降级成扁平风。
 - **不改系统标题栏。** 见 §8 已知限制，这是平台限制不是取舍。
-- **不引入新依赖。** 系统主题探测用 4 个 `extern "system"` 声明，不拉 `windows-sys`。
+- **不引入会新增编译单元的依赖。** 系统主题探测用 `windows-sys`，但**钉在已在 lock 文件里的 0.61 版本**上（winit 等 12 处已编译它），故依赖数与编译量都不变。见下方「规格修订」。
+
+**规格修订（2026-09-22，评审后）：** 本节原写"用 4 个 `extern "system"` 声明，不拉 `windows-sys`"，**该估算偏低**。要写成**无竞态**的监视（先武装通知、再读值）就需要事件对象，真实的手写 FFI 面是约 11 个函数、跨 3 个 DLL，并要自己管 `HKEY`/`HANDLE` 的成对释放 —— 每处都是一个不会被测试抓到的泄漏或 UB 机会。改用 `windows-sys` 后：没有新增 crate（0.61.2 已在依赖树中），而且比手写 FFI **更短**。竞态为何必须消除见 §3 监视一节。
 
 ---
 
@@ -147,6 +149,26 @@ export global Tokens {
 - **非颜色令牌两套共用**，不参与主题：`r-lg/r-md/r-sm`、`font-hero`、三档 `motion-*`、`status-h`、`disabled`(0.35)。其中 `disabled` 用整体 opacity 表达，浅色下同样成立（深字变浅灰），无需按主题分叉。
 
 **强制模式下系统主题变化不产生任何视觉变化** —— 这是正确行为，不是漏接线：`resolved_dark` 由 mode 决定，`system_dark` 变了也不会进入它。监视线程照常更新 `system_dark`（用户随时切回「跟随系统」时立即是正确值），只是不触发重绘。
+
+### 4.4 变更监视为什么要无竞态
+
+`RegNotifyChangeKeyValue` 有两种用法，天真写法有坑：
+
+- **同步（`fAsynchronous = FALSE`）**：调用即阻塞到变更发生。若写成"读值 → 武装通知"，则**读与武装之间那个微秒窗口内发生的变更会被永久跟丢** —— 因为武装之后不再有变更来唤醒它。后果不是"慢一拍"，而是**永久不一致**：winit 的标题栏早已变色（它自己独立响应），而应用主体停在旧主题，直到用户下次再切主题才自愈。
+- **异步（`fAsynchronous = TRUE`）+ 事件对象**：**先**武装通知、**再**读值，然后 `WaitForSingleObject` 等事件。任何发生在读之后的变更都会置位事件，因此不可能丢。本设计采用这种。
+
+正确顺序（每轮循环）：
+
+```
+RegOpenKeyExW(个人化键, KEY_READ | KEY_NOTIFY)
+RegNotifyChangeKeyValue(键, watch_subtree=1, LAST_SET, 事件, fAsynchronous=TRUE)  ← 先武装
+读 AppsUseLightTheme                                                              ← 再读值
+送 UiMsg::SystemThemeChanged(系统态)
+WaitForSingleObject(事件, INFINITE)   ← 任何后续变更都会置位
+ResetEvent(事件); RegCloseKey(键); 回到循环开头
+```
+
+事件对象每轮复用（`CreateEventW` 一次），键句柄每轮开关 —— 句柄生命周期短且成对，避免长期持有的泄漏。UI 线程退出后 `send` 失败即 `return`，线程自行结束。
 
 ---
 
