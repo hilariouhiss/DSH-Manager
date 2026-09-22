@@ -1363,8 +1363,11 @@ Task 1 Step 5 在 `src/theme.rs` 里加的**三行** `#[allow(dead_code)]`（`Th
 （Task 2 / 6 / 8）都已落地，抑制已经没有存在理由。
 
 Run: `grep -n "allow(dead_code)" src/theme.rs`
-Expected: 只剩注释块里提到它的那几行（`// ⚠ 过渡期抑制…` 那段），**没有**任何生效的
-`#[allow(dead_code)]` 代码行。
+Expected: **无输出**（`grep` 退出码 1）。
+
+⚠ 注意这里没有"只剩注释行"之说 —— 那段移除契约注释里**并不含** `allow(dead_code)` 这个字面量
+（Task 1 复审实测确认：注释命中数为 0），所以删干净后应当一个匹配都没有。
+**若仍有匹配，那就是还有没删的生效属性**，逐个删掉并重跑本步。
 
 删除后 Run: `cargo build 2>&1 | grep -c "^warning"`
 Expected: `0`。
