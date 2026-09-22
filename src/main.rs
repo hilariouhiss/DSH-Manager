@@ -6,6 +6,7 @@
 mod config;
 mod dsh;
 mod model;
+mod plugin;
 mod pm;
 mod theme;
 mod txn;
@@ -106,7 +107,35 @@ struct AppState {
     /// 系统当前是否为暗色。**刻意只存在 Rust 侧** —— UI 拿不到也不需要，
     /// 它只需要知道 `resolve()` 之后的结果（那个进了 Tokens.dark）。
     system_dark: bool,
+    /// 插件卡的盘点结果（FR-34）。`status` 与 `NotesState` 同款三态：
+    /// "还没查到"与"查完但没有插件"必须可区分，否则加载期会渲染成"没有插件"。
+    plugins: PluginsState,
+    /// 已点〔卸载〕、等确认框答复的那一行下标。`None` = 没有待确认的卸载。
+    ///
+    /// ⚠ 存**下标**而不是包名：确认时要从 `plugins.rows` 取回那一行（名称与版本），
+    /// 而列表可能在这期间被刷新过 —— 取不到就当作"列表变了，取消这次操作"，
+    /// 绝不用一个可能过期的包名去执行卸载。
+    plugin_remove_index: Option<usize>,
     log: Rc<VecModel<slint::SharedString>>,
+}
+
+/// 插件卡的盘点状态。
+#[derive(Debug, PartialEq)]
+enum PluginsStatus {
+    Loading,
+    Ok,
+    /// 读 profile 失败（文件不存在 / JSON 损坏）。原因进日志，界面只显示一句短提示。
+    Failed,
+}
+
+#[derive(Debug)]
+struct PluginsState {
+    /// ⚠ 必须写全限定名 `model::PluginRow`：`slint::include_modules!()` 在本模块（crate 根）
+    /// 生成了一个**同名**的 `PluginRow`（Slint 结构体，字段全是格式化好的字符串），
+    /// 而本地定义会遮蔽 `use model::*` 的 glob 导入 —— 与 `model.rs` 里
+    /// `NotesStatus` 刻意不重复定义是同一类坑（那边是反过来）。
+    rows: Vec<model::PluginRow>,
+    status: PluginsStatus,
 }
 
 #[derive(Default)]
@@ -145,6 +174,8 @@ impl AppState {
             theme_mode,
             use_system_proxy,
             system_dark: theme::system_dark(),
+            plugins: PluginsState { rows: Vec::new(), status: PluginsStatus::Loading },
+            plugin_remove_index: None,
             log: Rc::new(VecModel::default()),
         }
     }
@@ -235,6 +266,79 @@ impl AppState {
     fn notes_status(&self) -> NotesStatus {
         self.notes.status.unwrap_or(NotesStatus::Loading)
     }
+
+    /// 插件卡的行：把 `model::PluginRow` 转成 Slint 结构体。
+    ///
+    /// **格式化在这里完成**（slint 侧只渲染字符串），与 `version_labels()` 同款约定。
+    /// 两个哨兵值：已装版本读不到 → "未安装"；registry 查不到最新版 → "—"。
+    fn slint_plugin_rows(&self) -> Vec<PluginRow> {
+        self.plugins
+            .rows
+            .iter()
+            .map(|r| PluginRow {
+                name: r.name.clone().into(),
+                spec: r.spec.clone().into(),
+                installed: r
+                    .installed
+                    .as_ref()
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "未安装".into())
+                    .into(),
+                latest: r
+                    .latest
+                    .as_ref()
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "—".into())
+                    .into(),
+                updatable: r.updatable(),
+                missing: r.installed.is_none(),
+            })
+            .collect()
+    }
+
+    fn plugin_updatable_count(&self) -> i32 {
+        self.plugins.rows.iter().filter(|r| r.updatable()).count() as i32
+    }
+
+    /// 卡头右侧的**汇总**（与卡底那行状态各管一件事，spec §8.2）。
+    fn plugin_summary(&self) -> slint::SharedString {
+        match self.plugins.status {
+            PluginsStatus::Loading => "检查中…".into(),
+            PluginsStatus::Failed => "读取失败".into(),
+            PluginsStatus::Ok => {
+                let n = self.plugins.rows.len();
+                let up = self.plugin_updatable_count();
+                if up > 0 {
+                    format!("{n} 个 · {up} 个可更新").into()
+                } else {
+                    format!("{n} 个").into()
+                }
+            }
+        }
+    }
+
+    /// 卡底左侧的**状态**（加载中 / 失败时才有内容，成功时留空 —— 汇总已经说了个数）。
+    fn plugin_status_line(&self) -> slint::SharedString {
+        match self.plugins.status {
+            PluginsStatus::Loading => "正在读取 profile 并检查最新版…".into(),
+            PluginsStatus::Failed => "读取 profile 失败，详见日志".into(),
+            PluginsStatus::Ok => "".into(),
+        }
+    }
+}
+
+/// 插件卡的高度：按行数取，**上限 6 行**（再多由卡内 `ListView` 自己滚）。
+///
+/// ⚠ 为什么由 Rust 算而不是让 Slint 自适应：卡高要跟着"有几行"走，而 Slint 里
+/// `ListView` 没有可读的内容高度（用 `ScrollView` 包它又会破坏虚拟化 —— 日志区
+/// 已记过这条坑）。纯函数因此可单测，像素常量在 Task 5 用离屏探针量过再定。
+fn plugin_card_height(rows: usize) -> f32 {
+    /// SectionHeader + 安装行 + Divider + 汇总行 + 上下留白。
+    const CHROME: f32 = 118.0;
+    /// 一行的高度（两行式行条目）。
+    const ROW: f32 = 46.0;
+    let visible = rows.clamp(1, 6) as f32; // 至少留一行的位置（空态也要有个落点）
+    CHROME + ROW * visible
 }
 
 /// 追加一行日志，带 GC-12 的上限裁剪。
@@ -334,6 +438,15 @@ fn project(state: &AppState, win: &MainWindow, tray: &AppTray) {
     win.set_busy(state.busy);
     win.set_busy_label(state.busy_label.clone().into());
     win.set_status_text(state.status.clone().into());
+
+    // ── 插件卡（FR-34）──
+    // 行的格式化在 `slint_plugin_rows()` 里做完（与 version_options 同款约定）。
+    win.set_plugin_rows(ModelRc::from(Rc::new(VecModel::from(state.slint_plugin_rows()))));
+    win.set_plugin_summary(state.plugin_summary());
+    win.set_plugin_status_line(state.plugin_status_line());
+    win.set_plugins_loading(matches!(state.plugins.status, PluginsStatus::Loading));
+    win.set_plugin_updatable_count(state.plugin_updatable_count());
+    win.set_plugin_card_height(plugin_card_height(state.plugins.rows.len()));
 
     // ── 关于对话框的四项（FR-29）──
     // Task 15 的修复轮补上了这四个只读属性：FR-29 要求对话框含
@@ -514,6 +627,27 @@ fn drain(rx: &Receiver<UiMsg>, state: &Rc<RefCell<AppState>>, tx: &Sender<Job>) 
                     // 直接 panic（实测 "RefCell already mutably borrowed"）。
                     UiMsg::SystemThemeChanged(dark) => {
                         s.system_dark = dark;
+                    }
+                    // 插件盘点：`Err` 是"读 profile 失败"，与"没有插件"（`Ok(空表)`）
+                    // 必须分开 —— 否则加载失败会渲染成"这个 profile 一个插件都没有"。
+                    UiMsg::Plugins(Ok(rows)) => {
+                        s.plugins.rows = rows;
+                        s.plugins.status = PluginsStatus::Ok;
+                    }
+                    UiMsg::Plugins(Err(e)) => {
+                        s.plugins.rows.clear();
+                        s.plugins.status = PluginsStatus::Failed;
+                        push_log(&s, format!("插件盘点失败：{e}"));
+                    }
+                    UiMsg::PluginOpDone { op, ok } => {
+                        // 与 TxDone 同款：操作结束就交还闸门。
+                        s.busy = false;
+                        s.busy_label.clear();
+                        s.status = if ok {
+                            format!("{}完成", op.describe())
+                        } else {
+                            format!("{}失败，详见日志", op.describe())
+                        };
                     }
                     UiMsg::Failed { context, message } => {
                         // 探测失败也必须置真：否则界面会永远停在"检测中…"，
@@ -816,6 +950,44 @@ fn execute(job: Job, tx: &Sender<UiMsg>) {
             send(UiMsg::Notes { version, result });
         }
 
+        Job::FetchPlugins => send(UiMsg::Plugins(plugin::fetch_all())),
+
+        Job::PluginOp { op } => {
+            // FR-28：命令原文进日志，形状与事务引擎那句 `$ <exe> <args…>` 一致。
+            let args = op.args(plugin::PROFILE);
+            send(UiMsg::Log(format!("$ dsh.cmd {}", args.join(" "))));
+            let ok = match plugin::run_plugin(&args) {
+                Ok(out) => {
+                    // pnpm 的原文**逐行**进日志：`allowBuilds` / `minimumReleaseAge`
+                    // 这类拦截的说明就在里面（spec §12 已知限制 3/4：本项目不代改
+                    // pnpm-workspace.yaml，只把原文交到用户手里）。
+                    for line in out.stdout.lines().chain(out.stderr.lines()) {
+                        if !line.trim().is_empty() {
+                            send(UiMsg::Log(line.to_string()));
+                        }
+                    }
+                    if out.code == 0 {
+                        send(UiMsg::Log(format!("{} 完成", op.describe())));
+                        true
+                    } else {
+                        send(UiMsg::Failed {
+                            context: "插件操作",
+                            message: format!("{} 失败（退出码 {}），详见日志", op.describe(), out.code),
+                        });
+                        false
+                    }
+                }
+                Err(e) => {
+                    send(UiMsg::Failed { context: "插件操作", message: e });
+                    false
+                }
+            };
+            // ⚠ **无论成败都重新盘点**：失败时用户更要看到"列表其实没变"，
+            // 否则点了没反应与操作成功在界面上分不出来（spec §5.3）。
+            send(UiMsg::Plugins(plugin::fetch_all()));
+            send(UiMsg::PluginOpDone { op, ok });
+        }
+
         Job::Transact { origin, target, port } => {
             send(UiMsg::Log(format!(
                 "事务开始：{} {} → {} {}",
@@ -1096,6 +1268,32 @@ fn request_install(
     None
 }
 
+/// 派发一次插件操作（安装 / 更新 / 更新全部 / 卸载）。
+///
+/// **复用既有的 `busy` 闸门**（与 `Job::Transact` 同一套）：置真于此、`PluginOpDone`
+/// 清掉（`drain` 里）—— 于是"事务进行中"与"插件操作进行中"互斥，两者都不会并发。
+///
+/// ⚠ 必须置 `dirty`：本函数**不发任何消息**，而 `project()` 只在排空到消息或
+/// `take_dirty()` 为真时跑 —— 少了它，按钮要等到 worker 的第一条日志回来才变灰。
+fn dispatch_plugin_op(state: &Rc<RefCell<AppState>>, send: &impl Fn(Job), op: PluginOp) {
+    {
+        let mut s = state.borrow_mut();
+        s.busy = true;
+        s.busy_label = op.describe();
+        s.status = op.describe();
+        s.dirty = true;
+    }
+    send(Job::PluginOp { op });
+}
+
+/// 插件操作被前置拒绝（行没了 / 最新版未知 / 没有可更新项）：只给状态栏提示，不发 Job。
+/// ⚠ 同样必须置 `dirty`，理由见上。
+fn reject_plugin_op(state: &Rc<RefCell<AppState>>, why: &str) {
+    let mut s = state.borrow_mut();
+    s.status = why.into();
+    s.dirty = true;
+}
+
 /// 把 Slint 回调接到 Job 派发上。
 ///
 /// ⚠ 这里是 GC-16 的边界：回调运行在 UI 线程，**不得**做任何子进程/网络动作。
@@ -1144,6 +1342,115 @@ fn wire_callbacks(
         });
     }
 
+    // ── 插件卡（FR-34 ~ FR-37）──
+    {
+        let send = send.clone();
+        let state = state.clone();
+        let win_weak = win_weak.clone();
+        win.on_plugin_install(move || {
+            // ⚠ 规格从**输入框**读，但校验在 Rust 侧（信任边界，spec §7）：
+            // Slint 只负责把文本交上来，不决定什么能装。
+            let spec = win_weak
+                .upgrade()
+                .map(|w| w.get_plugin_input().trim().to_string())
+                .unwrap_or_default();
+            if !plugin::valid_spec(&spec) {
+                let mut s = state.borrow_mut();
+                s.status =
+                    "包规格不合法：只支持 registry 上的包，形如 @scope/name@1.2.3".into();
+                // ⚠ 拒绝路径**不发 Job**：稳态下没有任何消息可排空，不置 dirty
+                // 的话提示永远不会被投影出来（按钮点起来像坏的）。
+                s.dirty = true;
+                return;
+            }
+            dispatch_plugin_op(&state, &send, PluginOp::Install(spec));
+        });
+    }
+
+    {
+        let send = send.clone();
+        let state = state.clone();
+        win.on_plugin_update(move |i| {
+            // 行下标 → 行 → 操作。**包名不从 UI 传回来**（少一条能被伪造的输入路径）。
+            let op = state.borrow().plugins.rows.get(i as usize).and_then(|r| {
+                r.latest.clone().map(|v| PluginOp::Update { name: r.name.clone(), version: v })
+            });
+            match op {
+                Some(op) => dispatch_plugin_op(&state, &send, op),
+                None => reject_plugin_op(&state, "该插件的最新版未知，请先刷新"),
+            }
+        });
+    }
+
+    {
+        let send = send.clone();
+        let state = state.clone();
+        win.on_plugin_update_all(move || {
+            let op = plugin::update_all_op(&state.borrow().plugins.rows);
+            match op {
+                Some(op) => dispatch_plugin_op(&state, &send, op),
+                None => reject_plugin_op(&state, "没有可更新的插件"),
+            }
+        });
+    }
+
+    {
+        let state = state.clone();
+        let win_weak = win_weak.clone();
+        win.on_plugin_remove(move |i| {
+            // ⚠ 这一步**只弹确认框**，不派发 —— 破坏性动作的二次确认。
+            let picked = {
+                let mut s = state.borrow_mut();
+                let row = s.plugins.rows.get(i as usize).cloned();
+                // 记下标，不记包名：确认时再从列表取回那一行（理由见字段注释）。
+                s.plugin_remove_index = row.as_ref().map(|_| i as usize);
+                s.dirty = true;
+                row
+            };
+            let (Some(row), Some(w)) = (picked, win_weak.upgrade()) else { return };
+            w.set_plugin_remove_name(row.name.clone().into());
+            w.set_plugin_remove_version(
+                row.installed
+                    .as_ref()
+                    .map(|v| v.to_string())
+                    .unwrap_or_default()
+                    .into(),
+            );
+            w.set_plugin_remove_prompt_visible(true);
+        });
+    }
+
+    {
+        let send = send.clone();
+        let state = state.clone();
+        win.on_plugin_remove_confirmed(move || {
+            let op = {
+                let mut s = state.borrow_mut();
+                let idx = s.plugin_remove_index.take();
+                // ⚠ 取不到就放弃这次卸载：列表在这期间被刷新过，用旧包名去删是危险的
+                // （用户确认的是他当时看到的那一行）。
+                idx.and_then(|i| s.plugins.rows.get(i).map(|r| PluginOp::Remove(r.name.clone())))
+            };
+            match op {
+                Some(op) => dispatch_plugin_op(&state, &send, op),
+                None => reject_plugin_op(&state, "插件列表已变化，请重新选择要卸载的插件"),
+            }
+        });
+    }
+
+    {
+        let send = send.clone();
+        let state = state.clone();
+        win.on_plugin_refresh(move || {
+            {
+                let mut s = state.borrow_mut();
+                s.plugins.status = PluginsStatus::Loading;
+                s.dirty = true;
+            }
+            send(Job::FetchPlugins);
+        });
+    }
+
     {
         // ⚠ 不要 clone `state`：本回调只发 Job，多出来的克隆会变成
         // "unused variable" 警告（构建要求零警告）。
@@ -1151,6 +1458,9 @@ fn wire_callbacks(
         win.on_refresh_clicked(move || {
             send(Job::Probe);
             send(Job::FetchCatalog);
+            // 插件的刷新按钮在插件卡内部，全局〔刷新〕也一并刷新它 ——
+            // "刷新"对用户是全局语义，让插件卡停在旧数据上会像是坏的。
+            send(Job::FetchPlugins);
         });
     }
 
@@ -1611,6 +1921,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 启动时的初始任务（Q-3：每次启动查询一次更新，不做后台轮询）
     let _ = job_tx.send(Job::Probe);
     let _ = job_tx.send(Job::FetchCatalog);
+    // FR-34：插件盘点也在启动时做一次（读文件是毫秒级，查最新版是 6 个并行请求）。
+    let _ = job_tx.send(Job::FetchPlugins);
 
     // FR-31：若上次有未清除的运行态端口，探测它 —— 这正是 FR-22 的
     // 孤儿恢复机制入口。无法确认时**保留**记录，只有确知端口空闲才清除。

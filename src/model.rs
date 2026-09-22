@@ -231,8 +231,83 @@ impl WebState {
     }
 }
 
-// ⚠ `NotesStatus` 【刻意不在此处定义】。
-// app.slint 的 `export enum NotesStatus` 会让 Slint 在 crate 根生成同名的
+/// 插件卡的一行：profile 里装的一个第三方插件。
+///
+/// ⚠ `spec` 是 `package.json` 里**原样**的规格字符串（`^1.0.1` 与 `1.2.1` 混排是现状），
+/// 界面把它当次要信息显示 —— 用户能一眼看出哪些是钉死的。
+/// `installed`/`latest` 都是 `Option`：读不到 node_modules 里的版本、或 registry 查不到
+/// 最新版时是 `None`，界面显示"未安装"/"—"，**不得**用某个默认值冒充。
+#[derive(Clone, Debug, PartialEq)]
+pub struct PluginRow {
+    pub name: String,
+    pub spec: String,
+    pub installed: Option<Version>,
+    pub latest: Option<Version>,
+}
+
+impl PluginRow {
+    /// 可更新 = 已装版本 **严格小于** 最新版。两个版本都必须已知。
+    ///
+    /// ⚠ 三个否定情形都要显式挡住，每一种在真机上都会遇到：
+    /// 最新版没查到（离线/包已下架）、这个包压根没装上（`node_modules` 里没有）、
+    /// 以及 registry 上出现了一个**比已装更旧**的 latest（包被回滚过）——
+    /// 最后一种若判成"可更新"，点下去就是把用户**降级**。
+    pub fn updatable(&self) -> bool {
+        matches!((&self.installed, &self.latest), (Some(i), Some(l)) if l > i)
+    }
+}
+
+/// 一次插件变更。**表驱动**：`args()` 是唯一的命令构造点（与 FR-14 的 PM 命令表同款纪律），
+/// 界面与 worker 都不得自己拼 `dsh plugin` 的参数。
+#[derive(Clone, Debug, PartialEq)]
+pub enum PluginOp {
+    /// 用户在输入框里给的规格（已过 `plugin::valid_spec`）。
+    Install(String),
+    Update { name: String, version: Version },
+    /// 一次子进程、多条规格（spec §5.2 的取舍：一次加锁 + 一次解析安装，
+    /// 换掉的是一荣俱荣的颗粒度 —— 任一规格失败则整批不生效，日志里有 pnpm 原文）。
+    UpdateAll(Vec<(String, Version)>),
+    Remove(String),
+}
+
+impl PluginOp {
+    /// `dsh` 的参数表。`profile` 由调用方给（`plugin::PROFILE`），
+    /// model.rs 不依赖 plugin.rs（依赖方向：`model.rs` 谁都不依赖）。
+    pub fn args(&self, profile: &str) -> Vec<String> {
+        let mut a = vec!["plugin".to_string(), "--profile".to_string(), profile.to_string()];
+        match self {
+            PluginOp::Install(spec) => {
+                a.push("add".into());
+                a.push(spec.clone());
+            }
+            PluginOp::Update { name, version } => {
+                a.push("add".into());
+                a.push(format!("{name}@{version}"));
+            }
+            PluginOp::UpdateAll(items) => {
+                a.push("add".into());
+                a.extend(items.iter().map(|(n, v)| format!("{n}@{v}")));
+            }
+            PluginOp::Remove(name) => {
+                a.push("remove".into());
+                a.push(name.clone());
+            }
+        }
+        a
+    }
+
+    /// 日志与状态栏用的一句话（中文，面向用户）。
+    pub fn describe(&self) -> String {
+        match self {
+            PluginOp::Install(spec) => format!("安装 {spec}"),
+            PluginOp::Update { name, version } => format!("更新 {name} → {version}"),
+            PluginOp::UpdateAll(items) => format!("全部更新（{} 个）", items.len()),
+            PluginOp::Remove(name) => format!("卸载 {name}"),
+        }
+    }
+}
+
+// ⚠ `NotesStatus` 【刻意不在此处定义】。// app.slint 的 `export enum NotesStatus` 会让 Slint 在 crate 根生成同名的
 // Rust 枚举，那才是唯一使用者（`NotesState.status` 与 `set_notes_status`）。
 // 若此处也定义一份，main.rs 的 `use model::*` 是【glob 导入】，会被 crate 根
 // 的本地定义遮蔽 —— 结果是这份副本永远没有消费者，Task 20 删除
@@ -257,6 +332,18 @@ pub enum Job {
     ///   `stop_by_pid`，任何未来的发送方都绕不过它。
     StopWeb { port: u16, own_pid: Option<u32> },
     OpenUrl { url: String },
+    /// 盘点 web profile 的第三方插件（读文件 + 并行查 registry）。
+    ///
+    /// ⚠ **刻意不进 `coalesce_notes` 的合并逻辑**：那个合并只对 `FetchNotes` 生效
+    /// （I-4：说明区只认最后一次选择），本任务与"用户的选择"无关 ——
+    /// 连点刷新只是多发几次同样的盘点，排空顺序即结果顺序，最后一次赢就够了。
+    FetchPlugins,
+    /// 一次插件变更（安装 / 更新 / 更新全部 / 卸载）。
+    ///
+    /// ⚠ 与 `Transact` 的关键区别：**事先不停 `dsh web`**。`dsh plugin` 与运行中的
+    /// 服务共用同一把 profile 写锁（spec F9），而停服务会杀掉用户正在跑的会话 ——
+    /// 这条取舍的完整依据见 spec §2 的 F8/F9 与 §13 变更记录。
+    PluginOp { op: PluginOp },
 }
 
 /// I-4：把一队已入队的任务折叠成"只保留**最后一个** `FetchNotes`"。
@@ -296,6 +383,11 @@ pub enum UiMsg {
     /// 系统主题变了。⚠ 只带"现在是不是暗色"，不带模式 ——
     /// 模式归 Rust 的 AppState 管，与系统态在这里是正交的两件事。
     SystemThemeChanged(bool),
+    /// 插件盘点结果。`Err` 是"读 profile 失败"（不是"没有插件"—— 那是 `Ok(空表)`）。
+    Plugins(Result<Vec<PluginRow>, String>),
+    /// 一次插件操作结束。`ok` 只用于清 `busy` 与挑状态栏文案；
+    /// 命令原文与 pnpm 的输出已经逐条走过 `UiMsg::Log`（FR-28）。
+    PluginOpDone { op: PluginOp, ok: bool },
     Failed { context: &'static str, message: String },
 }
 
@@ -435,5 +527,57 @@ mod tests {
         assert_eq!(coalesce_notes(jobs.clone()).len(), 3);
         assert!(matches!(coalesce_notes(jobs)[0], Job::Probe));
         assert!(coalesce_notes(vec![]).is_empty());
+    }
+
+    /// ★ 命令表的**精确**断言（与 `pm_command_table_is_exact` 同款纪律）：
+    /// 只断言"非空"的话，把 `add` 误写成 `remove`、或规格与包名拼错，测试照样通过 ——
+    /// 而那正是这张表唯一可能出错的方式。
+    #[test]
+    fn plugin_op_args_are_table_driven() {
+        let v: Version = "1.3.0".parse().unwrap();
+        assert_eq!(
+            PluginOp::Install("@s/p@1.0.0".into()).args("web"),
+            ["plugin", "--profile", "web", "add", "@s/p@1.0.0"]
+        );
+        assert_eq!(
+            PluginOp::Update { name: "@s/p".into(), version: v.clone() }.args("web"),
+            ["plugin", "--profile", "web", "add", "@s/p@1.3.0"]
+        );
+        // ★ 全部更新 = 一次子进程、多规格（spec §5.2 的取舍）
+        assert_eq!(
+            PluginOp::UpdateAll(vec![("@s/p".into(), v.clone()), ("@s/q".into(), v)]).args("web"),
+            ["plugin", "--profile", "web", "add", "@s/p@1.3.0", "@s/q@1.3.0"]
+        );
+        assert_eq!(
+            PluginOp::Remove("@s/p".into()).args("web"),
+            ["plugin", "--profile", "web", "remove", "@s/p"]
+        );
+    }
+
+    #[test]
+    fn updatable_requires_both_versions_and_a_strictly_newer_latest() {
+        let row = |i: Option<&str>, l: Option<&str>| PluginRow {
+            name: "@s/p".into(),
+            spec: "1.0.0".into(),
+            installed: i.map(|s| s.parse().unwrap()),
+            latest: l.map(|s| s.parse().unwrap()),
+        };
+        assert!(row(Some("1.0.0"), Some("1.1.0")).updatable());
+        assert!(!row(Some("1.1.0"), Some("1.1.0")).updatable(), "已是最新不算可更新");
+        assert!(!row(Some("1.1.0"), Some("1.0.0")).updatable(), "★ 不得把降级当更新");
+        assert!(!row(Some("1.0.0"), None).updatable(), "最新版未知 → 不算可更新");
+        assert!(!row(None, Some("1.0.0")).updatable(), "未安装 → 不算可更新");
+    }
+
+    #[test]
+    fn plugin_op_describe_is_user_facing() {
+        let v: Version = "1.3.0".parse().unwrap();
+        assert_eq!(PluginOp::Install("@s/p@1.0.0".into()).describe(), "安装 @s/p@1.0.0");
+        assert_eq!(
+            PluginOp::Update { name: "@s/p".into(), version: v.clone() }.describe(),
+            "更新 @s/p → 1.3.0"
+        );
+        assert_eq!(PluginOp::Remove("@s/p".into()).describe(), "卸载 @s/p");
+        assert_eq!(PluginOp::UpdateAll(vec![("@s/p".into(), v)]).describe(), "全部更新（1 个）");
     }
 }

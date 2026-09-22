@@ -40,6 +40,20 @@ export struct NoteBlock {
     text: styled-text,
 }
 
+/// 插件卡的一行（FR-34）。
+///
+/// ⚠ 字段全是**格式化好的字符串**：可更新与否、显示"未安装"还是"—"都由
+/// `src/main.rs` 的 `slint_plugin_rows()` 算完再推（与 `version-options` 同款约定）——
+/// Slint 侧不做任何判断，也就不可能与本程序的状态分叉。
+export struct PluginRow {
+    name: string,
+    spec: string,       // package.json 里的原样规格（"^1.1.0" / "1.2.1"）
+    installed: string,  // 已装版本；读不到 → "未安装"
+    latest: string,     // registry 最新版；查不到 → "—"
+    updatable: bool,    // 已装 < 最新（严格小于，降级不算）
+    missing: bool,      // 未安装 → 按钮文案改"安装"
+}
+
 // ── 设计令牌 ────────────────────────────────────────────────────────────────
 // 一处定义，全局引用。
 //
@@ -740,6 +754,99 @@ component LogLine inherits Rectangle {
     }
 }
 
+// ── 插件卡的一行（FR-34）──────────────────────────────────────────────────
+// **左两行文字 + 右两个动作**：右栏可用宽度约 388px，单行式塞不下 ——
+// 长包名 `@hilariouhiss/dsh-superpowers`（29 字符等宽）自己就约 190px，
+// 再加"版本 → 版本"与两个按钮会溢出去。
+component PluginRowView inherits Rectangle {
+    // ⚠ 属性名不能叫 `row` —— 那是 Slint 的 GridLayout 内附属性名，声明同名会被拒：
+    // "Cannot override property 'row'"（实测报在声明行上，信息不指向真正的原因）。
+    in property <PluginRow> plugin;
+    in property <bool> busy;
+
+    callback update-clicked();
+    callback remove-clicked();
+
+    width: 100%;
+    height: 40px;
+    background: transparent;
+
+    HorizontalLayout {
+        spacing: 8px;
+        cross-axis-alignment: center;
+
+        VerticalLayout {
+            spacing: 1px;
+            vertical-stretch: 1;
+            alignment: center;   // 文字块在行内垂直居中，与右侧按钮同高
+
+            // 名称：等宽 + 尾部省略。
+            // ⚠ Slint 1.18 的 `Text` **没有省略方向**（只有 `overflow: elide|clip`，
+            // 省略号固定在尾部）—— 想"中间省略"保住 scope 与包名两头是做不到的，
+            // 别去找 `elide:` 属性（它不存在，报的是 "Unknown property elide"）。
+            Text {
+                text: root.plugin.name;
+                color: Tokens.ink;
+                font-family: Font.mono;
+                font-size: 11.5px;
+                overflow: elide;
+            }
+            HorizontalLayout {
+                spacing: 6px;
+                Text {
+                    // "1.2.1 → 1.3.0"；未安装时右端是"—"（由 Rust 格式化好）
+                    text: root.plugin.installed + " → " + root.plugin.latest;
+                    color: root.plugin.updatable ? Tokens.warn : Tokens.ink-4;
+                    font-family: Font.mono;
+                    font-size: 10.5px;
+                    vertical-alignment: center;
+                }
+                Text {
+                    text: root.plugin.spec;
+                    color: Tokens.ink-4;
+                    font-family: Font.mono;
+                    font-size: 10.5px;
+                    vertical-alignment: center;
+                }
+                // 三种终态各说一句：可更新（由上面那行的颜色 + 按钮表达，这里不说）、
+                // 已是最新、最新版未知。⚠ 不可见元素照样占位，但这里是行内**尾随**位置，
+                // 留白无害（与操作卡右端那三个 Tag 的情形不同 —— 那边留白会把徽标推离右缘）。
+                Text {
+                    visible: !root.plugin.updatable && !root.plugin.missing && root.plugin.latest != "—";
+                    text: "已是最新";
+                    color: Tokens.good;
+                    font-family: Font.text;
+                    font-size: 10.5px;
+                    vertical-alignment: center;
+                }
+                Text {
+                    visible: root.plugin.latest == "—";
+                    text: "最新版未知";
+                    color: Tokens.ink-4;
+                    font-family: Font.text;
+                    font-size: 10.5px;
+                    vertical-alignment: center;
+                }
+            }
+        }
+        Rectangle { horizontal-stretch: 1; }
+
+        // 更新：未安装时文案改"安装"（走同一条 Update 路径，按最新版重装）。
+        // 最新版未知 → 禁用（不知道装哪个版本）。
+        ChipButton {
+            label: root.plugin.missing ? "安装" : "更新";
+            accent: root.plugin.updatable || root.plugin.missing;
+            interactive: !root.busy && root.plugin.latest != "—";
+            clicked => { root.update-clicked(); }
+        }
+        ChipButton {
+            label: "卸载";
+            interactive: !root.busy && !root.plugin.missing;
+            clicked => { root.remove-clicked(); }
+        }
+    }
+}
+
 // ── 玻璃输入框（取代 Fluent 的 LineEdit）────────────────────────────────────
 // 为什么自己画：Fluent 的 LineEdit 把 `min-width: max(160px, …)`、
 // `min-height: max(32px, …)`、4px 圆角、浅色底和自己的描边**全写死在组件体里**
@@ -1207,6 +1314,27 @@ export component MainWindow inherits Window {
     in-out property <bool> reinstall-prompt-visible: false;
     /// 确认框正文里那个版本号（Rust 侧填已装版本号，避免在 Slint 里拼字符串）。
     in property <string> reinstall-version: "";
+
+    // ── 插件卡（FR-34）──
+    in property <[PluginRow]> plugin-rows: [];
+    /// 卡头右侧的**汇总**（"6 个 · 1 个可更新" / "检查中…" / "读取失败"）。
+    in property <string> plugin-summary: "";
+    /// 卡底左侧的**状态**（"正在读取 profile 并检查最新版…" / 失败提示 / 成功时为空）。
+    /// ⚠ 与 `plugin-summary` 各管一件事，不要合并（spec §8.2）。
+    in property <string> plugin-status-line: "";
+    in property <bool>   plugins-loading: false;
+    /// 〔全部更新〕的启用条件与文案来源。
+    in property <int>    plugin-updatable-count: 0;
+    /// 卡高由 Rust 按行数算（上限 6 行）—— 理由见 main.rs 的 `plugin_card_height`。
+    in property <length> plugin-card-height: 164px;
+    /// 安装输入框的当前文本。
+    in-out property <string> plugin-input: "";
+    /// 卸载确认框（唯一的破坏性动作 → 唯一需要二次确认的地方）。
+    in-out property <bool>   plugin-remove-prompt-visible: false;
+    in property <string>     plugin-remove-name: "";
+    /// 卸载确认框里那句"已装版本 x.y.z"；未安装时是"未安装"。
+    in property <string>     plugin-remove-version: "";
+
     /// 当前展开的应用菜单：0 = 都没开 / 1 = 文件 / 2 = 帮助。
     /// 纯 UI 状态：菜单开着的时候只可能有一个，用一个 int 比两个 bool 少一半状态。
     in-out property <int> open-menu: 0;
@@ -1230,6 +1358,18 @@ export component MainWindow inherits Window {
     /// 重装确认框里的〔重装〕。取消**不设回调** —— 它只把
     /// `reinstall-prompt-visible` 置假，什么都不做（同关闭询问框的做法）。
     callback reinstall-confirmed();
+
+    // ── 插件卡（FR-34）──
+    /// 读 `plugin-input` 并交给 Rust 校验；不合法时只有状态栏提示，不发 Job。
+    callback plugin-install();
+    /// 行下标 → 更新该行到最新版。
+    callback plugin-update(int);
+    callback plugin-update-all();
+    /// 行下标 → **只弹确认框**，不派发（破坏性动作的二次确认）。
+    callback plugin-remove(int);
+    /// 确认框里的〔卸载〕→ 才真正派发。
+    callback plugin-remove-confirmed();
+    callback plugin-refresh();
     /// 应用菜单「文件 → 退出」。与托盘菜单的"退出"走**同一条** Rust 路径
     /// （停掉自己启动的 dsh web 再退出事件循环），所以不经过"关闭时的行为"那一问。
     callback quit-app();
@@ -1591,12 +1731,85 @@ export component MainWindow inherits Window {
                 }
             }
 
-            // ───────────────────── 右：更新说明 ─────────────────────
-            // 应用输出已并入左栏的服务区（见上），右栏整列让给更新说明 ——
-            // 长文阅读需要的是宽度和高度，日志不需要。
+            // ───────────────────── 右：插件卡 + 更新说明 ─────────────────────
+            // 应用输出已并入左栏的服务区（见上），右栏上半给插件卡（FR-34）、
+            // 下半给更新说明 —— 长文阅读需要的是宽度和高度。
             VerticalLayout {
                 horizontal-stretch: 1;
-                spacing: 0px;
+                // 两张卡之间要留缝，与左栏的 12px 一致（原先是 0px，只有一张卡）
+                spacing: 12px;
+
+                // ═══════════════════ 插件卡（FR-34）═══════════════════
+                Bezel {
+                    // ⚠ 高度由 Rust 推（`plugin-card-height`）：按行数取、上限 6 行。
+                    // Slint 侧做不了"内容自适应但封顶" —— `ListView` 没有可读的内容高度，
+                    // 而用 `ScrollView` 包它会破坏虚拟化（日志区已记过这条坑）。
+                    height: root.plugin-card-height;
+                    SectionHeader {
+                        label: "插件";
+                        // ⚠ 空串即不占位（Slint 里不可见元素照样占宽），SectionHeader 内部
+                        // 已经按这条处理过 trailing。
+                        trailing: root.plugin-summary;
+                    }
+                    HorizontalLayout {   // 安装行
+                        spacing: 8px;
+                        GlassField {
+                            horizontal-stretch: 1;
+                            text <=> root.plugin-input;
+                            // 包规格是"文本"不是"读数"：左对齐 + 正文体（端口的 4 位数字
+                            // 才用居中 + 等宽）。
+                            text-align: left;
+                            font-family: Font.text;
+                            font-size: 12px;
+                            enabled: !root.busy;
+                            placeholder-text: "@scope/name 或 @scope/name@1.2.3";
+                            edited(t) => { root.plugin-input = t; }
+                        }
+                        ChipButton {
+                            label: "安装";
+                            accent: true;
+                            interactive: !root.busy && root.plugin-input != "";
+                            clicked => { root.plugin-install(); }
+                        }
+                    }
+                    Divider { }
+                    // ⚠ 不要用 ScrollView 包 ListView（虚拟化会失效）。
+                    // ⚠ 也不要在 ListView 上写 padding（它是 ScrollView，不是布局元素，
+                    // padding 会被静默忽略并给出编译警告）。
+                    ListView {
+                        vertical-stretch: 1;
+                        min-height: 40px;
+                        for p[i] in root.plugin-rows : PluginRowView {
+                            plugin: p;
+                            busy: root.busy;
+                            update-clicked => { root.plugin-update(i); }
+                            remove-clicked => { root.plugin-remove(i); }
+                        }
+                    }
+                    HorizontalLayout {   // 汇总行：状态在左、动作在右
+                        spacing: 8px;
+                        cross-axis-alignment: center;
+                        Text {
+                            text: root.plugin-status-line;
+                            color: Tokens.ink-4;
+                            font-family: Font.text;
+                            font-size: 11px;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        ChipButton {
+                            label: "全部更新";
+                            accent: root.plugin-updatable-count > 0;
+                            interactive: !root.busy && root.plugin-updatable-count > 0;
+                            clicked => { root.plugin-update-all(); }
+                        }
+                        ChipButton {
+                            label: "刷新";
+                            interactive: !root.plugins-loading && !root.busy;
+                            clicked => { root.plugin-refresh(); }
+                        }
+                    }
+                }
 
                 // 更新说明（FR-27）
                 // ⚠ 标题移进面板**内部**顶部居中（原先在面板外侧单独占一行）。
@@ -2017,6 +2230,85 @@ export component MainWindow inherits Window {
                     font-family: Font.text;
                     font-size: 11.5px;
                     wrap: word-wrap;
+                }
+            }
+        }
+    }
+
+    // ═══════════════════════ 卸载插件的确认（FR-37）═══════════════════════
+    // 插件卡上唯一的**破坏性**动作，因此是本功能唯一的二次确认。
+    // 点遮罩 / Esc / 右上角关闭 = 取消这次卸载（同关闭询问框与重装框的做法）。
+    if root.plugin-remove-prompt-visible : Rectangle {
+        background: Tokens.overlay;
+        TouchArea { clicked => { root.plugin-remove-prompt-visible = false; } }
+        FocusScope {
+            init => { self.focus(); }
+            key-pressed(e) => {
+                if (e.text == Key.Escape) { root.plugin-remove-prompt-visible = false; return accept; }
+                return reject;
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            cross-axis-alignment: center;
+            Bezel {
+                width: 400px;
+                core-padding: 20px;
+                spacing: 0px;
+
+                HorizontalLayout {
+                    spacing: 10px;
+                    Text {
+                        text: "卸载插件";
+                        color: Tokens.ink;
+                        font-family: Font.display;
+                        font-size: 16px;
+                        font-weight: 600;
+                        letter-spacing: -0.2px;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    CloseButton { clicked => { root.plugin-remove-prompt-visible = false; } }
+                }
+                Rectangle { height: 12px; }
+                Text {
+                    text: root.plugin-remove-name;
+                    color: Tokens.ink;
+                    font-family: Font.mono;
+                    font-size: 12.5px;
+                    wrap: no-wrap;
+                    overflow: elide;
+                }
+                Rectangle { height: 7px; }
+                Text {
+                    text: "将从 profile 移除该依赖（已装版本 "
+                        + (root.plugin-remove-version == "" ? "未知" : root.plugin-remove-version)
+                        + "）。卸载后如需恢复，可重新安装。";
+                    color: Tokens.ink-2;
+                    font-family: Font.text;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                Rectangle { height: 18px; }
+                // ⚠ 强调放在**推荐动作**上（最右）。这里的推荐动作是〔取消〕——
+                // 与重装框相反：那边点下去只是重装一遍，这边是不可逆的删除。
+                HorizontalLayout {
+                    spacing: 9px;
+                    Rectangle { horizontal-stretch: 1; }
+                    ChipButton {
+                        label: "卸载";
+                        interactive: !root.busy;
+                        clicked => {
+                            root.plugin-remove-prompt-visible = false;
+                            root.plugin-remove-confirmed();
+                        }
+                    }
+                    ChipButton {
+                        label: "取消";
+                        accent: true;
+                        clicked => { root.plugin-remove-prompt-visible = false; }
+                    }
                 }
             }
         }
