@@ -1,0 +1,1383 @@
+# 明暗双主题与三种切换模式 实施计划
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** 让应用有明、暗两套完整主题，用户可在「浅色 / 深色 / 跟随系统」间切换，入口在设置面板，默认跟随系统，且运行中实时跟随 Windows 主题变化。
+
+**Architecture:** Rust 是主题的唯一真相源 —— `src/theme.rs` 探测系统态并合成 `resolved_dark`，经 `ui.global::<Tokens>().set_dark()` 写入 Slint 全局；`Tokens` 每个令牌写成 `dark ? 暗值 : 浅值`。UI 只上报意图（`theme-mode-changed(int)`）与显示选中态（`theme-mode`），`system_dark` 不进 .slint。Fluent 控件（ScrollView 滚动条 / AboutSlint）由 `Palette.color-scheme` 单独同步。
+
+**Tech Stack:** Rust 2024 / Slint 1.18（`slint-build` 编译 `ui/app.slint`）/ serde_json（手写 JSON，无 derive）/ windows-sys 0.61（钉在已在 lock 中的版本）/ 既有 `mpsc` + 80ms Timer 排空机制。
+
+**Spec:** `docs/superpowers/specs/2026-09-22-theme-system-design.md`（本计划从该规格论证而来，执行者两份都要读；规格 §2 的平台事实表是本设计的支点，§4.3 是浅色令牌的权威值表）
+
+## Global Constraints
+
+- **两份契约不可破坏**（`ui/app.slint` 头部注释）：所有 `in property` / `in-out property` 的名字与类型、所有 callback 的名字与签名，改任一都要同步 `src/main.rs`。
+- **`cargo build` 必须 0 警告**，`cargo test` 必须全绿。本仓库不接受 `allow` 掩盖死代码。
+- **下标即契约**：`ThemeMode` 的 0/1/2 与 `ui/app.slint` 的 `theme-mode` 一一对应（同 `CloseBehavior` 与 `close-behavior-index` 的既有约定）。
+- **不加会新增编译单元的依赖。** `windows-sys` 固定 `"0.61"`（0.61.2 已在 `Cargo.lock` 中，被 12 处依赖使用）。
+- **暗色侧现有色值一律不改** —— 本次是加浅色，不是重做暗色。上次提交 `9c5a478` 的验证结论必须继续有效。
+- **端口纪律**：`3080` 是本会话的 live `dsh web`，任何验证都不得触碰；需要真实监听的场景用 `3099`。截图运行应用时**不得点击任何控件**。
+- **不得 `git add target/`**（`.gitignore` 已忽略，验证脚本放那里）。
+
+## File Structure
+
+| 文件 | 责任 | 动作 |
+|---|---|---|
+| `src/theme.rs` | 主题模式、解析、系统态探测、变更监视。**唯一**知道"如何得到系统主题"的地方 | 新建 |
+| `src/config.rs` | `state.json` I/O。新增 `theme_mode` 字段的读写与兼容 | 修改 |
+| `src/model.rs` | `UiMsg` 消息枚举。新增系统主题变更变体 | 修改 |
+| `src/main.rs` | `AppState`、`project()`、`drain()`、`wire_callbacks()`、`main()` 接线 | 修改 |
+| `ui/app.slint` | `Tokens` 双主题令牌、设置面板「主题」组、两份契约 | 修改 |
+| `Cargo.toml` | 加 `windows-sys` 目标依赖 | 修改 |
+| `docs/ARCHITECTURE.md` / `docs/RULINGS.md` / `docs/VERIFICATION.md` | 平台事实留档与验证记录 | 修改 |
+
+**不新建** `src/theme_win.rs`：探测与解析同属"主题"这一个职责，且解析部分需要被探测部分复用；拆开只会制造两处互相引用的文件。
+
+---
+
+### Task 1: `ThemeMode` 与解析（纯逻辑）
+
+**Files:**
+- Create: `src/theme.rs`
+- Modify: `src/main.rs:6-10`（`mod` 声明处，加一行 `mod theme;`）
+
+**Interfaces:**
+- Consumes: 无
+- Produces:
+  - `theme::ThemeMode`（`Copy + Clone + PartialEq + Eq + Debug + Default`，默认 `Auto`）
+  - `ThemeMode::index(self) -> i32`、`ThemeMode::from_index(i: i32) -> Option<ThemeMode>`
+  - `ThemeMode::as_str(self) -> &'static str`、`ThemeMode::parse(s: &str) -> Option<ThemeMode>`
+  - `theme::resolve(mode: ThemeMode, system_dark: bool) -> bool`
+
+- [ ] **Step 1: 写失败的测试**
+
+创建 `src/theme.rs`，**只写文档注释与测试模块**（实现留空，先让它编译失败）：
+
+```rust
+//! 主题的模式、解析与系统态探测。
+//!
+//! ⚠ 平台事实（已在依赖源码中核实，出处见
+//! `docs/superpowers/specs/2026-09-22-theme-system-design.md` §2）：
+//! Slint 1.18 **不允许应用读系统主题** —— `SlintInternal.color-scheme` 对用户代码
+//! 是编译错误（`i-slint-compiler-1.18.0/tests/syntax/lookup/global.slint:38` 断言了
+//! 这一点），`SlintContext::color_scheme()` 又只在 `private_unstable_api` 里。
+//! 所以"跟随系统"必须我们自己探测。
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn index_roundtrips_for_every_mode() {
+        for m in [ThemeMode::Light, ThemeMode::Dark, ThemeMode::Auto] {
+            assert_eq!(ThemeMode::from_index(m.index()), Some(m));
+        }
+    }
+
+    #[test]
+    fn out_of_range_index_is_rejected_not_guessed() {
+        // 越界不得猜一个模式 —— 与 CloseBehavior::from_index 同判据
+        assert_eq!(ThemeMode::from_index(3), None);
+        assert_eq!(ThemeMode::from_index(-1), None);
+    }
+
+    #[test]
+    fn str_roundtrips_for_every_mode() {
+        for m in [ThemeMode::Light, ThemeMode::Dark, ThemeMode::Auto] {
+            assert_eq!(ThemeMode::parse(m.as_str()), Some(m));
+        }
+    }
+
+    #[test]
+    fn unrecognized_str_is_treated_as_never_set() {
+        // 手改过或降级运行留下的值一律当"没记过"（→ 跟随系统），
+        // 这比替用户猜一个固定主题安全。与 close_behavior 的既有处理同款。
+        assert_eq!(ThemeMode::parse("MINT"), None);
+        assert_eq!(ThemeMode::parse(""), None);
+    }
+
+    #[test]
+    fn default_mode_follows_the_system() {
+        assert_eq!(ThemeMode::default(), ThemeMode::Auto);
+    }
+
+    #[test]
+    fn resolve_truth_table() {
+        // 强制档忽略系统态；自动档完全等于系统态。六个格子逐个钉住。
+        assert!(!resolve(ThemeMode::Light, true));
+        assert!(!resolve(ThemeMode::Light, false));
+        assert!(resolve(ThemeMode::Dark, true));
+        assert!(resolve(ThemeMode::Dark, false));
+        assert!(resolve(ThemeMode::Auto, true));
+        assert!(!resolve(ThemeMode::Auto, false));
+    }
+}
+```
+
+同时在 `src/main.rs` 的模块声明处（`mod pm;` 之后）加：
+
+```rust
+mod theme;
+```
+
+- [ ] **Step 2: 运行测试确认失败**
+
+Run: `cargo test theme:: 2>&1 | tail -20`
+Expected: 编译错误 —— `cannot find type ThemeMode in this scope`、`cannot find function resolve`。
+
+- [ ] **Step 3: 写最小实现**
+
+在 `src/theme.rs` 的文档注释之后、`#[cfg(test)]` 之前插入：
+
+```rust
+/// 主题模式。
+///
+/// ⚠ 下标即 UI 契约：`ui/app.slint` 的 `theme-mode` 用 0/1/2 表示这三档，
+/// 与 `CloseBehavior` / `close-behavior-index` 同一约定，改顺序要两边一起改。
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub enum ThemeMode {
+    Light,
+    Dark,
+    /// 跟随系统。也是 `state.json` 里**没记过**时的缺省 —— 于是"默认跟随系统"
+    /// 这条需求不需要任何额外标志：没值就是跟随。
+    #[default]
+    Auto,
+}
+
+impl ThemeMode {
+    pub fn index(self) -> i32 {
+        match self {
+            ThemeMode::Light => 0,
+            ThemeMode::Dark => 1,
+            ThemeMode::Auto => 2,
+        }
+    }
+
+    pub fn from_index(i: i32) -> Option<Self> {
+        match i {
+            0 => Some(ThemeMode::Light),
+            1 => Some(ThemeMode::Dark),
+            2 => Some(ThemeMode::Auto),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ThemeMode::Light => "light",
+            ThemeMode::Dark => "dark",
+            ThemeMode::Auto => "auto",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "light" => Some(ThemeMode::Light),
+            "dark" => Some(ThemeMode::Dark),
+            "auto" => Some(ThemeMode::Auto),
+            _ => None,
+        }
+    }
+}
+
+/// 把模式与系统态合成"现在该不该用暗色"。
+///
+/// **这是主题的唯一判据** —— UI 不参与判断，`system_dark` 甚至不进 .slint。
+/// 强制模式下 `system_dark` 变化不会改变返回值，这是正确行为不是漏接线。
+pub fn resolve(mode: ThemeMode, system_dark: bool) -> bool {
+    match mode {
+        ThemeMode::Light => false,
+        ThemeMode::Dark => true,
+        ThemeMode::Auto => system_dark,
+    }
+}
+```
+
+- [ ] **Step 4: 运行测试确认通过**
+
+Run: `cargo test theme:: 2>&1 | tail -12`
+Expected: `test result: ok. 6 passed`
+
+- [ ] **Step 5: 提交**
+
+```bash
+git add src/theme.rs src/main.rs
+git commit -m "feat(theme): ThemeMode 三档与 resolve 解析（纯逻辑 + 单测）"
+```
+
+---
+
+### Task 2: `state.json` 持久化 `theme_mode`
+
+**Files:**
+- Modify: `src/config.rs:11`（`use` 区）、`:57-63`（`StateFile`）、`:90-99`（解析）、`:146-150`（保存）、以及 6 处测试字面构造：`:377`、`:403`、`:429`、`:439`、`:485`、`:491`
+- Test: `src/config.rs` 的 `mod tests`
+
+**Interfaces:**
+- Consumes: `theme::ThemeMode`、`ThemeMode::as_str`、`ThemeMode::parse`（Task 1）
+- Produces: `config::StateFile { …, pub theme_mode: Option<ThemeMode> }`
+
+- [ ] **Step 1: 写失败的测试**
+
+在 `src/config.rs` 的 `mod tests` 内追加（`use super::*;` 已存在；再补 `use crate::theme::ThemeMode;`）：
+
+```rust
+    #[test]
+    fn theme_mode_roundtrips_through_json() {
+        let p = tmp("theme.json");
+        let s = StateFile {
+            preferred_port: None,
+            running_port: None,
+            close_behavior: None,
+            theme_mode: Some(ThemeMode::Dark),
+        };
+        save_to(&p, &s).unwrap();
+        match load_from(Some(&p)) {
+            Loaded::Ok(got) => assert_eq!(got.theme_mode, Some(ThemeMode::Dark)),
+            other => panic!("期望 Ok，得到 {other:?}"),
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// ⚠ 兼容性：旧版 state.json 只有三个字段。缺 key 必须读出 `None`
+    /// （= 跟随系统），**不得**当成损坏、也不得回落成某个固定主题。
+    #[test]
+    fn legacy_state_without_theme_mode_reads_as_none() {
+        let p = tmp("legacy.json");
+        std::fs::write(
+            &p,
+            r#"{"preferred_port": 3080, "running_port": null, "close_behavior": "quit"}"#,
+        )
+        .unwrap();
+        match load_from(Some(&p)) {
+            Loaded::Ok(s) => {
+                assert_eq!(s.theme_mode, None, "缺 key 应为 None（跟随系统）");
+                assert_eq!(s.preferred_port, Some(3080), "旧字段不得受影响");
+                assert_eq!(s.close_behavior, Some(CloseBehavior::Quit));
+            }
+            other => panic!("期望 Ok，得到 {other:?}"),
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn unrecognized_theme_mode_reads_as_none() {
+        let p = tmp("badtheme.json");
+        std::fs::write(&p, r#"{"theme_mode": "MINT"}"#).unwrap();
+        match load_from(Some(&p)) {
+            Loaded::Ok(s) => assert_eq!(s.theme_mode, None),
+            other => panic!("期望 Ok，得到 {other:?}"),
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 保存必须落 `theme_mode` 这个 key —— 否则"选了深色重启还是跟随系统"，
+    /// 而所有内存测试都看不出来。
+    #[test]
+    fn save_writes_theme_mode_key() {
+        let p = tmp("writetheme.json");
+        let s = StateFile {
+            preferred_port: None,
+            running_port: None,
+            close_behavior: None,
+            theme_mode: Some(ThemeMode::Light),
+        };
+        save_to(&p, &s).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(v.get("theme_mode").and_then(|x| x.as_str()), Some("light"));
+        let _ = std::fs::remove_file(&p);
+    }
+```
+
+- [ ] **Step 2: 运行测试确认失败**
+
+Run: `cargo test config::tests::theme 2>&1 | tail -20`
+Expected: 编译错误 —— `struct StateFile has no field named theme_mode`，同时 6 处既有字面构造报 `missing field theme_mode`。
+
+- [ ] **Step 3: 写最小实现**
+
+`src/config.rs` 顶部 `use` 区加：
+
+```rust
+use crate::theme::ThemeMode;
+```
+
+`StateFile` 加字段：
+
+```rust
+#[derive(Default, Clone, Debug, PartialEq)]
+pub struct StateFile {
+    pub preferred_port: Option<u16>,
+    pub running_port: Option<u16>,
+    /// `None` = 从没问过（首次关闭要弹询问框）。见 `CloseBehavior`。
+    pub close_behavior: Option<CloseBehavior>,
+    /// `None` = 从没设过 = 跟随系统。见 `ThemeMode`。
+    pub theme_mode: Option<ThemeMode>,
+}
+```
+
+`load_from` 的 `StateFile { .. }`（约 `:90`）加：
+
+```rust
+        theme_mode: v
+            .get("theme_mode")
+            .and_then(|x| x.as_str())
+            .and_then(ThemeMode::parse),
+```
+
+`save_to`（约 `:146`）加：
+
+```rust
+        "theme_mode": s.theme_mode.map(ThemeMode::as_str),
+```
+
+把 6 处测试字面构造各补一行 `theme_mode: None,`（编译器会逐个报 `missing field`，不要用 `..Default::default()` —— 那样新增字段就再也无法被编译器提醒了）。
+
+- [ ] **Step 4: 运行测试确认通过**
+
+Run: `cargo test config:: 2>&1 | tail -12`
+Expected: 全部 ok，包含新增 4 项。
+
+- [ ] **Step 5: 提交**
+
+```bash
+git add src/config.rs
+git commit -m "feat(theme): state.json 持久化 theme_mode，含旧文件兼容"
+```
+
+---
+
+### Task 3: 对比度回归测试（先红）
+
+**Files:**
+- Modify: `src/theme.rs`（在 `mod tests` 内追加）
+
+**Interfaces:**
+- Consumes: Task 1 的 `src/theme.rs`
+- Produces: `mod tests` 内的辅助函数 `parse_palette() -> Result<Vec<(String, String, String)>, String>`、`palette() -> BTreeMap<String, (String, String)>`、`contrast(&str, &str) -> f64`、`over(&str, &str) -> String`（Task 4 靠这两个测试验收）
+
+> **为什么先写这个**：Task 4 要改 45 行令牌，全靠肉眼会漏。这两个测试**解析 `ui/app.slint` 的实际文本**（不是校验意图），漏改或写错色值会让它红。
+
+- [ ] **Step 1: 写失败的测试**
+
+在 `src/theme.rs` 的 `mod tests` 内追加（顶部补 `use std::collections::BTreeMap;`）：
+
+```rust
+    /// 从 `ui/app.slint` 的 Tokens 全局解析每个 brush 令牌的（暗值, 浅值）。
+    ///
+    /// ⚠ 只认 `out property <brush> 名字: dark ? #AAAAAA : #BBBBBB;` 这一形状，
+    /// 且**形状不认识时报错而不是跳过** —— 跳过会让测试在令牌被改写后
+    /// 悄悄失去覆盖，那正是这类回归测试最容易失效的方式。
+    fn parse_palette() -> Result<Vec<(String, String, String)>, String> {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app.slint"))
+            .map_err(|e| format!("读不到 ui/app.slint: {e}"))?;
+        let start = src.find("global Tokens {").ok_or("找不到 Tokens 全局")?;
+        let body = &src[start..];
+        let end = body.find("\n}").ok_or("Tokens 全局没有结束大括号")?;
+        let hex = |s: &str| -> Option<String> {
+            let i = s.find('#')?;
+            let rest: String = s[i + 1..].chars().take(8).collect();
+            let n = rest.chars().take_while(|c| c.is_ascii_hexdigit()).count();
+            (n == 6 || n == 8).then(|| format!("#{}", &rest[..n]))
+        };
+        let mut out = Vec::new();
+        for line in body[..end].lines() {
+            let Some(rest) = line.split("<brush>").nth(1) else { continue };
+            let (name, val) = rest
+                .split_once(':')
+                .ok_or_else(|| format!("令牌行缺冒号: {line}"))?;
+            let name = name.trim().to_string();
+            if !name.is_empty() {
+                let (dark_side, light_side) = val
+                    .split_once('?')
+                    .ok_or_else(|| format!("令牌 {name} 没有明暗条件（期望 `dark ? 暗 : 浅`）: {line}"))?;
+                let (dark, light) = (
+                    hex(dark_side).ok_or_else(|| format!("{name} 的暗色侧不是 hex: {line}"))?,
+                    hex(light_side).ok_or_else(|| format!("{name} 的浅色侧不是 hex: {line}"))?,
+                );
+                out.push((name, dark, light));
+            }
+        }
+        if out.is_empty() {
+            return Err("一个令牌都没解析出来".into());
+        }
+        Ok(out)
+    }
+
+    fn palette() -> BTreeMap<String, (String, String)> {
+        let mut m = BTreeMap::new();
+        for (n, d, l) in parse_palette().expect("解析 ui/app.slint 令牌失败") {
+            m.insert(n, (d, l));
+        }
+        m
+    }
+
+    fn lin(c: f64) -> f64 {
+        if c <= 0.03928 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+    }
+
+    /// 返回 (r, g, b, alpha)，alpha 为 1.0 表示不透明。
+    fn rgba(hex: &str) -> (u8, u8, u8, f64) {
+        let h = hex.trim_start_matches('#');
+        let ch = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).expect("hex 解析");
+        let a = if h.len() == 8 { ch(6) as f64 / 255.0 } else { 1.0 };
+        (ch(0), ch(2), ch(4), a)
+    }
+
+    fn lum(hex: &str) -> f64 {
+        let (r, g, b, _) = rgba(hex);
+        0.2126 * lin(r as f64 / 255.0) + 0.7152 * lin(g as f64 / 255.0) + 0.0722 * lin(b as f64 / 255.0)
+    }
+
+    fn contrast(a: &str, b: &str) -> f64 {
+        let (la, lb) = (lum(a), lum(b));
+        let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// 把带 alpha 的 fg 合成到不透明 bg 上，返回不透明 hex。
+    fn over(fg: &str, bg: &str) -> String {
+        let (fr, fg_, fb, a) = rgba(fg);
+        let (br, bg_, bb, _) = rgba(bg);
+        let mix = |f: u8, b: u8| (f as f64 * a + b as f64 * (1.0 - a)).round() as u8;
+        format!("#{:02X}{:02X}{:02X}", mix(fr, br), mix(fg_, bg_), mix(fb, bb))
+    }
+
+    /// 文字类令牌：两套主题都必须过门槛。背景取 **canvas**（各自主题里最不利的
+    /// 那个面）。门槛见规格 §4.3：正文 4.5，小字标签 3.0。
+    #[test]
+    fn both_palettes_meet_text_contrast_bars() {
+        let p = palette();
+        let (c_dark, c_light) = p.get("canvas").expect("缺 canvas 令牌").clone();
+        let bars: [(&str, f64); 9] = [
+            ("ink", 4.5),
+            ("ink-2", 4.5),
+            ("ink-3", 4.5),
+            ("ink-4", 3.0),
+            ("accent", 4.5),
+            ("accent-ink", 4.5),
+            ("good", 4.5),
+            ("warn", 4.5),
+            ("danger", 4.5),
+        ];
+        for (name, bar) in bars {
+            let (d, l) = p.get(name).unwrap_or_else(|| panic!("缺 {name} 令牌")).clone();
+            let rd = contrast(&d, &c_dark);
+            let rl = contrast(&l, &c_light);
+            assert!(rd >= bar, "暗色 {name}={d} on {c_dark} 只有 {rd:.2f}，需 >= {bar}");
+            assert!(rl >= bar, "浅色 {name}={l} on {c_light} 只有 {rl:.2f}，需 >= {bar}");
+        }
+    }
+
+    /// α 档令牌：合成到各自 canvas 后必须仍然可辨。数值门槛取自规格 §4.3 表格。
+    #[test]
+    fn translucent_tiers_stay_visible_in_both_palettes() {
+        let p = palette();
+        let (c_dark, c_light) = p.get("canvas").expect("缺 canvas 令牌").clone();
+        let bars: [(&str, f64); 11] = [
+            ("shell", 1.005),
+            ("hairline", 1.02),
+            ("hairline-soft", 1.01),
+            ("hairline-strong", 1.10),
+            ("fill", 1.01),
+            ("fill-hover", 1.02),
+            ("fill-active", 1.05),
+            ("sunk", 1.015),
+            ("accent-fill", 1.02),
+            ("accent-line", 1.10),
+            ("glow-brand", 1.01),
+        ];
+        for (name, bar) in bars {
+            let (d, l) = p.get(name).unwrap_or_else(|| panic!("缺 {name} 令牌")).clone();
+            for (label, val, bg) in [("暗色", &d, &c_dark), ("浅色", &l, &c_light)] {
+                let comp = over(val, bg);
+                let r = contrast(&comp, bg);
+                assert!(
+                    r >= bar,
+                    "{label} {name}={val} 合成到 {bg} 得 {comp}，只有 {r:.3f}，需 >= {bar}"
+                );
+            }
+        }
+    }
+```
+
+- [ ] **Step 2: 运行测试确认失败**
+
+Run: `cargo test theme::tests 2>&1 | tail -20`
+Expected: 两个新测试 FAIL —— 报 `令牌 xxx 没有明暗条件（期望 `dark ? 暗 : 浅`）`。这正是预期的红：`ui/app.slint` 现在还是单套暗色常量。
+
+- [ ] **Step 3: 提交（红测试先入库）**
+
+```bash
+git add src/theme.rs
+git commit -m "test(theme): 双主题对比度回归测试（解析 app.slint 实际值，先红）"
+```
+
+---
+
+### Task 4: `ui/app.slint` 双主题令牌
+
+**Files:**
+- Modify: `ui/app.slint:46-111`（`Tokens` 全局）、`:136`（`Orb` 默认 tint）、`:241`（图标井）、`:268`（CTA 悬停）、`:471`（Flyout 阴影）、`:1190`（顶部光）
+
+**Interfaces:**
+- Consumes: `theme::resolve` 的布尔结果（Task 8 写入）
+- Produces: `export global Tokens`（Rust 侧类型 `Tokens`，含 `set_dark(bool)` / `get_dark() -> bool`）、新增令牌 `well` / `well-hover` / `cta-hover-top` / `cta-hover-bottom` / `top-light` / `shadow`
+
+**权威色值表是规格 §4.3**（浅色侧每一格都已验算过 WCAG，不要自行发挥）。暗色侧一律保持现值。
+
+- [ ] **Step 1: 打开令牌块并与规格对表**
+
+读 `ui/app.slint:46-111` 与规格 §4.3 表格逐行对照。**先看清再动手** —— 45 个令牌里任何一个漏改，Task 3 的测试都会红。
+
+- [ ] **Step 2: 改 `Tokens` 为可切换的双主题全局**
+
+把 `global Tokens {` 改为 `export global Tokens {`，并在其第一行插入输入属性；每个 `out property <brush>` 改为 `dark ? 暗值 : 浅值`。**暗色值原样保留**，浅色值取自规格 §4.3。整块替换为：
+
+```slint
+// ── 设计令牌 ────────────────────────────────────────────────────────────────
+// 一处定义，全局引用。
+//
+// ⚠ 色值锚定 `assets/logo.png`（本机采样，非肉眼估）：
+//     头发主蓝 #59659B（占 9.2%，签名色）／发丝高光 #7AA3CD→#95B6E9
+//     裙装藏青 #30304E~#3B3C62／围裙暖白 #FDF4F5
+// 所以下面三件事是一体的，改一件要一起想：
+//   ① 中性色阶是**藏青**不是纯灰（取裙装的色相，压到近黑／提到近白）
+//   ② 玻璃层的结构色随主题**反向**（暗色是白 α，浅色必须翻成深 α）
+//   ③ 强调色是**紫蓝**不是薄荷 —— logo 里一个绿色像素都没有
+//
+// ⚠ 双主题：`dark` 由 Rust 唯一写入（`theme::resolve` 的结果），UI 不参与判断，
+// 系统态（system_dark）甚至不进本文件。每格写成 `dark ? 暗 : 浅` 是 Slint 自己的
+// 形状 —— 见 i-slint-compiler-1.18.0/widgets/fluent/styling.slint:36。
+// 浅色侧每个值都在规格 §4.3 验算过 WCAG，改动要走 test(theme) 的对比度回归测试。
+//
+// 浅色侧要点：accent 用 logo **真实**主蓝 #59659B（暗色侧是提亮版 #9AA6E8）——
+// 浅底上必须压深才够 4.87，压深后正好落回 logo 原色。warn/danger 同理必须压深
+// （#E3B341 / #F07178 在白底上只有 1.9 / 2.6，不可用）。
+export global Tokens {
+    /// 当前是否为暗色。Rust 写，其余令牌读。
+    in-out property <bool> dark: true;
+
+    out property <brush> canvas:        dark ? #08080F : #EDEFF7;  // 最深/最浅一层
+    out property <brush> core-top:      dark ? #12121C : #FFFFFF;  // 卡片内胎（渐变上端）
+    out property <brush> core-bottom:   dark ? #0D0D15 : #F6F7FB;  // 卡片内胎（渐变下端）
+    out property <brush> shell:         dark ? #EEF0FF06 : #2A2E4A03; // 外碗底
+    out property <brush> hairline:      dark ? #EEF0FF12 : #2A2E4A09; // 1px 结构线
+    out property <brush> hairline-soft: dark ? #EEF0FF0A : #2A2E4A05;
+    out property <brush> hairline-strong: dark ? #EEF0FF33 : #2A2E4A22; // 输入类控件的描边
+    out property <brush> inner-light:   dark ? #EEF0FF0E : #FFFFFF99; // 内胎顶缘高光
+
+    out property <brush> ink:           dark ? #EFEFF7 : #191B2A;  // 主文字
+    out property <brush> ink-2:         dark ? #AFB0C6 : #4C4F66;  // 正文
+    out property <brush> ink-3:         dark ? #7C7D95 : #666980;  // 次级
+    out property <brush> ink-4:         dark ? #63647C : #82859B;  // 标签 / 眉标
+
+    out property <brush> accent:        dark ? #9AA6E8 : #59659B;  // 唯一强调色
+    out property <brush> accent-ink:    dark ? #BCC5F7 : #3A4270;  // 强调色上的文字
+    out property <brush> good:          dark ? #7FB4E4 : #2E6C9E;  // 信息 / 成功
+    out property <brush> warn:          dark ? #E3B341 : #8A6200;  // ⚠ 不取自 logo：金蝶结只占 67px(0.05%)
+
+    out property <brush> cta-top:       dark ? #F8F6FA : #59659B;  // 主 CTA（浅色为实心强调色）
+    out property <brush> cta-bottom:    dark ? #DCDAE6 : #59659B;
+    out property <brush> cta-ink:       dark ? #0B0B14 : #FFFFFF;
+    // ⚠ 悬停方向**相反**：暗色白胶囊变亮，浅色实心胶囊必须变深 ——
+    // 变浅会让白字掉到 4.36，不达标。
+    out property <brush> cta-hover-top:    dark ? #FFFFFF : #4C5788;
+    out property <brush> cta-hover-bottom: dark ? #E6E7F2 : #4C5788;
+    // 图标井：暗色是白胶囊里的黑井；浅色 CTA 是实心强调色，井翻成白井。
+    out property <brush> well:          dark ? #00000024 : #FFFFFF2E;
+    out property <brush> well-hover:    dark ? #0000001F : #FFFFFF38;
+
+    out property <brush> glow-brand:    dark ? #9AA6E81F : #59659B14; // 强调色的氛围光
+    out property <brush> glow-blue:     dark ? #7FB4E417 : #7FB4E41A;
+    out property <brush> top-light:     dark ? #EEF0FF0B : #FFFFFFB3; // 顶部一线竖直渐变
+    out property <brush> shadow:        dark ? #00000080 : #2A2E4A33; // 浮层投影
+    out property <length> r-lg: 22px;
+    out property <length> r-md: 16px;
+    out property <length> r-sm: 11px;
+    out property <length> font-hero: 27px;
+
+    // ── 控制面：所有可点元素共用同一套填充，不允许各自写白百分比 ─────────────
+    // 收敛前散着 #FFFFFF08/0D/12/14/17/1F 六个值，四个按钮族各挑一个，
+    // 于是"同一档悬停"在四个地方是四种亮度。
+    out property <brush> fill:        dark ? #EEF0FF0D : #2A2E4A05; // 静止
+    out property <brush> fill-hover:  dark ? #EEF0FF17 : #2A2E4A09; // 悬停
+    out property <brush> fill-active: dark ? #EEF0FF1F : #2A2E4A0D; // 按压 / 已展开
+
+    // ── 槽与浮层 ──────────────────────────────────────────────────────────
+    out property <brush> sunk:        dark ? #00000059 : #2A2E4A06; // 下凹槽底（输入框 / 下拉框）
+    out property <brush> solid:       dark ? #15151F : #FFFFFF;   // 浮层底：不透明，才压得住下层文字
+    out property <brush> overlay:     dark ? #000000B8 : #1A1C2E66; // 模态遮罩
+
+    // ── 强调色的四档（静止填充 / 悬停填充 / 描边 / 徽标底）──────────────────
+    out property <brush> accent-fill:       dark ? #9AA6E81A : #59659B14;
+    out property <brush> accent-fill-hover: dark ? #9AA6E82E : #59659B24;
+    out property <brush> accent-line:       dark ? #9AA6E847 : #59659B3D;
+    out property <brush> accent-soft:       dark ? #9AA6E812 : #59659B0F;
+    out property <brush> warn-soft:         dark ? #E3B34112 : #8A620012;
+
+    out property <brush> danger:      dark ? #F07178 : #9C3F41;   // 错误（日志行）
+    out property <brush> lamp-off:    dark ? #494C60 : #B0B3C2;   // 熄灭的状态灯
+
+    // ── 动效与状态（两套主题共用，不参与主题）──────────────────────────────
+    // 三档时长：读数变色 400ms / 配色切换 200ms / 按压回弹 150ms。
+    out property <duration> motion-slow:  400ms;
+    out property <duration> motion-hover: 200ms;
+    out property <duration> motion-tap:   150ms;
+    /// 状态栏高度。⚠ 两处必须一致：主布局靠 `padding-bottom: Tokens.status-h`
+    /// 给贴底的状态栏让位，状态栏自己用它定高。
+    out property <length> status-h: 34px;
+    /// 不可用元素整体压暗的统一档位。用 opacity 表达，两套主题同样成立。
+    out property <float> disabled: 0.35;
+}
+```
+
+- [ ] **Step 3: 吸收 5 处散落字面量**
+
+1. `:136` `Orb` 的默认 tint 改为引用**氛围光**令牌（⚠ 不是 `Tokens.accent` —— 那是**不透明**色，拿它当 tint 会让缺省光晕变成一块实心色斑；两个调用点传的都是 `glow-*`，缺省必须同档）：
+
+```slint
+    in property <brush> tint: Tokens.glow-brand;
+```
+
+2. `:241` 图标井改用新令牌：
+
+```slint
+                background: emphasis
+                    ? (touch.has-hover ? Tokens.well-hover : Tokens.well)
+                    : (touch.has-hover ? Tokens.fill-active : Tokens.fill-hover);
+```
+
+3. `:268` CTA 悬停渐变改用新令牌：
+
+```slint
+                ? @linear-gradient(180deg, Tokens.cta-hover-top 0%, Tokens.cta-hover-bottom 100%)
+```
+
+4. `:471` Flyout 阴影：
+
+```slint
+    drop-shadow-color: Tokens.shadow;
+```
+
+5. `:1190` 顶部光：
+
+```slint
+        background: @linear-gradient(180deg, Tokens.top-light 0%, transparent 100%);
+```
+
+- [ ] **Step 4: 运行对比度回归测试确认转绿**
+
+Run: `cargo test theme::tests 2>&1 | tail -12`
+Expected: `both_palettes_meet_text_contrast_bars` 与 `translucent_tiers_stay_visible_in_both_palettes` 都 PASS。
+
+- [ ] **Step 5: 确认编译与令牌块外再无颜色字面量**
+
+Run: `cargo build 2>&1 | tail -5`
+Expected: `Finished`，0 警告。
+
+Run: `grep -n '#[0-9A-Fa-f]\{6,8\}' ui/app.slint | awk -F: '$1>115'`
+Expected: 只剩注释行（`//` 开头）。**任何非注释行都是漏抽的字面量**，必须补成令牌。
+
+- [ ] **Step 6: 确认 `dark` 开关真的驱动了颜色（临时验证，随后还原）**
+
+Run: `cargo test theme::tests::both_palettes_meet_text_contrast_bars 2>&1 | tail -4`（应 PASS）
+然后**手动**把 `canvas` 的浅色值 `#EDEFF7` 临时改成 `#000000`，重跑上面这条命令。
+
+Expected: **FAIL**，报"浅色 canvas 相关对比度不足"。这证明测试真的在读文件、真的会因错值而红（而不是恒真）。改回 `#EDEFF7`，重跑确认 PASS。
+
+- [ ] **Step 7: 提交**
+
+```bash
+git add ui/app.slint
+git commit -m "feat(ui): Tokens 双主题（浅色版逐令牌验算）+ 吸收 5 处散落字面量"
+```
+
+---
+
+### Task 5: Windows 系统主题探测
+
+**Files:**
+- Modify: `Cargo.toml`（加目标依赖）
+- Modify: `src/theme.rs`（加探测实现与单测）
+
+**Interfaces:**
+- Consumes: 无（只依赖 Windows API）
+- Produces: `theme::system_dark() -> bool`
+
+> **与 winit 同源是硬要求**：winit 用 `uxtheme.dll` 序号 132 的 `ShouldAppsUseDarkMode()` 给系统标题栏定色（`winit-0.30.13/src/platform_impl/windows/dark_mode.rs:130`）。我们若改用注册表读，某些机器上会出现"应用主体变暗而标题栏不变"。故主路径同源，注册表只作回落。
+
+- [ ] **Step 1: 写失败的测试**
+
+`src/theme.rs` 的 `mod tests` 内追加：
+
+```rust
+    /// ⚠ 这条**不能**断言具体值 —— 值取决于跑测试时系统的主题设置。
+    /// 它能抓住的是：FFI 不崩、不吃到空指针、两次调用自洽。
+    /// 序号写错或 `GetProcAddress` 结果被误用时，这里会直接段错误而不是返回。
+    #[test]
+    fn system_dark_is_callable_and_stable() {
+        let a = system_dark();
+        let b = system_dark();
+        assert_eq!(a, b, "同一时刻两次探测必须一致");
+    }
+```
+
+- [ ] **Step 2: 运行测试确认失败**
+
+Run: `cargo test theme::tests::system_dark 2>&1 | tail -12`
+Expected: 编译错误 —— `cannot find function system_dark`。
+
+- [ ] **Step 3: 加依赖**
+
+`Cargo.toml` 末尾追加（⚠ 用 `"0.61"` 而非 `"0.61.2"`：0.61.2 已在 `Cargo.lock` 中，该区间解析到它，**不新增编译单元**）：
+
+```toml
+# 系统主题探测与变更监视。⚠ 钉在 0.61 —— 该版本已在 lock 里（winit 等 12 处
+# 依赖使用它），故不新增 crate。手写等价 FFI 要跨 3 个 DLL 且自己管 HKEY/HANDLE
+# 成对释放，每处都是测试抓不到的泄漏机会。
+#
+# ⚠ `Win32_Security` 是 `CreateEventW` 的**必需** feature，不是可选：
+# windows-sys 把签名里带 `SECURITY_ATTRIBUTES` 的函数整体 cfg 在它后面
+# （已核实 windows-sys-0.61.2/src/Windows/Win32/System/Threading/mod.rs）。
+# 少了它 `CreateEventW` 根本不存在，而事件对象是"无竞态武装通知"的前提。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Accessibility",
+    "Win32_UI_WindowsAndMessaging",
+] }
+```
+
+- [ ] **Step 3b: 编译确认依赖本身没问题**
+
+Run: `cargo build 2>&1 | tail -6`
+Expected: 因 `system_dark` 未实现而报 `cannot find function`（Step 2 那条），**不得**出现 `unresolved import` 或 feature 相关错误。若报 feature 名不存在，说明 `"0.61"` 解析到了别的补丁版本，改回精确 `"0.61.2"`。
+
+- [ ] **Step 4: 写实现**
+
+在 `src/theme.rs` 的 `resolve` 之后插入：
+
+```rust
+/// 个人化设置键。`AppsUseLightTheme` 是 DWORD：1 = 浅色，0 = 深色。
+#[cfg(windows)]
+const PERSONALIZE_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize";
+
+/// 当前系统是否为暗色。
+///
+/// **主路径与 winit 同源**：`uxtheme.dll` 的序号 132 导出（`ShouldAppsUseDarkMode`），
+/// 并同样排除高对比度。不同源的话，系统标题栏（winit 负责）与窗口主体（本函数
+/// 负责）会各说各话 —— 那正是本设计要避免的。取不到该导出时回落注册表读
+/// `AppsUseLightTheme`。
+#[cfg(windows)]
+pub fn system_dark() -> bool {
+    use windows_sys::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, SPI_GETHIGHCONTRAST};
+
+    /// 高对比度下 winit 判定为浅色（`dark_mode.rs:126` 的 `!is_high_contrast()`），
+    /// 我们必须同样处理，否则高对比度用户会看到主体与标题栏不一致。
+    fn high_contrast() -> bool {
+        // HIGHCONTRASTW 在这个版本实现了 Default，用它而不是手写零值字段。
+        let mut hc = HIGHCONTRASTW {
+            cbSize: std::mem::size_of::<HIGHCONTRASTW>() as u32,
+            ..Default::default()
+        };
+        // SPI_GETHIGHCONTRAST = 66；失败时按"非高对比度"处理（winit 也是同向的保守处理）
+        let ok = unsafe {
+            SystemParametersInfoW(SPI_GETHIGHCONTRAST, hc.cbSize, (&raw mut hc).cast(), 0)
+        };
+        ok != 0 && hc.dwFlags & HCF_HIGHCONTRASTON != 0
+    }
+
+    if high_contrast() {
+        return false;
+    }
+    uxtheme_dark().unwrap_or_else(registry_dark)
+}
+
+/// `uxtheme.dll` 序号 132 导出。取不到（老系统）返回 `None`。
+#[cfg(windows)]
+fn uxtheme_dark() -> Option<bool> {
+    use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
+
+    // ⚠ 按序号取，不是按名字：该导出无名。`132 as *const u8` 是 winit 同款用法
+    // （winit-0.30.13/src/platform_impl/windows/dark_mode.rs:141）。
+    const ORDINAL: usize = 132;
+    type ShouldAppsUseDarkMode = unsafe extern "system" fn() -> windows_sys::core::BOOL;
+
+    unsafe {
+        let module = LoadLibraryA(c"uxtheme.dll".as_ptr().cast());
+        if module.is_null() {
+            return None;
+        }
+        let proc = GetProcAddress(module, ORDINAL as *const u8)?;
+        // ⚠ 故意不 FreeLibrary：该模块是进程级单例，且进程存活期内我们会反复调用。
+        // 释放它会在下次调用时重新加载 —— 那是纯粹的浪费，不是严谨。
+        let f: ShouldAppsUseDarkMode = std::mem::transmute(proc);
+        Some(f() != 0)
+    }
+}
+
+/// 回落：直接读注册表。序号 132 取不到时才走这里。
+#[cfg(windows)]
+fn registry_dark() -> bool {
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY_CURRENT_USER, HKEY, KEY_READ,
+        REG_DWORD,
+    };
+
+    let sub: Vec<u16> = std::ffi::OsStr::new(PERSONALIZE_KEY)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let name: Vec<u16> = std::ffi::OsStr::new("AppsUseLightTheme")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    unsafe {
+        let mut hkey: HKEY = std::ptr::null_mut();
+        if RegOpenKeyExW(HKEY_CURRENT_USER, sub.as_ptr(), 0, KEY_READ, &mut hkey) != 0 {
+            return false; // 读不到就当浅色：暗色是本应用的"特殊外观"，不该是猜错的默认
+        }
+        let mut val: u32 = 1;
+        let mut size = std::mem::size_of::<u32>() as u32;
+        let mut ty = 0u32;
+        let r = RegQueryValueExW(
+            hkey,
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut ty,
+            (&raw mut val).cast(),
+            &mut size,
+        );
+        RegCloseKey(hkey);
+        // AppsUseLightTheme == 0 表示深色
+        r == 0 && ty == REG_DWORD && val == 0
+    }
+}
+
+/// 非 Windows：不作探测，一律浅色（GC-1 声明只在 Windows 上验证）。
+#[cfg(not(windows))]
+pub fn system_dark() -> bool {
+    false
+}
+```
+
+在 `src/theme.rs` 顶部加 `#[cfg(windows)] use std::os::windows::ffi::OsStrExt;`。
+
+⚠ 三处需要核实后可能要微调（`windows-sys` 0.61 的签名细节）：`c"uxtheme.dll"` 需要 Rust 2021+ 的 C 字符串字面量（本仓库 edition 2024，可用）；`(&raw mut x).cast()` 需要 Rust 1.82+。若 `HIGHCONTRASTW` 的字段名不符，查 `windows-sys-0.61.2/src/Windows/Win32/UI/Accessibility/mod.rs` 后按其定义写。
+
+- [ ] **Step 5: 运行测试确认通过**
+
+Run: `cargo test theme::tests::system_dark 2>&1 | tail -8`
+Expected: PASS（`ok. 1 passed`）。若段错误 → 序号或 `transmute` 写错。
+
+- [ ] **Step 6: 人工核对与系统当前设置是否一致**
+
+Run: `cargo test theme::tests::system_dark -- --nocapture 2>&1 | tail -6`
+再在 PowerShell 里读系统设置对照：
+
+```powershell
+Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' | Select-Object AppsUseLightTheme
+```
+
+Expected: `AppsUseLightTheme = 1` 时测试内部的 `system_dark()` 应为 `false`；`= 0` 时为 `true`。若不符，说明主路径（uxtheme）与注册表不一致 —— 记录到 `docs/VERIFICATION.md`，因为这正是不该发生的情况。
+
+- [ ] **Step 7: 提交**
+
+```bash
+git add Cargo.toml Cargo.lock src/theme.rs
+git commit -m "feat(theme): Windows 系统主题探测（与 winit 同源 + 注册表回落）"
+```
+
+---
+
+### Task 6: 变更监视线程、消息与状态接入
+
+**Files:**
+- Modify: `src/model.rs:279-293`（`UiMsg`）
+- Modify: `src/theme.rs`（加 `spawn_watcher`）
+- Modify: `src/main.rs`：`AppState`（约 `:60-95`）、`AppState::new`（约 `:103`）、`drain()`（`:360` 起）、`main()` 的 `AppState::new(...)` 调用处
+
+**Interfaces:**
+- Consumes: `theme::system_dark()`（Task 5）、`theme::resolve`（Task 1）
+- Produces:
+  - `model::UiMsg::SystemThemeChanged(bool)`
+  - `theme::spawn_watcher(tx: std::sync::mpsc::Sender<model::UiMsg>)`
+  - `AppState { … theme_mode: ThemeMode, system_dark: bool }`
+  - `AppState::new(preferred_port: u16, close_behavior: CloseBehavior, theme_mode: ThemeMode) -> Self`
+
+> **本任务刻意把"消息定义 + 它的处理 + 状态字段"放在一起提交。** 只加变体而不加 `drain()` 分支会让构建红着跨过后续任务，逼人用 `_ => {}` 兜底 —— 那正好把编译器替我们找漏的能力扔掉。这里一次做完，构建全程绿。
+
+- [ ] **Step 1: 加消息变体**
+
+`src/model.rs` 的 `UiMsg` 内追加（放在 `Failed` 之前）：
+
+```rust
+    /// 系统主题变了。⚠ 只带"现在是不是暗色"，不带模式 ——
+    /// 模式归 Rust 的 AppState 管，与系统态在这里是正交的两件事。
+    SystemThemeChanged(bool),
+```
+
+- [ ] **Step 2: `AppState` 加两个字段并接上 `drain()`**
+
+`AppState` 结构体加：
+
+```rust
+    theme_mode: ThemeMode,
+    /// 系统当前是否为暗色。**刻意只存在 Rust 侧** —— UI 拿不到也不需要，
+    /// 它只需要知道 `resolve()` 之后的结果（那个进了 Tokens.dark）。
+    system_dark: bool,
+```
+
+`AppState::new` 签名改为 `fn new(preferred_port: u16, close_behavior: CloseBehavior, theme_mode: ThemeMode) -> Self`，初始化列表加 `theme_mode,` 与 `system_dark: theme::system_dark(),`；`main()` 里的调用处补第三个实参（本步先传 `ThemeMode::default()`，Task 8 再改成读持久化值）。
+
+`drain()` 的 `match msg` 内加（⚠ 三次 `borrow()` 不能重叠，否则 `RefCell` 会 panic —— 先把值取出来再改）：
+
+```rust
+            // 系统主题变了。⚠ 只有「跟随系统」档会因此改变外观：强制档下
+            // resolved 不变，就不该置 dirty 触发一次无谓重绘。
+            UiMsg::SystemThemeChanged(dark) => {
+                let (mode, was) = {
+                    let s = state.borrow();
+                    (s.theme_mode, theme::resolve(s.theme_mode, s.system_dark))
+                };
+                let now = theme::resolve(mode, dark);
+                {
+                    let mut s = state.borrow_mut();
+                    s.system_dark = dark;
+                    if was != now {
+                        s.dirty = true;
+                    }
+                }
+                changed |= was != now;
+            }
+```
+
+- [ ] **Step 3: 编译确认变体已被穷尽处理**
+
+Run: `cargo build 2>&1 | tail -6`
+Expected: `Finished`，**0 警告**。若仍有 `non-exhaustive patterns`，说明 `drain()` 之外还有别的 `match` 在匹配 `UiMsg` —— 按编译器的指引逐个补上，不要写 `_ => {}`。
+
+- [ ] **Step 4: 写监视线程**
+
+`src/theme.rs` 追加。**无竞态顺序是硬要求**，理由见规格 §4.4：
+
+```rust
+/// 启动系统主题监视线程。任何变更都会经 `tx` 送回 UI 线程。
+///
+/// ⚠ 顺序**必须**是"先武装通知、再读值"：反过来（读 → 武装）会留下一个
+/// 微秒级窗口，落在窗口里的变更**永远**不会被发现 —— 因为此后不再有变更
+/// 来唤醒它。后果不是慢一拍，而是永久不一致：winit 的标题栏早已变色，
+/// 应用主体却停在旧主题，直到用户下次再切主题才自愈。
+#[cfg(windows)]
+pub fn spawn_watcher(tx: std::sync::mpsc::Sender<crate::model::UiMsg>) {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegNotifyChangeKeyValue, RegOpenKeyExW, HKEY_CURRENT_USER, HKEY, KEY_NOTIFY,
+        KEY_READ, REG_NOTIFY_CHANGE_LAST_SET,
+    };
+    use windows_sys::Win32::System::Threading::{
+        CreateEventW, ResetEvent, WaitForSingleObject, INFINITE,
+    };
+
+    let sub: Vec<u16> = std::ffi::OsStr::new(PERSONALIZE_KEY)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    std::thread::spawn(move || {
+        // 事件对象建一次、每轮复用；键句柄每轮开关（生命周期短且成对，避免长期持有）
+        let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if event.is_null() {
+            return;
+        }
+        loop {
+            unsafe {
+                let mut hkey: HKEY = std::ptr::null_mut();
+                if RegOpenKeyExW(HKEY_CURRENT_USER, sub.as_ptr(), 0, KEY_READ | KEY_NOTIFY, &mut hkey)
+                    != 0
+                {
+                    // 键打不开（极罕见）：退避后重试，不要退化成忙等
+                    CloseHandle(event);
+                    std::thread::sleep(std::time::Duration::from_secs(30));
+                    return;
+                }
+                // ① 先武装（异步：立即返回，变更时置位 event）
+                let armed = RegNotifyChangeKeyValue(
+                    hkey,
+                    1, // bWatchSubtree
+                    REG_NOTIFY_CHANGE_LAST_SET,
+                    event,
+                    1, // fAsynchronous = TRUE
+                );
+                // ② 再读值 —— 此刻之后发生的任何变更都会置位 event，不会丢
+                let dark = system_dark();
+                RegCloseKey(hkey);
+                if armed != 0 {
+                    // 武装失败：无法可靠监视，退化为定时重读（仍然不丢，只是有延迟）
+                    if tx.send(crate::model::UiMsg::SystemThemeChanged(system_dark())).is_err() {
+                        CloseHandle(event);
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    continue;
+                }
+                if tx.send(crate::model::UiMsg::SystemThemeChanged(dark)).is_err() {
+                    // UI 线程已退出
+                    CloseHandle(event);
+                    return;
+                }
+                // ③ 等下一次变更
+                let w = WaitForSingleObject(event, INFINITE);
+                ResetEvent(event);
+                if w != WAIT_OBJECT_0 {
+                    CloseHandle(event);
+                    return;
+                }
+            }
+        }
+    });
+}
+
+/// 非 Windows：没有系统主题可跟随，空实现。
+#[cfg(not(windows))]
+pub fn spawn_watcher(_tx: std::sync::mpsc::Sender<crate::model::UiMsg>) {}
+```
+
+⚠ 若 `KEY_READ | KEY_NOTIFY` 的类型不匹配，按 `windows-sys-0.61.2` 里 `REG_SAM_FLAGS` 的定义转换。`WAIT_OBJECT_0` 与 `u32::MAX`（INFINITE）类型以该版本定义为准。
+
+- [ ] **Step 5: 加一句单测钉住"空实现也不炸"**
+
+```rust
+    #[test]
+    fn watcher_sender_survives_a_dropped_receiver() {
+        // 线程必须能容忍接收端先消失（UI 线程退出）而不 panic ——
+        // 它是在 `send` 失败时 return，不是 unwrap。
+        let (tx, rx) = std::sync::mpsc::channel::<crate::model::UiMsg>();
+        drop(rx);
+        spawn_watcher(tx);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+```
+
+- [ ] **Step 6: 编译、测试、提交**
+
+Run: `cargo build 2>&1 | tail -5` → Expected: `Finished`，0 警告。
+Run: `cargo test 2>&1 | tail -6` → Expected: 全绿。
+
+```bash
+git add src/model.rs src/theme.rs src/main.rs
+git commit -m "feat(theme): 系统主题变更消息、无竞态监视线程与状态接入"
+```
+
+---
+
+### Task 7: 设置面板「主题」组与 UI 契约
+
+**Files:**
+- Modify: `ui/app.slint:1150`（属性区）、`:1163`（callback 区）、`:1927` 之后（设置面板「关闭行为」组之后）
+
+**Interfaces:**
+- Consumes: Task 4 的 `Tokens.*`（含新的条件表达式）、既有 `ChipButton` / `Eyebrow` / `Divider` 组件
+- Produces: `MainWindow` 的 `in-out property <int> theme-mode` 与 `callback theme-mode-changed(int)`（Rust 侧名字分别为 `set_theme_mode` / `get_theme_mode` / `on_theme_mode_changed`）
+
+- [ ] **Step 1: 加属性与 callback**
+
+`ui/app.slint:1150` 附近（`close-behavior-index` 之后）加：
+
+```slint
+    /// 主题模式：0 = 浅色 / 1 = 深色 / 2 = 跟随系统。
+    /// ⚠ 与 src/theme.rs 的 `ThemeMode` 下标一一对应，改顺序要两边一起改。
+    /// 默认 2：与 `state.json` 里没记过时的缺省（跟随系统）一致。
+    in-out property <int> theme-mode: 2;
+```
+
+`ui/app.slint:1163` 附近（`callback settings-changed(int);` 之后）加：
+
+```slint
+    callback theme-mode-changed(int);
+```
+
+- [ ] **Step 2: 加设置面板分组**
+
+在「关闭行为」那组的说明文字 `Text { … }`（约 `:1928-1934`）之后、`Bezel` 结束之前插入：
+
+```slint
+                Rectangle { height: 16px; }
+                Divider { }
+                Rectangle { height: 16px; }
+
+                Eyebrow { text: "主题" }
+                Rectangle { height: 10px; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    ChipButton {
+                        label: "浅色";
+                        accent: root.theme-mode == 0;
+                        clicked => { root.theme-mode-changed(0); }
+                    }
+                    ChipButton {
+                        label: "深色";
+                        accent: root.theme-mode == 1;
+                        clicked => { root.theme-mode-changed(1); }
+                    }
+                    ChipButton {
+                        label: "跟随系统";
+                        accent: root.theme-mode == 2;
+                        clicked => { root.theme-mode-changed(2); }
+                    }
+                }
+                Rectangle { height: 12px; }
+                Text {
+                    // ⚠ 这里必须诚实交代标题栏的限制，否则用户会当成 bug 报：
+                    // 强制档只改窗口内部，系统标题栏跟着的是**系统**设置。
+                    text: "跟随系统时窗口与标题栏会一起变。选「浅色」「深色」只改窗口内部 —— 系统标题栏由 Windows 画，它跟的是系统设置，本程序无法覆盖。";
+                    color: Tokens.ink-4;
+                    font-family: Font.text;
+                    font-size: 11.5px;
+                    wrap: word-wrap;
+                }
+```
+
+- [ ] **Step 3: 编译确认两份契约未破**
+
+Run: `cargo build 2>&1 | tail -8`
+Expected: 仍是 Step 2 里那条 `non-exhaustive patterns`（Task 8 待办），**不得**出现 Slint 语法错误或 `Cannot access id`。
+
+- [ ] **Step 4: 确认设置面板高度够用**
+
+面板宽度 400px，三枚中文 ChipButton（浅色 / 深色 / 跟随系统）加间距约 200px，装得下；但「关闭行为」组的三枚（隐藏至托盘 / 彻底退出 / 每次询问）已较宽，两组合计不会同排。**必须**跑一次 Task 9 的截图矩阵确认第二组没有被裁掉 —— Slint 的 `VerticalLayout` 会把 `Bezel` 撑高，理论上不会被裁，但这是像素级结论，必须眼看。
+
+---
+
+### Task 8: Rust 接线
+
+**Files:**
+- Modify: `src/main.rs`：`use` 区（`mod` 后）、`AppState`（约 `:60-95` 的 struct 与 `:103` 的 `new`）、`project()`（`:249`，`:349` 附近）、`drain()`（`:360` 起，处理新变体）、`wire_callbacks()`（`:1196` 之后）、`main()`（`:1378` 的 `config::load()` 与 `:1392` 的窗口构造）
+
+**Interfaces:**
+- Consumes: `theme::{ThemeMode, resolve, spawn_watcher}`、`config::StateFile::theme_mode`、Task 6 已建好的 `AppState.theme_mode` / `AppState.system_dark`、Slint 侧 `Tokens` / `theme-mode` / `theme-mode-changed`
+- Produces: 可运行的双主题应用
+
+`AppState` 的字段与 `drain()` 的分支已在 Task 6 就位，本任务只做**投影、回调、启动顺序**三件事。
+
+- [ ] **Step 1: `project()` 推主题**
+
+在 `project()` 里「关闭行为」那两行之后加（**必须每帧都推** —— 与既有注释同理由：设置面板改的是 `AppState`，而唯一点投影点是本函数）：
+
+```rust
+    // ── 主题（Rust 是唯一真相源）──
+    // mode 推给界面画选中态；resolved 推给 Tokens 驱动全部颜色。
+    // ⚠ `Tokens` 是 `export global`，故 Rust 能拿到 setter：生成代码里
+    // `impl slint::Global<'a, MainWindow> for Tokens<'a>` + `pub fn set_dark`。
+    win.set_theme_mode(state.theme_mode.index());
+    win.global::<Tokens>().set_dark(theme::resolve(state.theme_mode, state.system_dark));
+```
+
+`Tokens` 由 `slint::include_modules!()`（`src/main.rs:23`）带到 crate 根，无需额外 `use`；`global()` 需要 `ComponentHandle`，已在 `:18` 导入。
+
+- [ ] **Step 2: 接线 callback**
+
+在 `wire_callbacks()` 里「关闭行为」那块之后加（**逐字照抄该块的形状**：改 `AppState`、置 dirty、立即落盘、写失败只记日志）：
+
+```rust
+    // ── 主题模式 ──
+    //
+    // 与「关闭行为」同款：只有一条投影路径（落 AppState → `project()` 推回），
+    // 点击不发任何 Job，所以必须置 dirty —— 稳态下没有消息可排空。
+    {
+        let state = state.clone();
+        win.on_theme_mode_changed(move |idx| {
+            let Some(mode) = ThemeMode::from_index(idx) else { return };
+            {
+                let mut s = state.borrow_mut();
+                s.theme_mode = mode;
+                s.dirty = true;
+            }
+            // 偏好立即落盘，设置面板里没有"保存"按钮。
+            // 写失败只记日志、不回滚 —— 回滚界面上的选择会让"点了没反应"，
+            // 而这次选择在本次运行里已经生效。
+            if let Err(e) = config::update(|f| f.theme_mode = Some(mode)) {
+                push_log(&state.borrow(), format!("主题设置保存失败（本次运行仍生效）：{e}"));
+            }
+        });
+    }
+```
+
+- [ ] **Step 3: `main()` 读持久化值、设初始值、起监视**
+
+`config::load()` 那个 `match` 的四个分支都要带上 `theme_mode`。改法：把元组扩成四元，`Ok` 分支读 `s.theme_mode.unwrap_or_default()`（= `Auto` = 跟随系统），其余三个分支用 `ThemeMode::default()`：
+
+```rust
+    let (preferred_port, close_behavior, theme_mode, startup_note) = match config::load() {
+        config::Loaded::Ok(s) => (
+            s.preferred_port.unwrap_or(3080),
+            s.close_behavior.unwrap_or_default(),
+            s.theme_mode.unwrap_or_default(),
+            None,
+        ),
+        config::Loaded::Missing => (3080, CloseBehavior::default(), ThemeMode::default(), None),
+        config::Loaded::Corrupt(e) => (
+            3080,
+            CloseBehavior::default(),
+            ThemeMode::default(),
+            Some(format!("state.json 损坏，使用缺省端口 3080：{e}")),
+        ),
+        config::Loaded::NoLocation => (3080, CloseBehavior::default(), ThemeMode::default(), None),
+    };
+```
+
+`AppState::new` 调用处补第三个实参：`AppState::new(preferred_port, close_behavior, theme_mode)`。
+
+**在 `Timer` 启动之前**加监视（顺序理由：先起监视，保证启动瞬间到事件循环就绪之间的系统主题变化不丢）：
+
+```rust
+    // 系统主题监视。⚠ 必须在 `run()` 之前起 —— 否则启动瞬间到事件循环就绪
+    // 之间的变更会丢。消息走既有 UiMsg 通道，由 80ms timer 排空。
+    theme::spawn_watcher(msg_tx_for_theme.clone());
+```
+
+`msg_tx_for_theme` 用既有的 worker→UI 发送端克隆（`drain` 用的那一个）。**执行时先读 `main()` 里该 sender 的实际变量名**，不要照抄这里的占位名。
+
+**首帧之前把初始主题推下去**（否则首帧会用 `Tokens.dark` 的声明缺省 `true`，在浅色系统上闪一下）：
+
+```rust
+    // 首帧之前的初始主题。⚠ `Palette.color-scheme` 由 .slint 的 `changed` 处理器
+    // 跟着 `Tokens.dark` 走（见 ui/app.slint 的 MainWindow），这里只写 Tokens。
+    win.global::<Tokens>().set_dark(theme::resolve(theme_mode, theme::system_dark()));
+```
+
+- [ ] **Step 4: 在 `ui/app.slint` 里同步 Fluent 的配色方案**
+
+`src/main.rs` 无法直接触达 Fluent 的 `Palette`（std-widgets 的全局不在生成代码的公开访问器里 —— 已实测确认）。**已验证可行**的写法是 `changed` 处理器里的赋值（绑定形态 `Palette.color-scheme: …;` 是语法错误，成因见规格 §2 F6）。
+
+把 `ui/app.slint:1086` 的 `init => { Palette.color-scheme = ColorScheme.dark; }` 替换为：
+
+```slint
+    // ⚠ Fluent 控件（ScrollView 滚动条 / AboutSlint）的配色派生自 Palette.color-scheme，
+    // 而 FluentPalette 是 std-widgets 的全局，Rust 侧拿不到访问器 ——
+    // 所以必须在本文件里跟着 `Tokens.dark` 走。
+    //
+    // ⚠ 只能写成"局部属性 + changed 处理器里的赋值"：
+    // 组件体里直接写 `Palette.color-scheme: …;` 是 Parse error（限定名走不进
+    // parser 的绑定分支，见 parser/element.rs 的 parse_element_content），
+    // 而 `changed` 里的赋值走的是语句路径，可用。
+    // `init` 那行负责首帧，`changed` 负责运行期切换，两者缺一不可。
+    property <bool> is-dark: Tokens.dark;
+    changed is-dark => {
+        Palette.color-scheme = is-dark ? ColorScheme.dark : ColorScheme.light;
+    }
+    init => { Palette.color-scheme = is-dark ? ColorScheme.dark : ColorScheme.light; }
+```
+
+`ColorScheme.dark` / `.light` 是既有代码已在用的名字（原 `:1086`）。**不要**写 `ColorScheme.unknown` —— 那会让 Fluent 跟随系统，与我们自己的强制档打架。
+
+- [ ] **Step 5: 编译、测试、跑起来**
+
+Run: `cargo build 2>&1 | tail -8`
+Expected: `Finished`，0 警告（Step 2 的 `non-exhaustive patterns` 到此消失）。
+
+Run: `cargo test 2>&1 | tail -6`
+Expected: 全绿（原 95 项 + 本轮新增约 12 项）。
+
+- [ ] **Step 6: 提交**
+
+```bash
+git add src/main.rs src/model.rs src/theme.rs ui/app.slint Cargo.toml Cargo.lock
+git commit -m "feat(theme): 明暗双主题接线（探测/监视/持久化/设置面板）"
+```
+
+---
+
+### Task 9: 文档留档与验证记录
+
+**Files:**
+- Modify: `docs/ARCHITECTURE.md`（加主题子系统一节）
+- Modify: `docs/RULINGS.md`（记录平台事实与设计后果）
+- Modify: `docs/VERIFICATION.md`（记本轮实测）
+
+- [ ] **Step 1: 跑完整验证矩阵**
+
+**截图矩阵**（复用 `target/shot.ps1` 的做法：启动 → `PrintWindow` → 杀进程）。⚠ **不得点击任何控件**，且运行前后都要核对 `state.json` 与 `3080` 的 pid 未变：
+
+```powershell
+# 依次把 state.json 的 theme_mode 置为 null / "light" / "dark" / "auto"，
+# 各启动一次并截图到 target/theme-<档位>.png
+```
+
+对每张图**回读像素**（复用 `target/readback.py` 的思路）确认：浅色档的 canvas 接近 `#EDEFF7`、`accent` 渲染色接近 `#59659B`；深色档 canvas 接近 `#08080F`、accent 接近 `#9AA6E8`。
+
+**实时跟随实测**：应用以「跟随系统」运行，改系统主题（设置 → 个性化 → 颜色 → 选择模式），确认窗口主体**与标题栏同时**变化，并记录延迟。
+
+**持久化实测**：设置里选「深色」→ 退出 → 重启 → 仍是深色且三个 ChipButton 的选中态正确。
+
+**旧文件兼容实测**：把 `state.json` 换回三字段版本启动，确认不崩、以跟随系统启动。
+
+Expected: 全部符合。任何不符都记进 `docs/VERIFICATION.md` 的备注，**不得**只写"通过"。
+
+- [ ] **Step 2: `docs/ARCHITECTURE.md` 加一节**
+
+新增主题子系统小节，至少覆盖：`src/theme.rs` 的职责边界、Rust 为唯一真相源、`Tokens.dark` 与 `Palette.color-scheme` 两条投影路径及为何是两条、`UiMsg::SystemThemeChanged` 与 80ms 排空的关系。**注明 `system_dark` 刻意不进 .slint**，以免下一个人"顺手"把它加到 UI 属性里从而出现两个真相源。
+
+- [ ] **Step 3: `docs/RULINGS.md` 记三条平台事实**
+
+按本仓库惯例（平台事实要留档，避免下一个人重新踩），逐条记录并写明设计后果：
+
+1. **应用读不到系统主题** —— `SlintInternal.color-scheme` 的不可访问是编译器语法测试断言的行为（`tests/syntax/lookup/global.slint:38`），`SlintContext::color_scheme()` 只在 `private_unstable_api`。后果：「跟随系统」必须自己探测。
+2. **winit 的探测只作用于系统标题栏**，且用的是 `uxtheme.dll` 序号 132 而非注册表（`winit-0.30.13/src/platform_impl/windows/dark_mode.rs:130`），Slint 也无公开 API 覆盖窗口主题。后果：① 我们的探测必须与 winit 同源，否则主体与标题栏不一致；② **强制明/暗改不动系统标题栏**是平台限制，必须在设置面板里向用户交代。
+3. **`Palette.color-scheme` 只能经 `changed` 处理器里的赋值切换**，绑定形态是 Parse error（成因：`parse_element_content` 只在 `Identifier Colon` 时走绑定分支，限定名进不去）。后果：Fluent 配色同步必须写成"局部属性镜像 + `changed`"。
+
+- [ ] **Step 4: 提交**
+
+```bash
+git add docs/
+git commit -m "docs: 主题子系统的架构、三条平台事实裁定与验证记录"
+```
+
+---
+
+## Self-Review
+
+**1. 规格覆盖**（逐节核对 `docs/superpowers/specs/2026-09-22-theme-system-design.md`）：
+
+| 规格节 | 覆盖它的任务 |
+|---|---|
+| §3 数据流与职责 | Task 8（接线）、Task 6（消息）、Task 1（解析） |
+| §4.1 令牌形状（`export global` + `dark`） | Task 4 |
+| §4.2 暗色侧不改 | Task 4 Step 1（对表时逐行保留暗色现值） |
+| §4.3 浅色完整表 | Task 4 Step 2（权威值表）+ Task 3（门槛测试） |
+| §4.4 无竞态监视 | Task 6 Step 4（先武装后读，注释写明理由） |
+| §5 四个新令牌 + 吸收 5 处字面量 | Task 4 Step 2/3 |
+| §6 设置界面 | Task 7 |
+| §7 持久化与旧文件兼容 | Task 2 |
+| §8 已知限制（标题栏/高对比度/首帧顺序） | Task 5（高对比度）、Task 8 Step 3（首帧顺序）、Task 7 Step 2（向用户交代标题栏） |
+| §9 验证计划 | Task 9 + Task 3 的回归测试 |
+| §10 探针结论 | Task 4 Step 2（`export global`）、Task 8 Step 1（Rust setter）、Task 8 Step 4（`changed`） |
+| §11 实施顺序 | 本计划的任务顺序即为该节展开 |
+| §12 风险 | Task 4 Step 6（证明测试非恒真）、Task 9 Step 1（观感迭代的记录出口） |
+
+**2. 占位符扫描**：计划内无 TBD / TODO / "类似 Task N"。唯一预设的占位名是 Task 8 Step 3 的 `msg_tx_for_theme`，已在该步内**显式要求执行者去读实际变量名**而非照抄 —— 因为该名字取决于 `main()` 里既有的 sender 变量，计划写死会制造一个编译错误。
+
+**3. 类型与名字一致性**：`ThemeMode::{index, from_index, as_str, parse, default}`、`resolve(mode, system_dark) -> bool`、`system_dark() -> bool`、`spawn_watcher(Sender<UiMsg>)`、`UiMsg::SystemThemeChanged(bool)`、`Tokens::set_dark(bool)`、`Tokens::get_dark()`、`win.set_theme_mode(i32)`、`win.on_theme_mode_changed(i32)`、`StateFile::theme_mode: Option<ThemeMode>`、新增令牌 `well`/`well-hover`/`cta-hover-top`/`cta-hover-bottom`/`top-light`/`shadow` —— 各任务引用处已逐个核对一致。`CloseBehavior` 的既有 API 未改动任何签名。
+
+**4. 任务边界与提交粒度**：每个任务结束时构建与测试都是绿的，9 个任务对应 9 个提交点。Task 6 刻意把"消息变体 + 它的 `drain()` 分支 + `AppState` 字段"放在**同一个**任务里 —— 若拆开，加完变体而没加分支会让构建红着跨过两个任务，执行者只能用 `_ => {}` 兜底，正好把"让编译器列出所有需要处理的位置"这个好处扔掉。
+
+**5. 计划里的平台代码已对着依赖源码核过**（这几处是初稿写错后被查出来的，执行时不必再怀疑）：
+
+| 事实 | 出处 |
+|---|---|
+| `HIGHCONTRASTW` 实现了 `Default`，字段为 `cbSize` / `dwFlags` / `lpszDefaultScheme` | `windows-sys-0.61.2/src/Windows/Win32/UI/Accessibility/mod.rs:464-472` |
+| 高对比度标志用 `HCF_HIGHCONTRASTON`（= 1），不要写魔法数 | 同上 `:444` |
+| **`CreateEventW` 被 `#[cfg(feature = "Win32_Security")]` 门住** → 该 feature 是必需项，不是可选 | `.../Win32/System/Threading/mod.rs` |
+| `WAIT_OBJECT_0` 在 `Win32::Foundation`；`INFINITE` 在 `Win32::System::Threading` | `.../Win32/Foundation/mod.rs:10027`、`.../Threading/mod.rs` |
+| `HKEY = *mut c_void`（故 `null_mut()` 正确）；`KEY_READ \| KEY_NOTIFY` 同为 `REG_SAM_FLAGS` 可合并 | `.../Win32/System/Registry/mod.rs:147` |
+| `RegQueryValueExW` 的 `lptype` 是 `*mut REG_VALUE_TYPE`(u32)、`lpdata` 是 `*mut u8`、`lpcbdata` 是 `*mut u32` | 同上 |
+| `Orb` 的默认 tint 必须是 `glow-brand`（带 α），**不能**是 `accent`（不透明）—— 否则缺省光晕会变成实心色斑 | `ui/app.slint:136` 与两个调用点实传的 `glow-*` |
