@@ -144,6 +144,14 @@ mod tests {
         assert!(!resolve(ThemeMode::Auto, false));
     }
 
+    /// `Tokens` 全局里应当出现的 brush 令牌数量下限。
+    ///
+    /// ⚠ 这个下限不是凑数：`parse_palette` 对没有 `<brush>` 标记的行是 `continue`（因为块内
+    /// 合法地存在 `<length>` / `<duration>` / `<float>` 行），于是**某一行的 `<brush>` 标记
+    /// 被误删时会静默少覆盖一个令牌**。下限把"静默漏掉"变成"测试失败"。取 `>=` 而非 `==`，
+    /// 这样以后新增令牌不会误报，而丢令牌一定会被抓到。
+    const MIN_BRUSH_TOKENS: usize = 40;
+
     /// 从 `ui/app.slint` 的 Tokens 全局解析每个 brush 令牌的（暗值, 浅值）。
     ///
     /// ⚠ 只认 `out property <brush> 名字: dark ? #AAAAAA : #BBBBBB;` 这一形状，
@@ -169,14 +177,16 @@ mod tests {
                 .ok_or_else(|| format!("令牌行缺冒号: {line}"))?;
             let name = name.trim().to_string();
             if !name.is_empty() {
-                // ⚠ 条件式是 `dark ? 暗 : 浅`：`?` 之前是**条件**，暗值在 `?` 之后。
-                // 故先切 `?` 校验形状，再在其余部分切出两个分支。
-                let (_, branches) = val
+                // ⚠ 两段式切分，顺序不能反：值的形状是 `dark ? #暗 : #浅`，
+                // 所以 `?` 之前那一段是**条件本身**（` dark `），里面没有 `#`。
+                // 先按 `?` 验证形状，再在 `?` 之后那一段里按 `:` 分出明暗两值。
+                // （先按 `:` 再按 `?` 会去 ` dark ` 里找 hex，永远找不到 —— 那是本计划初稿的 bug。）
+                let (_, arms) = val
                     .split_once('?')
                     .ok_or_else(|| format!("令牌 {name} 没有明暗条件（期望 `dark ? 暗 : 浅`）: {line}"))?;
-                let (dark_side, light_side) = branches
+                let (dark_side, light_side) = arms
                     .split_once(':')
-                    .ok_or_else(|| format!("令牌 {name} 的分支缺冒号（期望 `dark ? 暗 : 浅`）: {line}"))?;
+                    .ok_or_else(|| format!("令牌 {name} 的明暗两值之间缺冒号: {line}"))?;
                 let (dark, light) = (
                     hex(dark_side).ok_or_else(|| format!("{name} 的暗色侧不是 hex: {line}"))?,
                     hex(light_side).ok_or_else(|| format!("{name} 的浅色侧不是 hex: {line}"))?,
@@ -184,8 +194,12 @@ mod tests {
                 out.push((name, dark, light));
             }
         }
-        if out.is_empty() {
-            return Err("一个令牌都没解析出来".into());
+        if out.len() < MIN_BRUSH_TOKENS {
+            return Err(format!(
+                "只解析出 {} 个 brush 令牌，少于下限 {MIN_BRUSH_TOKENS} —— \
+                 多半是某行的 `<brush>` 标记被改了，那些令牌会静默失去覆盖",
+                out.len()
+            ));
         }
         Ok(out)
     }

@@ -126,13 +126,16 @@ export global Tokens {
 
     // ── 动效与状态（两套主题共用，不参与主题）──────────────────────────────
     // 三档时长：读数变色 400ms / 配色切换 200ms / 按压回弹 150ms。
+    // 收敛前是 160/200/260/300/400 五档，差别全在"当时顺手写了多少"。
     out property <duration> motion-slow:  400ms;
     out property <duration> motion-hover: 200ms;
     out property <duration> motion-tap:   150ms;
     /// 状态栏高度。⚠ 两处必须一致：主布局靠 `padding-bottom: Tokens.status-h`
-    /// 给贴底的状态栏让位，状态栏自己用它定高。
+    /// 给贴底的状态栏让位，状态栏自己用它定高 —— 不一致就会出现"内容压在栏上"
+    /// 或者"栏上方一条谁也解释不清的空白"。
     out property <length> status-h: 34px;
-    /// 不可用元素整体压暗的统一档位。用 opacity 表达，两套主题同样成立。
+    /// 不可用元素整体压暗的统一档位（收敛前 0.30 / 0.34 两个值）。
+    /// 用 opacity 表达，故两套主题同样成立，不需要按主题分叉。
     out property <float> disabled: 0.35;
 }
 
