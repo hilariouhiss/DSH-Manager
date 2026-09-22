@@ -444,8 +444,9 @@ brief 在截图路里要求"浅色档 `accent` 渲染色接近 `#59659B`、深�
   两个 SVG 的主色**互补**（已读源码核实）：dark 版是 **white 底 + `#151D21` 字形**，
   light 版是 **`#151D21` 底 + white 字形**。故只需数这两个颜色。
 - **信号 B —— 版本文字的默认前景色。** 那句 `Text { text: "Version 1.18.0…" }` **没有写 `color`**，
-  默认色来自 `StyleMetrics.default-text-color` = `FluentPalette.foreground`
-  （暗 `#FFFFFF` / 浅 `#000000E6`，`widgets/fluent/styling.slint:16-37`）。
+  默认色来自 `StyleMetrics.default-text-color`，而它绑定到 `FluentPalette.foreground`
+  （`i-slint-compiler-1.18.0/widgets/fluent/style-base.slint:14`：`default-text-color: FluentPalette.foreground;`）。
+  两个档位的取值在 `widgets/fluent/styling.slint:37`：暗 `#FFFFFF` / 浅 `#000000E6`。
 
 **测得的数字（`dark=true` vs `dark=false`，同一帧、同一批坐标）**
 
@@ -477,10 +478,21 @@ y=470  dark=false: #F4F5F8 #F9FAFC #151D21 #151D21 #151D21 #FFFFFF #151D21 #151D
 **结论：`changed is-dark` 确实在之后的 `set_dark` 上触发了。两档的 Fluent 像素完全不同，
 浅色档拿到了浅色的 Fluent 配色。Ruling 26 的疑点被实测排除 —— 这不是缺口。**
 
-`#E7E7E7` 这个数字还能对上账：`FluentPalette.foreground` 在暗档是 `#FFFFFF`，
-做 `#FFFFFFE6`（α=0.902）合成到带内底色 `#0D0D16`（13）上得
-`255×0.902 + 13×0.098 ≈ 231 = 0xE7` —— 与观测到的 **`#E7E7E7` 逐位一致**，
-即浅色档那 20 个像素确实来自 `FluentPalette.foreground = #000000E6`，而非别的什么东西。
+⚠ **这两个数字证明的是"颜色翻转了"，不是"某个声明的 α 被逐位复现"。** Fluent 的 `foreground`
+声明在 `widgets/fluent/styling.slint:37`：`dark-color-scheme ? #FFFFFF : #000000E6` ——
+**暗档是不透明的 `#FFFFFF`（没有 α）；带 α 的 `E6`（≈0.902）属于浅档那个值。**
+若暗档字形被完整覆盖，像素应当是 255；实测最亮 20 像素均色只有 `#E7E7E7`，整个字形带
+（578 个字形像素）的均色更低，是 `#7A7A7F` —— **说明这一带没有"被完整覆盖"的像素**，
+观测值是抗锯齿的部分覆盖，而不是某个声明 α 的直接读数。
+
+（这里原先写过一段"`#FFFFFFE6` 合成到 `#0D0D16` 得 `231 = 0xE7`，逐位一致"的**对账，那是错的**：
+`E6` 不属于暗档的 `foreground`，`231 ≈ 255×0.902 + 13×0.098` 只是巧合；那段算术还被错用到了
+浅色档那 20 个像素上，而那是另一行、另一个值。已删除。若要做对账，对象是**浅档**：
+`#000000E6` 合成到浅底 `#F7F8FB`（248）得 ≈ `#18181A`，而实测最暗 20 像素均色是 `#2D2D2E` ——
+同样说明这些是抗锯齿的部分覆盖，不是逐位合成值。）
+
+**结论不受影响**（上面那条才是被测到的东西）：暗档字形近白（`#E7E7E7`）、浅档字形近黑
+（`#2D2D2E`），即两档确实拿到了**不同**的 Fluent 前景色 —— 这就是 `changed is-dark` 触发了的证据。
 
 **这一条恰好是"必须先测后信"的那条**：`init` 一行确实只兜构造那一刻（Ruling 26 的说法成立），
 但 `changed` 接住了它。因此 `ui/app.slint:1114` 的原注释（"`init` 那行负责首帧，
@@ -517,6 +529,62 @@ y=470  dark=false: #F4F5F8 #F9FAFC #151D21 #151D21 #151D21 #FFFFFF #151D21 #151D
 那需要看到界面或读到选中态，锁屏下两者都拿不到。启动时的档位取自
 `config::load()` → `theme_mode: None` → `ThemeMode::Auto`（单测 M-10 覆盖），
 再经 `resolve(Auto, system_dark())` —— 这条链是**代码审查 + 单测**，不是本轮观测。
+
+### 2.4 证据复现配方：离屏探针（⚠ 探针**不在仓库里**，这里写明如何重建）
+
+本轮所有像素证据（M-3 ~ M-7、§2.2）都来自 `target/theme-probe/`，而 `target/` 是 gitignored 的
+—— 也就是说**证据的生成器没有入库**。这是刻意的：它是一次性脚手架，不是产品代码（它只用
+`slint` / `slint-build` 两个已在 GC-2 白名单里的 crate，不引入新依赖，但也没有长期维护价值）。
+代价是"数字从哪来"无法从 git 里查。**下面就是配方**，供将来复核或扩测时原地重建，不必猜。
+
+**它是什么**
+
+- 一个独立 cargo 包：`target/theme-probe/`，`Cargo.toml` 里放一个空的 `[workspace]` 表
+  （`# Standalone: keep it out of the dsh-manager workspace`），所以它**不并入**主 workspace；
+- `build.rs` 只有一行：`slint_build::compile("../../ui/app.slint")` —— **编译的是真实的
+  `ui/app.slint`**（不是副本），因此探针看到的 Fluent 样式/全局与产品逐字一致；
+- 依赖与主程序同规格：`slint = { version = "1.18", features = ["image-default-formats"] }`
+  （`slint-build` 同）—— 与主程序共用已编译产物，不额外引入 crate 版本。
+
+**它怎么驱动（顺序是结论的一部分，必须与 `src/main.rs` 一致）**
+
+1. 自写 `Platform` 实现，只交出一个 `MinimalSoftwareWindow`（`RepaintBufferType::NewBuffer`）
+   并 `set_platform(...)` —— 纯软件渲染、离屏，**不需要真窗口、也不需要解锁的桌面**
+   （这正是锁屏下唯一可行的路，见上面的环境约束）；
+2. **先 `MainWindow::new()`，再 `global::<Tokens>().set_dark(dark)`** —— 与 `src/main.rs` 逐字
+   一致。这个顺序正是 Ruling 26 的被测对象：`ui/app.slint` 的 `init` 在 `new()` 内跑，早于
+   第一次 `set_dark()`。**顺序反了就测不到东西**；
+3. `set_size(880×780)`；`render()` = `request_redraw()` + `draw_if_needed` **连渲两帧**
+   （软件渲染器的脏区缓存需要一帧全量），回读 `Vec<Rgb8Pixel>`；
+4. 全程**不截图、不依赖桌面**：读的是渲染缓冲区的像素。
+
+**它采样什么**
+
+| 采样 | 坐标 / 方式 | 对应 |
+|---|---|---|
+| canvas 令牌 | 单点 `(6,700)`（另加 `(300,12)/(6,400)/(874,400)/(440,770)`） | M-3 / M-4 |
+| 全帧众数色 | 全帧直方图取前 3 | M-5 |
+| `accent` 最近邻 | 全帧扫描：离目标色最近的像素 + 曼哈顿距离 + 距离 ≤ 6 的像素数 | M-5b（**未测成**，见 §2.1） |
+| 设置面板占位 | 面板带 `x∈[240,640)` 里"亮行"的首尾行 | M-6 |
+| `theme-mode` 0 vs 2 | 同帧全像素 diff + 差异 bbox | M-7 |
+| AboutSlint logo 药丸 | 区域 `x∈[310,570) y∈[410,540)` 内数 `#FFFFFF` 与 `#151D21` | §2.2 信号 A |
+| AboutSlint 版本文字 | 带 `x∈[330,550) y∈[540,572)`：先取带内众数色当底，再取**最暗 20 / 最亮 20 像素均色**（另报带内字形像素数与均色） | §2.2 信号 B |
+
+**怎么重建**
+
+```text
+target/theme-probe/
+  Cargo.toml    # [package] edition="2021"、空 [workspace]、slint/slint-build 1.18（同上）
+  build.rs      # slint_build::compile("../../ui/app.slint")
+  src/main.rs   # slint::include_modules!() 引入生成的 MainWindow/Tokens，按上面两节重写
+# 然后：
+cd target/theme-probe && cargo run > ../theme-probe-out.txt
+```
+
+原始输出（本轮读的那些行）留档在 `target/theme-probe-out.txt`，同样 gitignored。
+⚠ **这些数字只在探针的驱动顺序仍与 `src/main.rs` 一致时才有意义** —— 若产品侧改了
+`main()` 里 `new()` / `set_dark()` / `spawn_watcher()` 的先后，重跑探针前必须同步改探针，
+否则跑出来的差异是探针与产品之间的差异，不是两档主题之间的差异。
 
 ---
 

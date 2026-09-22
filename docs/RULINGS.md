@@ -1054,8 +1054,11 @@ registry/WinINET crate；改由 SRS 与 `docs/VERIFICATION.md` 明确记为**环
 
 # 主题系统的平台事实与设计后果（`feat/theme-system`）
 
-上面 101 条属于 `feat/implementation`。本节属于 **`feat/theme-system`**，记录的是那条分支的
-**平台事实**（不是本仓库的设计选择，是平台行为）与 **§5.2 可达性变化**。
+上面那一节属于 `feat/implementation` —— 它有 **101 条 `### Ruling N` 标题**，但只覆盖
+**94 个不同编号**（编号 60 / 61 / 67 / 68 / 69 / 75 / 80 各带一条 `（修正）` / `（已落地）` /
+`（确认）` 之类的后续标题；标题数 ≠ 编号数，别按"101 条"去索引）。本节属于
+**`feat/theme-system`**，记录的是那条分支的**平台事实**（不是本仓库的设计选择，是平台行为）
+与 **§5.2 可达性变化**。
 
 ⚠ 本节裁决引用的是**另一条分支的编号序列**：原文在 git-ignored 的
 `.superpowers/sdd/2026-09-22-theme-system/progress.md`（到 Task 9 为止共 27 条）。
@@ -1073,7 +1076,7 @@ registry/WinINET crate；改由 SRS 与 `docs/VERIFICATION.md` 明确记为**环
 |---|---|---|
 | `SlintInternal.color-scheme` | **编译错误**：`Cannot access id 'SlintInternal'` | `i-slint-compiler-1.18.0/tests/syntax/lookup/global.slint:37`。该文件是编译器的**语法测试断言** —— 即这是被保证的行为，不是巧合 |
 | `NativeStyleMetrics.color-scheme` | 同上：`Cannot access id 'NativeStyleMetrics'` | 同文件 `:35` |
-| `SlintContext::color_scheme()` | 存在，但只在 `private_unstable_api` 下 | `i-slint-core-1.18.0/context.rs:252` |
+| `SlintContext::color_scheme()` | 函数本身是**公开类型 `SlintContext` 上的公开方法**（`i-slint-core-1.18.0/context.rs:252`；`SlintContext` 由 `i-slint-core` 公开导出，见其 `lib.rs:102`）。**挡住应用的是 `slint` facade**：它只在 `private_unstable_api` 模块里把 `SlintContext` 再导出（`slint-1.18.0/private_unstable_api.rs:173`），故经 `slint` 用它就得写 `slint::private_unstable_api::…` | `i-slint-core-1.18.0/context.rs:252`、`slint-1.18.0/private_unstable_api.rs:173` |
 
 **设计后果。**
 
@@ -1081,7 +1084,10 @@ registry/WinINET crate；改由 SRS 与 `docs/VERIFICATION.md` 明确记为**环
    这不是"没找现成 API"，而是**没有现成 API**。
 2. 反过来，**`Palette.color-scheme` 是可以写的**（见事实 3）：它是 `std-widgets` 的普通全局属性，
    而 `SlintInternal` 不是。两件事容易混为一谈，别混。
-3. ⚠ 谁若哪天认为 `private_unstable_api` "能用"，先读仓库的 GC 约束：本仓库不接受依赖未稳定 API。
+3. ⚠ 谁若哪天认为 `private_unstable_api` "能用"，先读 `docs/IMPLEMENTATION-PLAN.md:103` 的 **GC-2**：
+   依赖**只允许 5 个 crate**（`slint` / `slint-build` / `ureq` / `serde_json` / `semver`）、**不得新增**。
+   直连 `i-slint-core` 拿那个公开方法就属于新增依赖 —— 被 GC-2 挡住；走 `slint::private_unstable_api`
+   不新增 crate，但模块名本身就是声明（无兼容承诺、随版本变），两条路都不通，所以「自己探测」。
 
 ---
 
@@ -1090,9 +1096,9 @@ registry/WinINET crate；改由 SRS 与 `docs/VERIFICATION.md` 明确记为**环
 | 项 | 值 | 出处 |
 |---|---|---|
 | winit 的判据 | `should_apps_use_dark_mode() && !is_high_contrast()` | `winit-0.30.13/src/platform_impl/windows/dark_mode.rs:126-127` |
-| 系统态取值 | `LoadLibraryA("uxtheme.dll")` + `GetProcAddress(132 as PCSTR)` —— **按序号，不读注册表** | 同文件 `:130-135`（序号常量在 `:134`） |
+| 系统态取值 | `LoadLibraryA("uxtheme.dll")` + `GetProcAddress(module, 132 as PCSTR)` —— **按序号，不读注册表** | 两次调用在 `:141` / `:147`；序号常量 `UXTHEME_SHOULDAPPSUSEDARKMODE_ORDINAL: PCSTR = 132 as PCSTR` 在 `:133` |
 | 三条失败路径 | 版本不达标 / 取不到模块 / 取不到序号 → 一律判**浅色**（`unwrap_or(false)`；`try_theme` 收尾落 `Theme::Light`） | 同文件 `:61`/`:80`/`:153` |
-| 版本门槛 | `RtlGetVersion` + `status >= 0` + major==10 + minor==0 + build>=17763 | 同文件 `:46-53` |
+| 版本门槛 | `RtlGetVersion`（`get_function!("ntdll.dll", …)`）+ `status >= 0` && major==10 && minor==0 → 得 build 号；再由该 build 号派生 `>= 17763` | `RtlGetVersion` 与 major/minor 检查在 `:19-20` / `:33-35`（`WIN10_BUILD_VERSION`）；build 门槛的派生在 `:46-53`（`DARK_MODE_SUPPORTED`） |
 | 作用对象 | `try_theme()` → `SetWindowTheme(hwnd, "DarkMode_Explorer"/"")` + `SetWindowCompositionAttribute`，**只改窗口框架 / 标题栏** | 同文件 `:60-82`；调用点 `src/platform_impl/windows/window.rs:963` |
 | 能否强制 | winit **有** `Window::set_theme(Option<Theme>)`（能强制框架明暗）；但 **Slint 1.18 完全没有对等的公开 API** —— `i-slint-core-1.18.0/window.rs` 与 `slint-1.18.0/lib.rs` 里 `theme` 一词出现 **0 次** | 两文件的全文检索 |
 
@@ -1145,7 +1151,10 @@ changed is-dark => { Palette.color-scheme = is-dark ? ColorScheme.dark : ColorSc
    于是浅色档的 Fluent 控件（`ScrollView` 滚动条 / `AboutSlint`）正确与否，
    **完全取决于之后 `set_dark(false)` 时 `changed is-dark` 是否真的触发**。
    这曾经只是"看起来对"的推理（Ruling 26 把它列为必测项）—— **Task 9 用离屏探针实测确认它确实触发**：
-   AboutSlint 的 logo 药丸与默认前景色在 `dark=true/false` 两档逐像素互换，数字见 `docs/VERIFICATION.md`。
+   AboutSlint 的 logo 药丸在 `dark=true/false` 两档按颜色计数**精确互换**（23518 ↔ 1701，
+   区域 `x∈[310,570) y∈[410,540)`），默认前景色在两档各取该文字带内**最暗 20 / 最亮 20 像素的均色**，
+   由近白（`#E7E7E7`）变为近黑（`#2D2D2E`）。⚠ 这**不是**全像素 diff：除药丸区的整区计数外，
+   只有每行 10 个采样 x 位置（`x=240…600`，步长 40）的逐点样例，数字见 `docs/VERIFICATION.md`。
    **若删掉 `changed` 那一支，浅色档的 Fluent 控件会整片停在深色。**
 3. **不得**从 Rust 侧另找路子写 `Palette`：`FluentPalette` 是 `std-widgets` 的全局，
    生成的 `MainWindow` 上不存在这个 global（Rust 侧没有访问器）—— 这正是"两条投影路径"的原因，

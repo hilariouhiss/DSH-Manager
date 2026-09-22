@@ -1117,7 +1117,8 @@ init => { /* 只兜构造那一刻 */ }
 ```
 uxtheme 序号 132 (system_dark)          ← 与 winit 同源，决定标题栏与主体一致
   ↑ 读值
-spawn_watcher 线程                       ← RegNotifyChangeKeyValue(REG_NOTIFY_CHANGE_LAST_SET) 阻塞等待
+spawn_watcher 线程                       ← 先 RegNotifyChangeKeyValue(REG_NOTIFY_CHANGE_LAST_SET)
+  │                                        武装（异步：立即返回，**不阻塞**，`src/theme.rs:283`）
   │ 先武装、再读值（顺序反了会永久漏掉落在窗口里的那次变更）
   ↓ tx.send(UiMsg::SystemThemeChanged(bool))
 无界 mpsc 通道
@@ -1141,8 +1142,11 @@ Slint 的属性只能在 UI 线程写。所有 `UiMsg` 都由 UI 线程上那个
 
 ⚠ **代价（已知并接受）**：监视线程为进程生命周期持有一个 `Sender<UiMsg>`，
 于是 `msg_rx.try_recv()` 再也不会返回 `Disconnected` —— `drain()` 里 §5.2 那条"worker 已死"兜底
-与 `worker_dead` 闩锁因此变成**条件可达**（仅当监视线程自己 panic 并释放 sender 时才重新可达）。
-真正的崩溃保护是 worker 的整圈 `catch_unwind` + 显式 `Log`/`Failed`，不受影响。见 RULINGS。
+与 `worker_dead` 闩锁因此变成**条件可达**：只有监视线程自己 panic，或它的**两条非 panic 早退路径**
+（`CreateEventW` 失败 `src/theme.rs:240`、`WaitForSingleObject` 返回非 `WAIT_OBJECT_0`
+`src/theme.rs:307`）丢弃了那个 sender 时，才重新可达。
+真正的崩溃保护是 worker 的整圈 `catch_unwind` + 显式 `Log`/`Failed`，不受影响。
+（同一组事实另见 `docs/RULINGS.md` 的 §5.2 可达性变化与 `src/main.rs:1494-1496`。）
 
 #### 4.7.5 继承来的既有约束
 
