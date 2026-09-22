@@ -7,6 +7,7 @@ mod config;
 mod dsh;
 mod model;
 mod pm;
+mod theme;
 mod txn;
 
 use std::cell::RefCell;
