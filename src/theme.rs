@@ -262,13 +262,13 @@ pub fn spawn_watcher(tx: std::sync::mpsc::Sender<crate::model::UiMsg>) {
                 if RegOpenKeyExW(HKEY_CURRENT_USER, sub.as_ptr(), 0, KEY_READ | KEY_NOTIFY, &mut hkey)
                     != 0
                 {
-                    // 键打不开（极罕见）：先退避 30 秒再结束本线程。
-                    // ⚠ 这里**不重试**（原注释写"退避后重试"，与代码不符，已按实际行为更正）：
-                    // 这段代码是 `return`。重试需要长期持有事件对象与发送端，
-                    // 而本路径只在键根本打不开时到达，收益不成比例。
-                    CloseHandle(event);
+                    // 键打不开（极罕见）：退避后重试，不要退化成忙等。
+                    // ⚠ 这里**不能 return** —— 那是"永久放弃跟随主题"，而且与下面
+                    // `armed != 0` 分支的处理自相矛盾（那个分支是 sleep 后 continue）。
+                    // 事件对象要留着：重试的是"开键"，不是"重造事件"。
+                    // 键没打开过，故本路径没有任何句柄需要释放。
                     std::thread::sleep(std::time::Duration::from_secs(30));
-                    return;
+                    continue;
                 }
                 // ① 先武装（异步：立即返回，变更时置位 event）
                 let armed = RegNotifyChangeKeyValue(
