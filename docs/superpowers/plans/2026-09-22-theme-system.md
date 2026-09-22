@@ -1347,7 +1347,7 @@ git commit -m "feat(theme): 系统主题变更消息、无竞态监视线程与�
                 Divider { }
                 Rectangle { height: 16px; }
 
-                Eyebrow { text: "主题" }
+                Eyebrow { text: "主题"; }
                 Rectangle { height: 10px; }
                 HorizontalLayout {
                     spacing: 8px;
@@ -1553,7 +1553,19 @@ allow 掩盖死代码」）删除该代码，**不得**恢复抑制行。这一�
 
 - [ ] **Step 2: 跑完整验证矩阵**
 
-**截图矩阵**（复用 `target/shot.ps1` 的做法：启动 → `PrintWindow` → 杀进程）。⚠ **不得点击任何控件**，且运行前后都要核对 `state.json` 与 `3080` 的 pid 未变：
+⚠⚠ **先确认会话是否锁屏，再决定用哪条路。** Task 7+8 实测：本会话的交互桌面**已锁屏**
+（`GetForegroundWindow() == 0`、`LogonUI.exe` 在跑），此时：
+- `PrintWindow` + `PW_RENDERFULLCONTENT` 返回**全白位图**，且明暗两档的 md5 **完全相同** ——
+  看起来"成功"其实什么都没截到（这是最容易骗过自己的一种失败）；
+- `CopyFromScreen` 截到的是锁屏桌面，不是应用窗口。
+
+**锁屏时的替代方案（推荐，且对"令牌是否真的生效"这个问题证据更强）——离屏渲染探针：**
+用一个 gitignored 的一次性 crate（`target/theme-probe/`）**编译真实的 `ui/app.slint`**，
+用 Slint 的软件渲染器离屏渲染，然后**直接读像素**。它是唯一能在锁屏下证明
+"`dark` 翻转后 40 条绑定真的重算"的办法 —— 而这正是 Task 3 评审留给 Task 8 的那个 ⚠️。
+Task 7+8 已用此法得到：暗色档 canvas = `#08080F`、浅色档 = `#EDEFF7`（与令牌声明值逐位一致）。
+
+**未锁屏时才用截图矩阵**（复用 `target/shot.ps1`：启动 → `PrintWindow` → 杀进程）。⚠ **不得点击任何控件**，且运行前后都要核对 `state.json` 与 `3080` 的 pid 未变：
 
 ```powershell
 # 依次把 state.json 的 theme_mode 置为 null / "light" / "dark" / "auto"，
@@ -1565,6 +1577,12 @@ allow 掩盖死代码」）删除该代码，**不得**恢复抑制行。这一�
 **实时跟随实测**：应用以「跟随系统」运行，改系统主题（设置 → 个性化 → 颜色 → 选择模式），确认窗口主体**与标题栏同时**变化，并记录延迟。
 
 **持久化实测**：设置里选「深色」→ 退出 → 重启 → 仍是深色且三个 ChipButton 的选中态正确。
+
+⚠⚠ **锁屏下必须交回给人做的一项（不得写成"通过"）**：**真实点击路径**从未在真窗口上跑过 ——
+点 ChipButton → `theme-mode-changed` 回调 → `config::update` 落盘 → 置 dirty → `project()`。
+bin crate 的根无法被探针 import，所以离屏探针**证明不了**这一段；
+Task 7+8 只做到了编译期验证 + 代码审查。**必须在解锁的会话里由人点一次并截图**。
+这一条要原样写进 `docs/VERIFICATION.md`，标明"未执行/待人工"，不能含糊成 PASS。
 
 **旧文件兼容实测**：把 `state.json` 换回三字段版本启动，确认不崩、以跟随系统启动。
 
