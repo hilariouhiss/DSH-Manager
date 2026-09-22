@@ -491,22 +491,25 @@ fn drain(rx: &Receiver<UiMsg>, state: &Rc<RefCell<AppState>>, tx: &Sender<Job>) 
                             let _ = config::update(|f| f.running_port = None);
                         }
                     }
-                    // 系统主题变了。⚠ 只有「跟随系统」档会因此改变外观：强制档下
-                    // resolved 不变，就不该置 dirty 触发一次无谓重绘。
+                    // 系统主题变了。本臂**只记事实**：`s.system_dark = dark`。
+                    //
+                    // ⚠ 它**不省下任何一次重绘**，别在这里加"优化"：
+                    // ① `drain` 在进 `match` **之前**就对任何收到的消息置了 `changed = true`
+                    //    （本臂位于 `Ok(msg) => { changed = true; … }` 内部），所以"强制档下
+                    //    resolved 不变"推不出"这一 tick 不用 `project()`" —— 它早已为真；
+                    // ② 置 `s.dirty` 同样不省：timer 回调里 `take_dirty` 在 `drain` **之前**
+                    //    跑，这里置的真只会留到**下一** tick，白多一次全量 `project()`。
+                    // 曾经的注释说"强制档下不置 dirty 就不会白白触发一次全量 project()"，
+                    // 是错的（两条都反了）。仍然成立的那半句：只有「跟随系统」档会因系统主题
+                    // 变化而改变外观，强制档下 `resolve` 确实不变 —— 那是 `resolve` 的性质，
+                    // 不是本臂省出来的。
                     //
                     // ⚠ **不在这里再 `state.borrow()`** —— 本臂之上 `drain` 已经持有
                     // `s`（`state.borrow_mut()`，作用域覆盖整个 `match`）。RefCell 的
                     // 借用是**运行期**检查的：多借一次编译期毫无提示，第一次切系统主题就
                     // 直接 panic（实测 "RefCell already mutably borrowed"）。
-                    // 所以旧值一律从**已在手的** `s` 上取，先取完再改 —— 次序不变。
                     UiMsg::SystemThemeChanged(dark) => {
-                        let was = theme::resolve(s.theme_mode, s.system_dark);
-                        let now = theme::resolve(s.theme_mode, dark);
                         s.system_dark = dark;
-                        if was != now {
-                            s.dirty = true;
-                        }
-                        changed |= was != now;
                     }
                     UiMsg::Failed { context, message } => {
                         // 探测失败也必须置真：否则界面会永远停在"检测中…"，

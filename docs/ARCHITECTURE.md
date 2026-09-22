@@ -1124,9 +1124,8 @@ spawn_watcher 线程                       ← 先 RegNotifyChangeKeyValue(REG_N
 无界 mpsc 通道
   ↓
 80 ms Timer → drain()
-  │ SystemThemeChanged(dark) 臂：s.system_dark = dark;
-  │   was = resolve(mode, 旧), now = resolve(mode, 新)
-  │   was != now → s.dirty = true; changed = true      ← 强制档下两者相等，不触发重绘，这是正确行为
+  │ SystemThemeChanged(dark) 臂：s.system_dark = dark;   ← 只记事实，不算 was/now
+  │   （不置 dirty、不改 changed：drain 进来时已 changed=true，置 dirty 只会多跑一次 project）
   ↓
 drain() 返回 true → 全量 project() → set_dark(resolve(...))
 ```
@@ -1137,8 +1136,10 @@ Slint 的属性只能在 UI 线程写。所有 `UiMsg` 都由 UI 线程上那个
 
 - 同一次系统主题切换引发的多条消息（以及其它消息）被**合并成一帧**；
 - 监视线程本身在变更之间阻塞在 `WaitForSingleObject(INFINITE)` 上，**不轮询**（NFR-4 要求空闲近零 CPU）；
-- 消息是幂等的：重复的 `SystemThemeChanged(同一个值)` 因为 `was == now` 而不置 `dirty`，
-  不会白白触发一次全量 `project()`。
+- ⚠ **没有"消息幂等 ⇒ 不重绘"这回事**：`drain()` 对**每一条**收到的消息都置 `changed = true`，
+  所以重复的 `SystemThemeChanged(同一个值)`（以及强制档下 resolved 不变的那种）**照样**触发一帧全量
+  `project()`。`SystemThemeChanged` 臂只写 `s.system_dark`，它既不置 `dirty`、也不动 `changed`。
+  真正的省帧发生在别处：稳态下没有消息，`drain` 无输出且 `take_dirty` 为假，于是根本不 `project()`。
 
 ⚠ **代价（已知并接受）**：监视线程为进程生命周期持有一个 `Sender<UiMsg>`，
 于是 `msg_rx.try_recv()` 再也不会返回 `Disconnected` —— `drain()` 里 §5.2 那条"worker 已死"兜底

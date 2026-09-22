@@ -963,9 +963,17 @@ LISTENING 表是权威的 —— 超时路径上问它一次即可判别。
 - 事实：ureq 默认只认 `HTTPS_PROXY`/`HTTP_PROXY` 环境变量，**不读 Windows/WinINET 系统代理**；
 实现者实测本机直连 `api.github.com` 返回 **403（IP 小时级限流，remaining 0）**，而系统代理
 `127.0.0.1:12450` 返回 200。V-6 因此是靠**注入 `HTTPS_PROXY`**（仅环境变量，无代码改动）才验成的。
-- 为什么不改：读系统代理需要注册表/WinINET API —— 前者要 `winreg`、后者要 `windows` crate，
-**GC-2 明令禁止新增依赖**（含 `windows`）。而失败路径是**优雅的**（非 404 的错误 → `NotesError::Net`
-→ 界面显示"加载失败"）✓ 不阻塞任何主流程。
+- 为什么不改（⚠ **2026-09-22 修订：原话是"GC-2 明令禁止新增依赖（含 `windows`）"，现在不准确**）：
+  读系统代理的两条路里只有一条还挡在依赖上 —— `winreg`（读 `Internet Settings`）是**真·新 crate**，
+  lock 里没有，仍被 GC-2 挡住；而 WinINET/WinHTTP 这条路**不再**被依赖挡住：本分支已把
+  `windows-sys 0.61.2` 提为直接依赖（GC-2 口径见平台事实 1 第 3 条：**已在该版本 lock 里 ⇒ 不新增
+  编译单元**），且该 crate **确实带** `Win32_Networking_WinInet` / `Win32_Networking_WinHttp` 两个
+  feature（已核实 `windows-sys-0.61.2/src/Windows/Win32/Networking/` 下两个模块与
+  `InternetQueryOptionW` / `WinHttpGetIEProxyConfigForCurrentUser` 的签名）。
+  **所以这条不改代码的理由改成两条事实，而不是"没有可用依赖"**：① 它是 `feat/implementation`
+  的出网路径上的**行为变更**，不在 `feat/theme-system` 范围内，且该路径已按环境变量方案验成（V-6）；
+  ② 失败路径是**优雅的**（非 404 的错误 → `NotesError::Net` → 界面显示"加载失败"），不阻塞任何主流程。
+  —— 裁决本身（记录为已知限制、不改代码）不变，变的只是理由的表述。
 - 附带提醒（给人类）：实现者的 22 步下拉遍历**烧掉了本机 IP 的 GitHub 小时配额**；
 这是**暂时性**的，一小时后自愈，且与本程序代码无关。
 
@@ -1061,7 +1069,7 @@ registry/WinINET crate；改由 SRS 与 `docs/VERIFICATION.md` 明确记为**环
 与 **§5.2 可达性变化**。
 
 ⚠ 本节裁决引用的是**另一条分支的编号序列**：原文在 git-ignored 的
-`.superpowers/sdd/2026-09-22-theme-system/progress.md`（到 Task 9 为止共 27 条）。
+`.superpowers/sdd/2026-09-22-theme-system/progress.md`（到 Task 9 为止共 **28** 条 —— 按 `### Ruling` 标题数）。
 **两套编号不共享序列** —— 本节的「Ruling 26」与上面的「Ruling 26」（Task 3 的 Produces 笔误）
 是两个不同的编号。引用时请写明分支。
 
@@ -1084,10 +1092,18 @@ registry/WinINET crate；改由 SRS 与 `docs/VERIFICATION.md` 明确记为**环
    这不是"没找现成 API"，而是**没有现成 API**。
 2. 反过来，**`Palette.color-scheme` 是可以写的**（见事实 3）：它是 `std-widgets` 的普通全局属性，
    而 `SlintInternal` 不是。两件事容易混为一谈，别混。
-3. ⚠ 谁若哪天认为 `private_unstable_api` "能用"，先读 `docs/IMPLEMENTATION-PLAN.md:103` 的 **GC-2**：
-   依赖**只允许 5 个 crate**（`slint` / `slint-build` / `ureq` / `serde_json` / `semver`）、**不得新增**。
-   直连 `i-slint-core` 拿那个公开方法就属于新增依赖 —— 被 GC-2 挡住；走 `slint::private_unstable_api`
-   不新增 crate，但模块名本身就是声明（无兼容承诺、随版本变），两条路都不通，所以「自己探测」。
+3. ⚠ 谁若哪天认为 `private_unstable_api` "能用"，先读 `docs/IMPLEMENTATION-PLAN.md:103` 的 **GC-2**。
+   ⚠ **GC-2 的白名单本来是 5 个 crate**（`slint` / `slint-build` / `ureq` / `serde_json` / `semver`），
+   但 `feat/theme-system` 自己把它扩到了 **6 个**：本分支新增直接依赖 `windows-sys`（`Cargo.toml`，
+   钉 `0.61`），**放行的理由不是"主题子系统特殊"，而是"不新增编译单元"** —— `windows-sys 0.61.2`
+   本来就在 `Cargo.lock` 里、且已有 **12 个**依赖方（`winit` / `softbuffer` / `muda` / `polling` 等），
+   直接依赖它只多一条边，不多编译一个 crate。**这条口径对谁都一样**：只有"已在 lock 里"的 crate 才
+   能按此放行，`winreg`、`tokio`、`reqwest` 这类真正的新 crate 仍然被 GC-2 挡住。
+   所以 `private_unstable_api` 不通的**理由不是"数到了 5 所以不行"**（本分支已经证明那个数不是绝对的），
+   而是**要走通它必须经过 `slint::private_unstable_api` 这个 facade**：`SlintContext::color_scheme()`
+   虽是 `i-slint-core` 上的公开方法，但从本程序的窗口拿到那个 context 只有这一条路，而模块名本身就是
+   声明（无兼容承诺、随版本变）。于是仍然是两条路都不通（一条是 facade，一条是拿不到 context），
+   结论不变：**自己探测**。
 
 ---
 
@@ -1159,6 +1175,46 @@ changed is-dark => { Palette.color-scheme = is-dark ? ColorScheme.dark : ColorSc
 3. **不得**从 Rust 侧另找路子写 `Palette`：`FluentPalette` 是 `std-widgets` 的全局，
    生成的 `MainWindow` 上不存在这个 global（Rust 侧没有访问器）—— 这正是"两条投影路径"的原因，
    见 `docs/ARCHITECTURE.md` §4.7.2。
+
+---
+
+## 平台事实 4 — ⚠ **高对比度是判据的输入，却不是通知源**（已知缺口，与 H-3 同类）
+
+**事实（终审发现，2026-09-22）。** 取值那条路**每次都问**高对比度，但监视线程**只看一个键**：
+
+| 侧 | 事实 | 出处 |
+|---|---|---|
+| 判据（每调用一次就问一次） | `system_dark()` 的三段：`!dark_mode_supported()` → `false`；`high_contrast()` → `false`；否则 `uxtheme_dark().unwrap_or(false)`。`high_contrast()` 每次调 `SystemParametersInfoW(SPI_GETHIGHCONTRAST)` 现取 | `src/theme.rs:103-132`（高对比度查询 `:109-120`、被咨询处 `:127-129`） |
+| 通知源（只此一个键） | 监视的是 `PERSONALIZE_KEY` = `HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize`，`RegNotifyChangeKeyValue(…, bWatchSubtree=1, REG_NOTIFY_CHANGE_LAST_SET, …)`，然后 `WaitForSingleObject(event, INFINITE)` | `src/theme.rs:84`、`:222-284`（武装 `:282-284`）、等待 `:305` |
+| 高对比度写在**别的键** | `HKCU\Control Panel\Accessibility\HighContrast`（本机 2026-09-22 只读实测：`Flags=REG_SZ 126` —— bit0 `HCF_HIGHCONTRASTON` **未置位**，即当前 HC 关；`High Contrast Scheme=高对比白色`） | `reg query` 只读，两个键是**不同的键** |
+
+**机制（为什么这会造成不一致）。** `bWatchSubtree=1` 监视的是**该键及其子键**，
+**不包含兄弟键** —— `HKCU\Control Panel\Accessibility\HighContrast` 与 `Personalize` 之间没有父子关系，
+所以只改 HC 键**不会**置位我们等待的那个 event。于是：
+
+1. 用户切 HC（不改系统明暗）→ HC 键被改写并广播 `WM_SETTINGCHANGE`；
+2. **winit** 在 `WM_SETTINGCHANGE` 里重跑判据（`winit-0.30.13/src/platform_impl/windows/event_loop.rs:2423-2430`：
+   `preferred_theme.is_none()` 时 `try_theme(...)`），而它的判据同样含 `!is_high_contrast()`
+   （`dark_mode.rs:126-127`）→ **标题栏立刻跟着变**；
+3. **我们的监视线程仍在 `WaitForSingleObject(INFINITE)` 上睡着**（event 没被置位），
+   主体不重算 → **主体与标题栏分叉**，直到下一次**真正**的 `Personalize` 变更（或重启程序）才自愈。
+
+**触发条件（两个都要满足）**：① 档位是**跟随系统**（`ThemeMode::Auto`）；② 一次**只改 HC**、
+不改 `Personalize` 的切换。强制档下不存在这条缺口 —— 那时主体本来就不跟系统（那是事实 2 的
+平台限制，已向用户交代）。
+
+⚠ **两个必须写明的限定**：
+- **降级路径没有这个缺口**：若 `RegNotifyChangeKeyValue` 武装失败（`src/theme.rs:289-297`），
+  监视退化成**每 5 秒重读一次 `system_dark()`** —— 那条路上 HC 变更最多 5 秒后被我们读到。
+  缺口只出现在"武装成功"的正常路径上。
+- **本记录是代码/依赖源码核实的结论，不是实测**：验证它需要**真的切换高对比度**，
+  而那是**系统级无障碍设置、属于用户**，本轮（以及本分支）**刻意没有动它**。
+  所以这条按"已知缺口"记账，不按"已复现缺陷"记账。
+
+**为什么不在本分支修。** 修法只有"再监视第二个键（`HKCU\Control Panel\Accessibility\HighContrast`）
+并把两个 event 一起等"—— 那是**结构性改动**（第二轮等待/句柄生命期/失败退避都要重做一遍，
+见 `src/theme.rs:244-267` 那些 MSDN 约束），出现在分支末期，风险大于收益。
+与 H-3（实时跟随的端到端实测）同类：**都属于"跟随系统的实时性"这个面**，一并留给下一轮。
 
 ---
 

@@ -149,7 +149,8 @@ export global Tokens {
 - **浅色 CTA 是实心的，没有渐变**：`cta-top == cta-bottom == #59659B`。暗色的白胶囊靠渐变塑形，浅色的强调胶囊靠色块本身，加渐变只会让白字对比度在渐变端掉到门槛以下。
 - **非颜色令牌两套共用**，不参与主题：`r-lg/r-md/r-sm`、`font-hero`、三档 `motion-*`、`status-h`、`disabled`(0.35)。其中 `disabled` 用整体 opacity 表达，浅色下同样成立（深字变浅灰），无需按主题分叉。
 
-**强制模式下系统主题变化不产生任何视觉变化** —— 这是正确行为，不是漏接线：`resolved_dark` 由 mode 决定，`system_dark` 变了也不会进入它。监视线程照常更新 `system_dark`（用户随时切回「跟随系统」时立即是正确值），只是不触发重绘。
+**强制模式下系统主题变化不产生任何视觉变化** —— 这是正确行为，不是漏接线：`resolved_dark` 由 mode 决定，`system_dark` 变了也不会进入它。监视线程照常更新 `system_dark`（用户随时切回「跟随系统」时立即是正确值）。
+⚠ **但它并不会因此"省下一次重绘"**（终审修正）：`drain()` 对**每一条**收到的消息都置 `changed = true`，所以那一 tick 照样全量 `project()` —— 只是投影出来的颜色与上一帧相同。落地实现里 `SystemThemeChanged` 臂只写 `s.system_dark`（不置 `dirty`、不动 `changed`，两者都不省），见 `docs/ARCHITECTURE.md` §4.7.4 与 `src/main.rs` 该臂的注释。
 
 ### 4.4 变更监视为什么要无竞态
 

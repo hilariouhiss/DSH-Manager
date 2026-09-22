@@ -797,7 +797,7 @@ git commit -m "feat(ui): Tokens 双主题（浅色版逐令牌验算）+ 吸收 
 - Consumes: 无（只依赖 Windows API）
 - Produces: `theme::system_dark() -> bool`
 
-> **与 winit 同源是硬要求**：winit 用 `uxtheme.dll` 序号 132 的 `ShouldAppsUseDarkMode()` 给系统标题栏定色（`winit-0.30.13/src/platform_impl/windows/dark_mode.rs:130`）。我们若改用注册表读，某些机器上会出现"应用主体变暗而标题栏不变"。故主路径同源，注册表只作回落。
+> **与 winit 同源是硬要求**：winit 用 `uxtheme.dll` 序号 132 的 `ShouldAppsUseDarkMode()` 给系统标题栏定色（`winit-0.30.13/src/platform_impl/windows/dark_mode.rs:130`）。我们若改用注册表**读值**，某些机器上会出现"应用主体变暗而标题栏不变"。故取值与 winit 同源。⚠ **初稿在这里写的是"注册表只作回落"，Ruling 17 已推翻**：那条回落只在"winit 判浅色"的失败路径上被触发，是分叉源而非安全网，已删除 —— 本模块**不读注册表取值**，注册表只用于 Task 6 的**变更通知**。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -937,15 +937,16 @@ pub fn system_dark() -> bool {
 /// **又回到主体与标题栏各说各话**，正是同源约束要禁止的那件事。
 ///
 /// ⚠ **不能用 `GetVersionExW`**：它没有 manifest 时会**撒谎**（Win10+ 仍报 6.2 / build 9200），
-/// 那会让本函数在现代系统上恒为 false，于是我们永远走注册表而 winit 走 uxtheme —— 同样是不同源。
+/// 那会让本函数在现代系统上恒为 `false` —— 我们恒判**浅色**，而 winit 用 `RtlGetVersion`
+/// 判出真正的暗色：标题栏跟着变暗、主体却停在浅色，**同样是不同源**。
 /// winit 用 `RtlGetVersion` 正是为此。
 ///
 /// 为什么必须挡：`uxtheme.dll` 的序号 132 只在 build 17763+ 才有定义。低于该版本时，
 /// ① 若该序号上恰好是别的导出，`transmute` 出来的错误原型调用就是 **UB**；
 /// ② winit 在那种机器上判**浅色**，我们若判成暗色就会不一致。
 ///
-/// 取不到版本号、或版本不满足上述条件时返回 `false`（走注册表）：
-/// 宁可在旧机器上退化成注册表读数，也不赌一个未知序号。
+/// 取不到版本号、或版本不满足上述条件时返回 `false`（= 判**浅色**，与 winit 同判）：
+/// 宁可在这类机器上判浅色，也不赌一个未知序号。
 ///
 /// ⚠ **维护契约**：本函数是 winit 判定的镜像。若哪天 winit 放宽了它的条件
 /// （例如支持主版本不再是 10 的系统），**这里必须同步放宽**，否则又会分叉。
@@ -1052,7 +1053,7 @@ Expected: `AppsUseLightTheme = 1` 时测试内部的 `system_dark()` 应为 `fal
 
 ```bash
 git add Cargo.toml Cargo.lock src/theme.rs
-git commit -m "feat(theme): Windows 系统主题探测（与 winit 同源 + 注册表回落）"
+git commit -m "feat(theme): Windows 系统主题探测（与 winit 同源，不读注册表取值）"
 ```
 
 ---

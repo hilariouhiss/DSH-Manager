@@ -100,7 +100,7 @@
 | GC | 对应 SRS | 约束 |
 |---|---|---|
 | **GC-1** | CON-1 | 目标平台 **仅 Windows**。可保持可移植性，但只在 Windows 上验证。 |
-| **GC-2** | ARCH §7.1/§7.2 | 依赖**只允许 5 个**：`slint`、`slint-build`、`ureq`、`serde_json`、`semver`。**不得新增任何其他 crate** —— 包括 `tokio`、`reqwest`、`dirs`、`anyhow`、`thiserror`、`open`、`tray-icon`、`serde`(derive)、`windows`。 |
+| **GC-2** | ARCH §7.1/§7.2 | 依赖**只允许 5 个**：`slint`、`slint-build`、`ureq`、`serde_json`、`semver`。**不得新增任何其他 crate** —— 包括 `tokio`、`reqwest`、`dirs`、`anyhow`、`thiserror`、`open`、`tray-icon`、`serde`(derive)、`windows`。<br>⚠ **2026-09-22 修订（`feat/theme-system`）**：该分支新增第 **6** 个直接依赖 `windows-sys 0.61`（系统主题探测/变更监视），放行口径是 **"已在 `Cargo.lock` 里 ⇒ 不新增编译单元"** —— `windows-sys 0.61.2` 原本就在 lock 中且已有 **12 个**依赖方。这条口径**不是**"主题子系统特殊"：只有已在 lock 里的 crate 能按此放行，`tokio` / `winreg` / `reqwest` 这类真·新 crate 仍被本约束挡住。详见 `docs/RULINGS.md` 平台事实 1 第 3 条。 |
 | **GC-3** | CON-2 | Slint 使用**默认 feature 集，不裁剪**。 |
 | **GC-4** | CON-3 | 后台并发只用 `std::thread` + `std::sync::mpsc`。**禁止 async 运行时**。 |
 | **GC-5** | CON-4 | 网络访问**只允许** `registry.npmjs.org` 与 `api.github.com`。**禁止** `github.com` 网页、`git ls-remote`、git 协议。 |
