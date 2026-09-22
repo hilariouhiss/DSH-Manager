@@ -41,43 +41,62 @@ export struct NoteBlock {
 }
 
 // ── 设计令牌 ────────────────────────────────────────────────────────────────
-// 一处定义，全局引用。升级路径：将来若做主题切换，只需把这里的常量
-// 换成 `in` 属性并由 Rust 写入。
+// 一处定义，全局引用。
 //
 // ⚠ 色值锚定 `assets/logo.png`（本机采样，非肉眼估）：
 //     头发主蓝 #59659B（占 9.2%，签名色）／发丝高光 #7AA3CD→#95B6E9
 //     裙装藏青 #30304E~#3B3C62／围裙暖白 #FDF4F5
 // 所以下面三件事是一体的，改一件要一起想：
-//   ① 中性色阶是**藏青**不是纯灰（取裙装的色相，压到近黑）
-//   ② 玻璃层的白是**冷白**（#EEF0FF…）不是灰白（#FFFFFF…）
-//   ③ 强调色是**紫蓝**不是薄荷 —— logo 里一个绿色像素都没有，
-//      这是"配色不适配 logo"的全部根源。
-global Tokens {
-    out property <brush> canvas:        #08080F;  // 最深一层（OLED 近黑，带藏青，非纯黑）
-    out property <brush> core-top:      #12121C;  // 卡片内胎（渐变上端）
-    out property <brush> core-bottom:   #0D0D15;  // 卡片内胎（渐变下端）
-    out property <brush> shell:         #EEF0FF06; // 外碗底
-    out property <brush> hairline:      #EEF0FF12; // 1px 结构线
-    out property <brush> hairline-soft: #EEF0FF0A;
-    out property <brush> hairline-strong: #EEF0FF33; // 输入类控件的描边（小面积上结构线看不见）
-    out property <brush> inner-light:   #EEF0FF0E; // 内胎顶缘高光
+//   ① 中性色阶是**藏青**不是纯灰（取裙装的色相，压到近黑／提到近白）
+//   ② 玻璃层的结构色随主题**反向**（暗色是白 α，浅色必须翻成深 α）
+//   ③ 强调色是**紫蓝**不是薄荷 —— logo 里一个绿色像素都没有
+//
+// ⚠ 双主题：`dark` 由 Rust 唯一写入（`theme::resolve` 的结果），UI 不参与判断，
+// 系统态（system_dark）甚至不进本文件。每格写成 `dark ? 暗 : 浅` 是 Slint 自己的
+// 形状 —— 见 i-slint-compiler-1.18.0/widgets/fluent/styling.slint:36。
+// 浅色侧每个值都在规格 §4.3 验算过 WCAG，改动要走 test(theme) 的对比度回归测试。
+//
+// 浅色侧要点：accent 用 logo **真实**主蓝 #59659B（暗色侧是提亮版 #9AA6E8）——
+// 浅底上必须压深才够 4.87，压深后正好落回 logo 原色。warn/danger 同理必须压深
+// （#E3B341 / #F07178 在白底上只有 1.9 / 2.6，不可用）。
+export global Tokens {
+    /// 当前是否为暗色。Rust 写，其余令牌读。
+    in-out property <bool> dark: true;
 
-    out property <brush> ink:           #EFEFF7;  // 主文字
-    out property <brush> ink-2:         #AFB0C6;  // 正文
-    out property <brush> ink-3:         #7C7D95;  // 次级
-    out property <brush> ink-4:         #63647C;  // 标签 / 眉标
+    out property <brush> canvas:        dark ? #08080F : #EDEFF7;  // 最深/最浅一层
+    out property <brush> core-top:      dark ? #12121C : #FFFFFF;  // 卡片内胎（渐变上端）
+    out property <brush> core-bottom:   dark ? #0D0D15 : #F6F7FB;  // 卡片内胎（渐变下端）
+    out property <brush> shell:         dark ? #EEF0FF06 : #2A2E4A03; // 外碗底
+    out property <brush> hairline:      dark ? #EEF0FF12 : #2A2E4A09; // 1px 结构线
+    out property <brush> hairline-soft: dark ? #EEF0FF0A : #2A2E4A05;
+    out property <brush> hairline-strong: dark ? #EEF0FF33 : #2A2E4A22; // 输入类控件的描边
+    out property <brush> inner-light:   dark ? #EEF0FF0E : #FFFFFF99; // 内胎顶缘高光
 
-    out property <brush> accent:        #9AA6E8;  // 唯一强调色（logo 签名蓝 #59659B 提亮）
-    out property <brush> accent-ink:    #BCC5F7;  // 强调色上的文字
-    out property <brush> good:          #7FB4E4;  // 信息 / 成功（logo 高光天蓝，与强调色分工）
-    out property <brush> warn:          #E3B341;  // ⚠ 刻意**不**取自 logo：金蝶结只占 67px(0.05%)
+    out property <brush> ink:           dark ? #EFEFF7 : #191B2A;  // 主文字
+    out property <brush> ink-2:         dark ? #AFB0C6 : #4C4F66;  // 正文
+    out property <brush> ink-3:         dark ? #7C7D95 : #666980;  // 次级
+    out property <brush> ink-4:         dark ? #63647C : #82859B;  // 标签 / 眉标
 
-    out property <brush> cta-top:       #F8F6FA;  // 主 CTA（围裙白）
-    out property <brush> cta-bottom:    #DCDAE6;
-    out property <brush> cta-ink:       #0B0B14;
+    out property <brush> accent:        dark ? #9AA6E8 : #59659B;  // 唯一强调色
+    out property <brush> accent-ink:    dark ? #BCC5F7 : #3A4270;  // 强调色上的文字
+    out property <brush> good:          dark ? #7FB4E4 : #2E6C9E;  // 信息 / 成功
+    out property <brush> warn:          dark ? #E3B341 : #8A6200;  // ⚠ 不取自 logo：金蝶结只占 67px(0.05%)
 
-    out property <brush> glow-brand:    #9AA6E81F; // 强调色的氛围光（原名 glow-mint，随配色改）
-    out property <brush> glow-blue:     #7FB4E417;
+    out property <brush> cta-top:       dark ? #F8F6FA : #59659B;  // 主 CTA（浅色为实心强调色）
+    out property <brush> cta-bottom:    dark ? #DCDAE6 : #59659B;
+    out property <brush> cta-ink:       dark ? #0B0B14 : #FFFFFF;
+    // ⚠ 悬停方向**相反**：暗色白胶囊变亮，浅色实心胶囊必须变深 ——
+    // 变浅会让白字掉到 4.36，不达标。
+    out property <brush> cta-hover-top:    dark ? #FFFFFF : #4C5788;
+    out property <brush> cta-hover-bottom: dark ? #E6E7F2 : #4C5788;
+    // 图标井：暗色是白胶囊里的黑井；浅色 CTA 是实心强调色，井翻成白井。
+    out property <brush> well:          dark ? #00000024 : #FFFFFF2E;
+    out property <brush> well-hover:    dark ? #0000001F : #FFFFFF38;
+
+    out property <brush> glow-brand:    dark ? #9AA6E81F : #59659B14; // 强调色的氛围光
+    out property <brush> glow-blue:     dark ? #7FB4E417 : #7FB4E41A;
+    out property <brush> top-light:     dark ? #EEF0FF0B : #FFFFFFB3; // 顶部一线竖直渐变
+    out property <brush> shadow:        dark ? #00000080 : #2A2E4A33; // 浮层投影
     out property <length> r-lg: 22px;
     out property <length> r-md: 16px;
     out property <length> r-sm: 11px;
@@ -86,36 +105,34 @@ global Tokens {
     // ── 控制面：所有可点元素共用同一套填充，不允许各自写白百分比 ─────────────
     // 收敛前散着 #FFFFFF08/0D/12/14/17/1F 六个值，四个按钮族各挑一个，
     // 于是"同一档悬停"在四个地方是四种亮度。
-    out property <brush> fill:        #EEF0FF0D; // 静止
-    out property <brush> fill-hover:  #EEF0FF17; // 悬停
-    out property <brush> fill-active: #EEF0FF1F; // 按压 / 已展开
+    out property <brush> fill:        dark ? #EEF0FF0D : #2A2E4A05; // 静止
+    out property <brush> fill-hover:  dark ? #EEF0FF17 : #2A2E4A09; // 悬停
+    out property <brush> fill-active: dark ? #EEF0FF1F : #2A2E4A0D; // 按压 / 已展开
 
     // ── 槽与浮层 ──────────────────────────────────────────────────────────
-    out property <brush> sunk:        #00000059; // 下凹槽底（输入框 / 下拉框）
-    out property <brush> solid:       #15151F;   // 浮层底：不透明，才压得住下层文字
-    out property <brush> overlay:     #000000B8; // 模态遮罩
+    out property <brush> sunk:        dark ? #00000059 : #2A2E4A06; // 下凹槽底（输入框 / 下拉框）
+    out property <brush> solid:       dark ? #15151F : #FFFFFF;   // 浮层底：不透明，才压得住下层文字
+    out property <brush> overlay:     dark ? #000000B8 : #1A1C2E66; // 模态遮罩
 
     // ── 强调色的四档（静止填充 / 悬停填充 / 描边 / 徽标底）──────────────────
-    out property <brush> accent-fill:       #9AA6E81A;
-    out property <brush> accent-fill-hover: #9AA6E82E;
-    out property <brush> accent-line:       #9AA6E847;
-    out property <brush> accent-soft:       #9AA6E812;
-    out property <brush> warn-soft:         #E3B34112;
+    out property <brush> accent-fill:       dark ? #9AA6E81A : #59659B14;
+    out property <brush> accent-fill-hover: dark ? #9AA6E82E : #59659B24;
+    out property <brush> accent-line:       dark ? #9AA6E847 : #59659B3D;
+    out property <brush> accent-soft:       dark ? #9AA6E812 : #59659B0F;
+    out property <brush> warn-soft:         dark ? #E3B34112 : #8A620012;
 
-    out property <brush> danger:      #F07178;   // 错误（日志行）
-    out property <brush> lamp-off:    #494C60;   // 熄灭的状态灯：暗，但仍看得见那颗灯
+    out property <brush> danger:      dark ? #F07178 : #9C3F41;   // 错误（日志行）
+    out property <brush> lamp-off:    dark ? #494C60 : #B0B3C2;   // 熄灭的状态灯
 
-    // ── 动效与状态 ────────────────────────────────────────────────────────
+    // ── 动效与状态（两套主题共用，不参与主题）──────────────────────────────
     // 三档时长：读数变色 400ms / 配色切换 200ms / 按压回弹 150ms。
-    // 收敛前是 160/200/260/300/400 五档，差别全在"当时顺手写了多少"。
     out property <duration> motion-slow:  400ms;
     out property <duration> motion-hover: 200ms;
     out property <duration> motion-tap:   150ms;
     /// 状态栏高度。⚠ 两处必须一致：主布局靠 `padding-bottom: Tokens.status-h`
-    /// 给贴底的状态栏让位，状态栏自己用它定高 —— 不一致就会出现"内容压在栏上"
-    /// 或者"栏上方一条谁也解释不清的空白"。
+    /// 给贴底的状态栏让位，状态栏自己用它定高。
     out property <length> status-h: 34px;
-    /// 不可用元素整体压暗的统一档位（收敛前 0.30 / 0.34 两个值）。
+    /// 不可用元素整体压暗的统一档位。用 opacity 表达，两套主题同样成立。
     out property <float> disabled: 0.35;
 }
 
@@ -133,7 +150,7 @@ global Font {
 // ⚠ 必须是 fixed/装饰性图层，且 pointer-events 为无 —— 它铺满整窗，
 // 若参与命中测试会把下面的所有按钮都吃掉。
 component Orb inherits Rectangle {
-    in property <brush> tint: #9AA6E81F;
+    in property <brush> tint: Tokens.glow-brand;
     background: @radial-gradient(circle, root.tint 0%, transparent 70%);
 }
 
@@ -238,7 +255,7 @@ component PillButton inherits Rectangle {
                 // 井比按钮本体亮一档 —— 井在按钮**里面**，同亮度就"陷"没了；
                 // 强调按钮是白底，井改用减暗才看得出层次。
                 background: emphasis
-                    ? (touch.has-hover ? #0000001F : #00000024)
+                    ? (touch.has-hover ? Tokens.well-hover : Tokens.well)
                     : (touch.has-hover ? Tokens.fill-active : Tokens.fill-hover);
                 animate background { duration: Tokens.motion-hover; easing: ease-out-quint; }
 
@@ -265,7 +282,7 @@ component PillButton inherits Rectangle {
     states [
         hover when touch.has-hover && root.interactive : {
             background: emphasis
-                ? @linear-gradient(180deg, #FFFFFF 0%, #E6E7F2 100%)
+                ? @linear-gradient(180deg, Tokens.cta-hover-top 0%, Tokens.cta-hover-bottom 100%)
                 : Tokens.fill-hover;
         }
     ]
@@ -468,7 +485,7 @@ component Flyout inherits Rectangle {
     border-color: Tokens.hairline;
     drop-shadow-blur: 16px;
     drop-shadow-offset-y: 8px;
-    drop-shadow-color: #00000080;
+    drop-shadow-color: Tokens.shadow;
 }
 
 // ── 1px 结构线 ──────────────────────────────────────────────────────────────
@@ -1187,7 +1204,7 @@ export component MainWindow inherits Window {
     // 顶部一线极淡的竖直渐变，让"顶光"方向与所有内高光一致
     Rectangle {
         width: 100%; height: 120px;
-        background: @linear-gradient(180deg, #EEF0FF0B 0%, transparent 100%);
+        background: @linear-gradient(180deg, Tokens.top-light 0%, transparent 100%);
     }
 
     VerticalLayout {

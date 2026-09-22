@@ -82,6 +82,7 @@ pub fn resolve(mode: ThemeMode, system_dark: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     #[test]
     fn index_roundtrips_for_every_mode() {
@@ -141,5 +142,147 @@ mod tests {
         assert!(resolve(ThemeMode::Dark, false));
         assert!(resolve(ThemeMode::Auto, true));
         assert!(!resolve(ThemeMode::Auto, false));
+    }
+
+    /// 从 `ui/app.slint` 的 Tokens 全局解析每个 brush 令牌的（暗值, 浅值）。
+    ///
+    /// ⚠ 只认 `out property <brush> 名字: dark ? #AAAAAA : #BBBBBB;` 这一形状，
+    /// 且**形状不认识时报错而不是跳过** —— 跳过会让测试在令牌被改写后
+    /// 悄悄失去覆盖，那正是这类回归测试最容易失效的方式。
+    fn parse_palette() -> Result<Vec<(String, String, String)>, String> {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app.slint"))
+            .map_err(|e| format!("读不到 ui/app.slint: {e}"))?;
+        let start = src.find("global Tokens {").ok_or("找不到 Tokens 全局")?;
+        let body = &src[start..];
+        let end = body.find("\n}").ok_or("Tokens 全局没有结束大括号")?;
+        let hex = |s: &str| -> Option<String> {
+            let i = s.find('#')?;
+            let rest: String = s[i + 1..].chars().take(8).collect();
+            let n = rest.chars().take_while(|c| c.is_ascii_hexdigit()).count();
+            (n == 6 || n == 8).then(|| format!("#{}", &rest[..n]))
+        };
+        let mut out = Vec::new();
+        for line in body[..end].lines() {
+            let Some(rest) = line.split("<brush>").nth(1) else { continue };
+            let (name, val) = rest
+                .split_once(':')
+                .ok_or_else(|| format!("令牌行缺冒号: {line}"))?;
+            let name = name.trim().to_string();
+            if !name.is_empty() {
+                // ⚠ 条件式是 `dark ? 暗 : 浅`：`?` 之前是**条件**，暗值在 `?` 之后。
+                // 故先切 `?` 校验形状，再在其余部分切出两个分支。
+                let (_, branches) = val
+                    .split_once('?')
+                    .ok_or_else(|| format!("令牌 {name} 没有明暗条件（期望 `dark ? 暗 : 浅`）: {line}"))?;
+                let (dark_side, light_side) = branches
+                    .split_once(':')
+                    .ok_or_else(|| format!("令牌 {name} 的分支缺冒号（期望 `dark ? 暗 : 浅`）: {line}"))?;
+                let (dark, light) = (
+                    hex(dark_side).ok_or_else(|| format!("{name} 的暗色侧不是 hex: {line}"))?,
+                    hex(light_side).ok_or_else(|| format!("{name} 的浅色侧不是 hex: {line}"))?,
+                );
+                out.push((name, dark, light));
+            }
+        }
+        if out.is_empty() {
+            return Err("一个令牌都没解析出来".into());
+        }
+        Ok(out)
+    }
+
+    fn palette() -> BTreeMap<String, (String, String)> {
+        let mut m = BTreeMap::new();
+        for (n, d, l) in parse_palette().expect("解析 ui/app.slint 令牌失败") {
+            m.insert(n, (d, l));
+        }
+        m
+    }
+
+    fn lin(c: f64) -> f64 {
+        if c <= 0.03928 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+    }
+
+    /// 返回 (r, g, b, alpha)，alpha 为 1.0 表示不透明。
+    fn rgba(hex: &str) -> (u8, u8, u8, f64) {
+        let h = hex.trim_start_matches('#');
+        let ch = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).expect("hex 解析");
+        let a = if h.len() == 8 { ch(6) as f64 / 255.0 } else { 1.0 };
+        (ch(0), ch(2), ch(4), a)
+    }
+
+    fn lum(hex: &str) -> f64 {
+        let (r, g, b, _) = rgba(hex);
+        0.2126 * lin(r as f64 / 255.0) + 0.7152 * lin(g as f64 / 255.0) + 0.0722 * lin(b as f64 / 255.0)
+    }
+
+    fn contrast(a: &str, b: &str) -> f64 {
+        let (la, lb) = (lum(a), lum(b));
+        let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// 把带 alpha 的 fg 合成到不透明 bg 上，返回不透明 hex。
+    fn over(fg: &str, bg: &str) -> String {
+        let (fr, fg_, fb, a) = rgba(fg);
+        let (br, bg_, bb, _) = rgba(bg);
+        let mix = |f: u8, b: u8| (f as f64 * a + b as f64 * (1.0 - a)).round() as u8;
+        format!("#{:02X}{:02X}{:02X}", mix(fr, br), mix(fg_, bg_), mix(fb, bb))
+    }
+
+    /// 文字类令牌：两套主题都必须过门槛。背景取 **canvas**（各自主题里最不利的
+    /// 那个面）。门槛见规格 §4.3：正文 4.5，小字标签 3.0。
+    #[test]
+    fn both_palettes_meet_text_contrast_bars() {
+        let p = palette();
+        let (c_dark, c_light) = p.get("canvas").expect("缺 canvas 令牌").clone();
+        let bars: [(&str, f64); 9] = [
+            ("ink", 4.5),
+            ("ink-2", 4.5),
+            ("ink-3", 4.5),
+            ("ink-4", 3.0),
+            ("accent", 4.5),
+            ("accent-ink", 4.5),
+            ("good", 4.5),
+            ("warn", 4.5),
+            ("danger", 4.5),
+        ];
+        for (name, bar) in bars {
+            let (d, l) = p.get(name).unwrap_or_else(|| panic!("缺 {name} 令牌")).clone();
+            let rd = contrast(&d, &c_dark);
+            let rl = contrast(&l, &c_light);
+            assert!(rd >= bar, "暗色 {name}={d} on {c_dark} 只有 {rd:.2}，需 >= {bar}");
+            assert!(rl >= bar, "浅色 {name}={l} on {c_light} 只有 {rl:.2}，需 >= {bar}");
+        }
+    }
+
+    /// α 档令牌：合成到各自 canvas 后必须仍然可辨。数值门槛取自规格 §4.3 表格。
+    #[test]
+    fn translucent_tiers_stay_visible_in_both_palettes() {
+        let p = palette();
+        let (c_dark, c_light) = p.get("canvas").expect("缺 canvas 令牌").clone();
+        let bars: [(&str, f64); 11] = [
+            ("shell", 1.005),
+            ("hairline", 1.02),
+            ("hairline-soft", 1.01),
+            ("hairline-strong", 1.10),
+            ("fill", 1.01),
+            ("fill-hover", 1.02),
+            ("fill-active", 1.05),
+            ("sunk", 1.015),
+            ("accent-fill", 1.02),
+            ("accent-line", 1.10),
+            ("glow-brand", 1.01),
+        ];
+        for (name, bar) in bars {
+            let (d, l) = p.get(name).unwrap_or_else(|| panic!("缺 {name} 令牌")).clone();
+            for (label, val, bg) in [("暗色", &d, &c_dark), ("浅色", &l, &c_light)] {
+                let comp = over(val, bg);
+                let r = contrast(&comp, bg);
+                assert!(
+                    r >= bar,
+                    "{label} {name}={val} 合成到 {bg} 得 {comp}，只有 {r:.3}，需 >= {bar}"
+                );
+            }
+        }
     }
 }
