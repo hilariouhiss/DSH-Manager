@@ -1166,56 +1166,78 @@ pub fn spawn_watcher(tx: std::sync::mpsc::Sender<crate::model::UiMsg>) {
         .collect();
 
     std::thread::spawn(move || {
-        // 事件对象建一次、每轮复用；键句柄每轮开关（生命周期短且成对，避免长期持有）
+        // 事件对象建一次、整轮复用（manual reset，故每次等待后必须 ResetEvent）
         let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
         if event.is_null() {
             return;
         }
+
+        // ⚠⚠ 键句柄必须**整轮持有**，**绝不能每轮开关**。
+        //
+        // MSDN（RegNotifyChangeKeyValue 的 Remarks）原话：
+        //   "If the specified key is closed, the event is signaled."
+        //   "an application should not depend on the key being open after returning
+        //    from a wait operation on the event."
+        //
+        // 于是"开键 → 武装 → 读值 → **关掉键** → WaitForSingleObject(INFINITE)"这个顺序里，
+        // 关掉键这一步本身就把事件置位了，那个 INFINITE 等待**每轮都立刻返回** ——
+        // 循环退化成满速自旋。Task 6 评审用探针实测：`WaitForSingleObject(ev, 0)`
+        // 在关关键之前是 258(WAIT_TIMEOUT)、关掉之后立刻是 0(WAIT_OBJECT_0)，20/20 次。
+        //
+        // 自旋的后果不止是烧 CPU：它以极高频率向无界 mpsc 灌 SystemThemeChanged，
+        // 每条都让 `drain` 置 changed=true → 每 80ms 全量 project() 一次（违反 NFR-4 的空闲近零 CPU）；
+        // 且 `drain` 的排空循环可能永远看不到 Empty → timer 回调不返回 → UI 冻结 + 队列无界增长。
+        //
+        // MSDN 自己的示例也是"开键 → 武装 → 等 → 最后才关注"，本函数照此办理：
+        // 键在整轮循环里保持打开，只在退出时关闭。
+        //
+        // ⚠ 另一条 MSDN 约束："Each time a process calls RegNotifyChangeKeyValue with the same
+        // set of parameters, it establishes another wait operation, creating a resource leak."
+        // 故**必须**等上一轮等待结束后再重新武装 —— 本循环的次序（武装→读→发→等→复位）保证了这点，
+        // 不要在等待之前重新武装。
+        //
+        // 键打不开（极罕见）：退避后重试，不要永久放弃跟随主题。
+        let hkey: HKEY = loop {
+            let mut h: HKEY = std::ptr::null_mut();
+            if unsafe {
+                RegOpenKeyExW(HKEY_CURRENT_USER, sub.as_ptr(), 0, KEY_READ | KEY_NOTIFY, &mut h)
+            } == 0
+            {
+                break h;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        };
+
         loop {
-            unsafe {
-                let mut hkey: HKEY = std::ptr::null_mut();
-                if RegOpenKeyExW(HKEY_CURRENT_USER, sub.as_ptr(), 0, KEY_READ | KEY_NOTIFY, &mut hkey)
-                    != 0
-                {
-                    // 键打不开（极罕见）：退避后重试，不要退化成忙等。
-                    // ⚠ 这里**不能 return** —— 那是"永久放弃跟随主题"，而且与下面
-                    // `armed != 0` 分支的处理自相矛盾（那个分支是 sleep 后 continue）。
-                    // 事件对象要留着：重试的是"开键"，不是"重造事件"。
-                    std::thread::sleep(std::time::Duration::from_secs(30));
-                    continue;
-                }
-                // ① 先武装（异步：立即返回，变更时置位 event）
-                let armed = RegNotifyChangeKeyValue(
-                    hkey,
-                    1, // bWatchSubtree
-                    REG_NOTIFY_CHANGE_LAST_SET,
-                    event,
-                    1, // fAsynchronous = TRUE
-                );
-                // ② 再读值 —— 此刻之后发生的任何变更都会置位 event，不会丢
-                let dark = system_dark();
-                RegCloseKey(hkey);
-                if armed != 0 {
-                    // 武装失败：无法可靠监视，退化为定时重读（仍然不丢，只是有延迟）
-                    if tx.send(crate::model::UiMsg::SystemThemeChanged(system_dark())).is_err() {
-                        CloseHandle(event);
-                        return;
-                    }
-                    std::thread::sleep(std::time::Duration::from_secs(5));
-                    continue;
-                }
+            // ① 先武装（异步：立即返回，变更时置位 event）
+            let armed = unsafe {
+                RegNotifyChangeKeyValue(hkey, 1, REG_NOTIFY_CHANGE_LAST_SET, event, 1)
+            };
+            // ② 再读值 —— 此刻之后发生的任何变更都会置位 event，不会丢。
+            // 反之也成立：即便某个变更落在"上一轮等待返回"到"本轮武装"之间、
+            // 因而不会触发事件，紧接着的这次读取也已经把它读进来了。
+            let dark = system_dark();
+            if armed != 0 {
+                // 武装失败：无法可靠监视，退化为定时重读（仍然不丢，只是有延迟）。
+                // 注意此时**没有**建立等待操作，故 continue 后重新武装不会造成 MSDN 说的泄漏。
                 if tx.send(crate::model::UiMsg::SystemThemeChanged(dark)).is_err() {
-                    // UI 线程已退出
-                    CloseHandle(event);
+                    unsafe { RegCloseKey(hkey); CloseHandle(event); }
                     return;
                 }
-                // ③ 等下一次变更
-                let w = WaitForSingleObject(event, INFINITE);
-                ResetEvent(event);
-                if w != WAIT_OBJECT_0 {
-                    CloseHandle(event);
-                    return;
-                }
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                continue;
+            }
+            if tx.send(crate::model::UiMsg::SystemThemeChanged(dark)).is_err() {
+                // UI 线程已退出
+                unsafe { RegCloseKey(hkey); CloseHandle(event); }
+                return;
+            }
+            // ③ 等下一次变更。⚠ 键此刻**仍然开着** —— 这是本函数能真正阻塞、而不是空转的前提。
+            let w = unsafe { WaitForSingleObject(event, INFINITE) };
+            unsafe { ResetEvent(event) };
+            if w != WAIT_OBJECT_0 {
+                unsafe { RegCloseKey(hkey); CloseHandle(event); }
+                return;
             }
         }
     });
@@ -1260,13 +1282,23 @@ pub fn spawn_watcher(_tx: std::sync::mpsc::Sender<crate::model::UiMsg>) {}
 ⚠ `msg_tx` 要换成 `main()` 里**实际的** sender 变量名（`drain` 读的那个通道的发送端）——
 先读代码确认，不要照抄这里的名字。
 
-⚠ **副作用，必须知道**：监视线程为进程生命周期持有一个 `Sender<UiMsg>`，于是
-`msg_rx.try_recv()` **再也不会**返回 `Disconnected` —— `drain()` 里 §5.2 那条
-"worker 已死"兜底分支与 `worker_dead` 闩锁从此不可达。
+⚠ **副作用，必须知道**：监视线程持有一个 `Sender<UiMsg>`，于是只要它活着，
+`msg_rx.try_recv()` 就**不会**返回 `Disconnected` —— `drain()` 里 §5.2 那条
+"worker 已死"兜底分支与 `worker_dead` 闩锁因此（在监视线程存活期间）不可达。
 采纳理由见 Ruling 18：Ruling 83 已经判定那条兜底本来就不可靠（`dsh web` 运行时同样接不住），
 并把真正的保护换成了 `catch_unwind` + 显式 `Log`/`Failed`；那个保护不受本改动影响。
-代码里两处"兜底有效"的旧说法要改成事实描述，**但分支与闩锁都保留**
-（监视线程若 panic，其 sender 随之释放，该分支仍可能重新可达）。
+
+⚠ **注释要写准，不要写成"已永久不可达"**：监视线程有两条早退路径会丢弃 `tx`
+（`CreateEventW` 失败、等待失败），此后所有发送端都没了，该分支**重新变得可达**。
+所以分支与闩锁**都保留**。需要改的是**三处**旧说法，全部改成上述带条件的事实描述：
+1. `main()` 里启动监视的调用点（说明为什么在这里启动、Task 8 不要再加第二个）；
+2. `drop(msg_tx)` 附近那段"兜底有效"的旧论述；
+3. **`drain()` 的 `Disconnected` 分支自己的注释** —— 它仍把该闩锁描述成守着一条活跃路径，
+   完全没提监视线程持有 sender 这件事（Task 6 评审 M3）。
+
+⚠ 另外把 `src/theme.rs` 里非 Windows 桩上那句"Task 6 的监视器是它的消费者"改掉：
+那个桩是空实现、根本不调 `system_dark()`；真正的无条件消费者是
+`AppState::new` 里的 `system_dark: theme::system_dark()`（评审 M6）。
 
 - [ ] **Step 7: 编译、测试、提交**
 
