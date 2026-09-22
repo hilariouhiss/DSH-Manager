@@ -1007,7 +1007,10 @@ pub fn system_dark() -> bool {
 }
 ```
 
-在 `src/theme.rs` 顶部加 `#[cfg(windows)] use std::os::windows::ffi::OsStrExt;`。
+⚠ **不要**再加 `#[cfg(windows)] use std::os::windows::ffi::OsStrExt;`。本计划初稿要求加它，是因为
+`registry_dark()` 里有两个 `encode_wide()` 调用 —— 而 `registry_dark()` 已按 Ruling 17 删除，
+这行 import 于是没有使用者，加进去会**实测**产生 `warning: unused import`（1 条），直接违反 0 警告规则。
+Task 5 实测后删除该行并在原位留了说明。若 Task 6 的通知路径需要宽字符串，**届时**再按需引入。
 
 ⚠ 三处需要核实后可能要微调（`windows-sys` 0.61 的签名细节）：`c"uxtheme.dll"` 需要 Rust 2021+ 的 C 字符串字面量（本仓库 edition 2024，可用）；`(&raw mut x).cast()` 需要 Rust 1.82+。若 `HIGHCONTRASTW` 的字段名不符，查 `windows-sys-0.61.2/src/Windows/Win32/UI/Accessibility/mod.rs` 后按其定义写。
 
@@ -1021,7 +1024,13 @@ Task 6，所以本步落地后 `cargo build` 会报若干条 dead_code（`system
 同时 **`#[cfg(not(windows))]` 的那个桩也要各加一处**：它没有任何消费者，非 Windows 构建同样会因
 0 警告规则而红，而保留该桩的全部意义就是让别处也能编译。这也是一处 allow，不是 blanket。
 
-⚠ 加了这一组 `use`（`OsStrExt`）之后，文件里既有抑制的行号会整体下移 —— 引用它们时**一律用 grep，不要用行号**。
+⚠ 文件里既有的 `#[allow(dead_code)]` 行号会随每次改动漂移（Task 5 落地后实测为 **6 处**：
+`ThemeMode` / `impl ThemeMode` / `resolve` / `PERSONALIZE_KEY` / `system_dark` / 非 Windows 桩）。
+引用它们时**一律用 grep，不要用行号**。
+
+⚠ **顺序约束**：Task 9 删抑制必须发生在 **Task 6 与 Task 8 之后** —— Task 1 那三处抑制的消费者正是
+Task 2 / 6 / 8，提前删会让那些符号重新变成 dead_code 而报错。Task 9 是最后一个任务，天然满足；
+若将来调整任务顺序，这条要一起看。
 
 - [ ] **Step 5: 运行测试确认通过**
 
