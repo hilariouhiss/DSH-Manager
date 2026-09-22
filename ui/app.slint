@@ -1542,17 +1542,44 @@ export component MainWindow inherits Window {
                         }
                     }
                     // 骨架屏：形状与正文一致，比转圈的 spinner 更少突兀
+                    //
+                    // ⚠ `preferred-height: 100%` 这一条是**修跳动的关键**，别删。
+                    // 本卡的高度是**由内容顶出来的**（见 Bezel 的注释："高度取内容自然
+                    // 高度 → Rectangle 反过来由它定高"），调用点那个 `vertical-stretch: 1`
+                    // 顶不动它。于是三种状态各自的"内容想多高"就决定了卡片多高：
+                    //   · 正文态：内容是 std 的 ScrollView，它自带 `preferred-height: 100%`
+                    //     → 卡片顶到整列全高；
+                    //   · 骨架屏/空状态：内容只有几根写死高度的条 → 卡片只剩 `min-height`
+                    //     （260px）。
+                    // 实测：同一块区域加载期 260px、说明到位后 ~700px —— 启动过程中先矮
+                    // 后高地跳一下（用户报的）。三条状态统一"想占满"就没有这一跳了。
                     if root.notes-loading : VerticalLayout {
+                        preferred-height: 100%;
                         padding-left: 4px;
                         spacing: 9px;
                         Rectangle { height: 11px; width: 62%; border-radius: 5px; background: Tokens.hairline-soft; }
                         Rectangle { height: 11px; width: 88%; border-radius: 5px; background: Tokens.hairline-soft; }
                         Rectangle { height: 11px; width: 74%; border-radius: 5px; background: Tokens.hairline-soft; }
                         Rectangle { height: 11px; width: 41%; border-radius: 5px; background: Tokens.hairline-soft; }
+                        // 撑杆：几根骨架条留在顶部，但**容器自己**占满卡片高度。
+                        // 没有它，上面那条 preferred-height 只是"想更高"，布局不会真给。
+                        //
+                        // ⚠ 试过、并**否掉**的两种"填满 700px 高卡片"的做法（都实测过）：
+                        //   · 下面垫一块渐隐的实心矩形 → 顶上一条全宽的硬边 + 均匀亮度，
+                        //     看着就是一块矩形污渍，不像正文（截图 target/crop-v2.png）；
+                        //   · 循环生成几十根条 → 条数写死就适应不了任何窗口高度：
+                        //     多了会把卡片顶高（又跳一次），少了照样填不满。
+                        // 正文态本来就是"从顶到底一整块密排文字"，而加载态只持续到
+                        // 网络抓完说明（本机通常是几百毫秒）—— 为这几百毫秒做一块
+                        // 假正文不值。骨架条 + 标题里的"· 加载中…"已经说清楚了。
+                        Rectangle { vertical-stretch: 1; }
                     }
                     // 空状态：该版本没有说明，说清楚而不是留一片白
+                    // ⚠ 同样写 preferred-height：否则从"加载中"切到"没有说明"时卡片
+                    // 会再缩回去一次 —— 那就把刚修掉的跳动换个时机又演一遍。
                     if root.notes-status == NotesStatus.missing
                     || root.notes-status == NotesStatus.failed : VerticalLayout {
+                        preferred-height: 100%;
                         alignment: center;
                         Text {
                             text: root.notes-status == NotesStatus.missing
