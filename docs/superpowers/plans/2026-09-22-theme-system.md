@@ -1177,10 +1177,12 @@ pub fn spawn_watcher(tx: std::sync::mpsc::Sender<crate::model::UiMsg>) {
                 if RegOpenKeyExW(HKEY_CURRENT_USER, sub.as_ptr(), 0, KEY_READ | KEY_NOTIFY, &mut hkey)
                     != 0
                 {
-                    // 键打不开（极罕见）：退避后重试，不要退化成忙等
-                    CloseHandle(event);
+                    // 键打不开（极罕见）：退避后重试，不要退化成忙等。
+                    // ⚠ 这里**不能 return** —— 那是"永久放弃跟随主题"，而且与下面
+                    // `armed != 0` 分支的处理自相矛盾（那个分支是 sleep 后 continue）。
+                    // 事件对象要留着：重试的是"开键"，不是"重造事件"。
                     std::thread::sleep(std::time::Duration::from_secs(30));
-                    return;
+                    continue;
                 }
                 // ① 先武装（异步：立即返回，变更时置位 event）
                 let armed = RegNotifyChangeKeyValue(
@@ -1240,7 +1242,33 @@ pub fn spawn_watcher(_tx: std::sync::mpsc::Sender<crate::model::UiMsg>) {}
     }
 ```
 
-- [ ] **Step 6: 编译、测试、提交**
+- [ ] **Step 6: 在 `main()` 里启动监视（本步属 Task 6，不留给 Task 8）**
+
+⚠ 本步**必须**在 Task 6 内完成，否则 `cargo build` 会报 **2 条** dead_code
+（`UiMsg::SystemThemeChanged` 无人构造、`spawn_watcher` 无人使用），0 警告规则无法达成。
+计划初稿把它放在 Task 8 Step 3 —— 那是错的（Task 6 实测指出）。
+
+在 `main()` 里、**`Timer` 启动之前**加（顺序理由：先起监视，保证启动瞬间到事件循环就绪之间的
+系统主题变化不丢）：
+
+```rust
+    // 系统主题监视。⚠ 必须在 `run()` 与 Timer 之前起。
+    // ⚠ **只此一处**：再起一个会重复武装同一个键并重复发消息。
+    theme::spawn_watcher(msg_tx.clone());
+```
+
+⚠ `msg_tx` 要换成 `main()` 里**实际的** sender 变量名（`drain` 读的那个通道的发送端）——
+先读代码确认，不要照抄这里的名字。
+
+⚠ **副作用，必须知道**：监视线程为进程生命周期持有一个 `Sender<UiMsg>`，于是
+`msg_rx.try_recv()` **再也不会**返回 `Disconnected` —— `drain()` 里 §5.2 那条
+"worker 已死"兜底分支与 `worker_dead` 闩锁从此不可达。
+采纳理由见 Ruling 18：Ruling 83 已经判定那条兜底本来就不可靠（`dsh web` 运行时同样接不住），
+并把真正的保护换成了 `catch_unwind` + 显式 `Log`/`Failed`；那个保护不受本改动影响。
+代码里两处"兜底有效"的旧说法要改成事实描述，**但分支与闩锁都保留**
+（监视线程若 panic，其 sender 随之释放，该分支仍可能重新可达）。
+
+- [ ] **Step 7: 编译、测试、提交**
 
 Run: `cargo build 2>&1 | tail -5` → Expected: `Finished`，0 警告。
 Run: `cargo test 2>&1 | tail -6` → Expected: 全绿。
@@ -1409,15 +1437,8 @@ Expected: 仍是 Step 2 里那条 `non-exhaustive patterns`（Task 8 待办）�
 
 `AppState::new` 调用处补第三个实参：`AppState::new(preferred_port, close_behavior, theme_mode)`。
 
-**在 `Timer` 启动之前**加监视（顺序理由：先起监视，保证启动瞬间到事件循环就绪之间的系统主题变化不丢）：
-
-```rust
-    // 系统主题监视。⚠ 必须在 `run()` 之前起 —— 否则启动瞬间到事件循环就绪
-    // 之间的变更会丢。消息走既有 UiMsg 通道，由 80ms timer 排空。
-    theme::spawn_watcher(msg_tx_for_theme.clone());
-```
-
-`msg_tx_for_theme` 用既有的 worker→UI 发送端克隆（`drain` 用的那一个）。**执行时先读 `main()` 里该 sender 的实际变量名**，不要照抄这里的占位名。
+> ⚠ **本任务不要再启动监视** —— `theme::spawn_watcher` 已在 Task 6 Step 6 落地，
+> 位置就在 Timer 之前。重复启动会重复武装同一个注册表键并重复发消息。
 
 **首帧之前把初始主题推下去**（否则首帧会用 `Tokens.dark` 的声明缺省 `true`，在浅色系统上闪一下）：
 
