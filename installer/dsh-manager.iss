@@ -49,7 +49,10 @@ PrivilegesRequiredOverridesAllowed=commandline dialog
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir={#RepoRoot}dist
-OutputBaseFilename=dsh-manager-{#AppVersion}-setup
+; ⚠ 发布物名字是**英文 + 说明平台**：本安装包只装 x64（见上面 ArchitecturesAllowed），
+; 而 `v{#AppVersion}` 里的 `v` 与 git tag 逐字一致 —— 更新器（FR-38/FR-39）就是按
+; 这个名字去 Release 里找资产的，改名等于让老版本的自动更新失效。
+OutputBaseFilename=dsh-manager-v{#AppVersion}-windows-x64-setup
 SetupIconFile={#IconFile}
 UninstallDisplayIcon={app}\{#AppExeName}
 Compression=lzma2/max

@@ -57,11 +57,11 @@
 
 ## 安装
 
-从 [Releases](https://github.com/hilariouhiss/DSH-Manager/releases) 下载 `dsh-manager-<版本>-setup.exe` 双击安装（Inno Setup 6）：
+从 [Releases](https://github.com/hilariouhiss/DSH-Manager/releases) 下载 `dsh-manager-v<版本>-windows-x64-setup.exe` 双击安装（Inno Setup 6）：
 
 - 缺省**仅为当前用户**安装到 `%LOCALAPPDATA%\Programs\DSH Manager`，全程不弹 UAC；向导里可以改成"为所有用户安装"并自定义目录。
 - 卸载项与桌面快捷方式（可选）齐备；安装包**不碰** `%APPDATA%\dsh-manager\` 下的配置，升级与卸载都不会毁掉你的端口、主题与代理设置。
-- 同一 Release 里还有免安装的 `dsh-manager.exe` 与 `SHA256SUMS.txt`。
+- 同一 Release 里还有免安装的 `dsh-manager-v<版本>-windows-x64.exe`（单文件、拷走就能跑）与 `SHA256SUMS.txt`。
 
 ### 系统要求
 
@@ -94,7 +94,7 @@ cargo test                     # 单元测试
 
 ```powershell
 & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\dsh-manager.iss
-# → dist\dsh-manager-<版本>-setup.exe
+# → dist\dsh-manager-v<版本>-windows-x64-setup.exe
 ```
 
 **版本号只写一次**，在 `Cargo.toml`：`build.rs` 把它注入 exe 的 `VS_VERSION_INFO`，`.iss` 再用 `GetFileVersionString()` 从 exe 读回来 ⇒ `Cargo.toml` → exe → 安装包三者不可能漂移。
@@ -115,7 +115,7 @@ git push origin main --tags
 2. 校验 **tag 与 `Cargo.toml` 版本一致**（不一致立即失败，不浪费一次构建）；
 3. `cargo build --locked --release`，并校验 exe 的 `FileVersion` 与 tag 一致（防"没嵌上版本资源"）；
 4. 编译安装包，生成 `SHA256SUMS.txt`；
-5. `gh release create` 建 Release（正文取注解 tag 的说明），附上 `dsh-manager.exe`、`dsh-manager-<版本>-setup.exe`、`SHA256SUMS.txt`（含 `-` 的 tag 自动标为 prerelease）。
+5. 把免安装 exe 复制成 `dsh-manager-v<版本>-windows-x64.exe`，连同安装包与 `SHA256SUMS.txt` 一起附到 `gh release create` 建出的 Release 上（正文取注解 tag 的说明；含 `-` 的 tag 自动标为 prerelease）。
 
 日常 CI（[`ci.yml`](.github/workflows/ci.yml)）在 push 到 `main` 与 PR 上跑 `cargo test --locked`。
 

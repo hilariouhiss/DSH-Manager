@@ -79,11 +79,22 @@ jobs:
           if (-not (Get-Command ISCC.exe -ErrorAction SilentlyContinue)) { choco install innosetup -y --no-progress }
           ISCC.exe installer\dsh-manager.iss
 
+      # 资产名取**文件名**（gh 的 `#label` 只改显示标签，下载下来仍是原名），
+      # 所以免安装 exe 先复制成带版本与平台的名字再上传 —— 名字要在 Release 页上
+      # 一眼看出"哪个版本、哪个平台"，更新器也按这个名字找安装包。
+      - name: 整理发布物名字
+        run: |
+          $v = $env:GITHUB_REF_NAME.TrimStart('v')
+          $setup = "dist\dsh-manager-v$v-windows-x64-setup.exe"
+          if (-not (Test-Path $setup)) { throw "没生成 $setup —— 安装包编译失败或版本号对不上" }
+          Copy-Item target\release\dsh-manager.exe "dist\dsh-manager-v$v-windows-x64.exe" -Force
+          Get-ChildItem dist | Select-Object Name, Length | Format-Table -AutoSize
+
+      # 只哈希本次这两个文件：`dist\*.exe` 在本机会把旧版本一起算进去
       - name: 生成校验和
         run: |
-          $setup = "dist\dsh-manager-$($env:GITHUB_REF_NAME.TrimStart('v'))-setup.exe"
-          if (-not (Test-Path $setup)) { throw "没生成 $setup —— 安装包编译失败或版本号对不上" }
-          Get-FileHash target\release\dsh-manager.exe, $setup -Algorithm SHA256 |
+          $v = $env:GITHUB_REF_NAME.TrimStart('v')
+          Get-FileHash "dist\dsh-manager-v$v-windows-x64.exe", "dist\dsh-manager-v$v-windows-x64-setup.exe" -Algorithm SHA256 |
             ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } |
             Set-Content dist\SHA256SUMS.txt
           Get-Content dist\SHA256SUMS.txt
@@ -104,6 +115,6 @@ jobs:
           # 带 `-` 的 tag 标成 prerelease，免得它被 GitHub 当成 Latest release
           if ($tag -match '-') { $ghArgs += '--prerelease' }
           gh release create @ghArgs `
-            "target\release\dsh-manager.exe#免安装可执行文件" `
-            "dist\dsh-manager-$v-setup.exe#安装包（Inno Setup）" `
+            "dist\dsh-manager-v$v-windows-x64.exe" `
+            "dist\dsh-manager-v$v-windows-x64-setup.exe" `
             "dist\SHA256SUMS.txt"
