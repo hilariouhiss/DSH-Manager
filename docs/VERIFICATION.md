@@ -900,6 +900,34 @@ local 0.3.0 → 已是最新
 
 三条都有信息量：**①** 真机取到了 `releases/latest`（代理、UA、JSON 全通）；**②** 相等与更旧都判为"已是最新"（严格大于的判据在真数据上成立）；**③** 第一条正是**想要**的响亮失败 —— v0.2.1 是用旧资产名发布的，于是"名字对不上"以精确的 `Err` 暴露出来，而不是被吞成"已是最新"。
 
+### 7.2b 发布之后复验（2026-09-23，v0.3.0 已上线）
+
+§7.2 那三条是**发布前**跑的（那时最新 release 还是 v0.2.1）。v0.3.0 发布后按同一配方再跑一遍，
+这次才是真正的端到端：更新器能不能看到**我们自己刚发的那个 release**。
+
+```text
+local 0.1.0 → 有新版本 0.3.0 | setup=dsh-manager-v0.3.0-windows-x64-setup.exe | api_host=true | sums=true
+local 0.2.1 → 有新版本 0.3.0 | setup=dsh-manager-v0.3.0-windows-x64-setup.exe | api_host=true | sums=true
+local 0.3.0 → 已是最新
+```
+
+**FR-39 的校验链也在真实发布物上跑通了**（同一临时用例，跑完即删）：
+
+```text
+certutil 实算 = 66be154564d24d59f8013599fdb06101fb0c1e4e6ad1fcd4004348ac6c0a9950
+发布物声明  = 66be154564d24d59f8013599fdb06101fb0c1e4e6ad1fcd4004348ac6c0a9950
+```
+
+即 `sha256_file`（真的起了 `certutil.exe` 进程并解析其输出）与 `parse_sha256sums`
+（解析 release 里那份 `SHA256SUMS.txt`）给出**同一个**哈希 —— 这一条之前只有单测覆盖
+（单测用的是夹具），现在有真进程 + 真发布物的证据。发布物本身的核对：
+
+| 资产 | 大小 | 核对 |
+|---|---|---|
+| `dsh-manager-v0.3.0-windows-x64-setup.exe` | 8 719 847 | SHA256 与 `SHA256SUMS.txt` 逐字符一致；`ProductVersion=0.3.0`、`FileVersion=0.3.0.0` |
+| `dsh-manager-v0.3.0-windows-x64.exe` | 17 186 304 | 与 `SHA256SUMS.txt` 一致（免安装副本） |
+| `SHA256SUMS.txt` | 210 | 两行、文件名与资产名逐字一致 |
+
 ### 7.3 离屏探针（`target/ui-probe-update/`，配方同 §2.4）
 
 复用 §2.4 的一次性探针配方（新开一个 `target/` 下的独立包，`build.rs` 编译**真实的** `ui/app.slint`），量本轮新增的两处界面：
