@@ -1341,6 +1341,16 @@ export component MainWindow inherits Window {
     /// 纯 UI 状态：菜单开着的时候只可能有一个，用一个 int 比两个 bool 少一半状态。
     in-out property <int> open-menu: 0;
 
+    // ── 本程序自己的更新（FR-38 / FR-39）──
+    /// 有没有比当前版本新的 release。驱动顶栏徽标**与**弹框的显示。
+    in property <bool> update-available: false;
+    /// 新版本号（不带 `v`，如 `0.3.0`）。Rust 侧填好，不在 Slint 里解析字符串。
+    in property <string> update-version: "";
+    /// 更新弹框是否可见。
+    /// ⚠ **唯一写入方是 Rust**（Slint 侧只调回调、不直接改它）：两边都写的话，
+    /// 用户关掉之后的下一次 `project()` 会把它推回来，表现为"关不掉的弹框"。
+    in-out property <bool> update-prompt-visible: false;
+
     callback install-clicked();
     callback version-changed(int);
     callback refresh-clicked();
@@ -1376,6 +1386,19 @@ export component MainWindow inherits Window {
     /// （停掉自己启动的 dsh web 再退出事件循环），所以不经过"关闭时的行为"那一问。
     callback quit-app();
     callback link-clicked(string);
+
+    // ── 本程序自己的更新（FR-38 / FR-39）──
+    /// 顶栏徽标被点击 → 把更新弹框叫回来（本会话关过也照样给）。
+    callback update-badge-clicked();
+    /// 帮助 →〔检查更新〕。手动检查与启动时自动检查的区别只在 Rust 侧：
+    /// 前者失败要在状态栏说话，后者只进日志。
+    callback check-update-clicked();
+    /// 〔以后再说〕：只关框，下次启动还会提示。
+    callback update-later-clicked();
+    /// 〔忽略此版本〕：记进 state.json，该版本不再自动弹框（徽标仍在）。
+    callback update-skip-clicked();
+    /// 〔下载并安装〕：下载 → 校验 → 启动安装向导 → 本程序退出（保留 dsh web）。
+    callback update-download-clicked();
 
     // ═══ 派生量（纯展示推导，不引入新状态）═══
     // "检测中…" 是 project() 在探测完成前写入的哨兵值；用它区分"还没检测"与
@@ -1415,20 +1438,40 @@ export component MainWindow inherits Window {
         //
         // ⚠ `alignment: start` 是必须的：默认对齐会把富余宽度摊给每一项（实测把
         // 图标按钮撑到 121px），两个菜单标题会被拉成两根长条。
+        //
+        // ⚠ 所以"把更新徽标顶到最右"**不能**靠在同一条 `alignment: start` 的布局里
+        // 加一根 stretch 占位条：start/center/end 下 stretch 因子不生效，徽标会紧贴着
+        // 「帮助」落在左上角（离屏探针实测 diff bbox `x 118..230`，正好压在那团氛围光上）。
+        // 做法改成外面再套一层默认（stretch）布局：里层放菜单、自己 start 对齐，
+        // 外层把富余宽度整份给里层，徽标自然落到最右。
         HorizontalLayout {
             height: 30px;
             spacing: 4px;
-            alignment: start;
 
-            file-menu := MenuTitle {
-                label: "文件";
-                open: root.open-menu == 1;
-                toggled => { root.open-menu = root.open-menu == 1 ? 0 : 1; }
+            HorizontalLayout {
+                horizontal-stretch: 1;
+                spacing: 4px;
+                alignment: start;
+
+                file-menu := MenuTitle {
+                    label: "文件";
+                    open: root.open-menu == 1;
+                    toggled => { root.open-menu = root.open-menu == 1 ? 0 : 1; }
+                }
+                help-menu := MenuTitle {
+                    label: "帮助";
+                    open: root.open-menu == 2;
+                    toggled => { root.open-menu = root.open-menu == 2 ? 0 : 2; }
+                }
             }
-            help-menu := MenuTitle {
-                label: "帮助";
-                open: root.open-menu == 2;
-                toggled => { root.open-menu = root.open-menu == 2 ? 0 : 2; }
+
+            // 顶栏右侧的更新徽标（FR-38）。复用 ChipButton，只把 min-height 从缺省的
+            // 32px 压到 22px —— 32px 在这个 30px 高的菜单行里会把它撑出格。
+            if root.update-available : ChipButton {
+                label: "有新版本 v" + root.update-version;
+                accent: true;
+                min-height: 22px;
+                clicked => { root.update-badge-clicked(); }
             }
         }
 
@@ -2013,7 +2056,11 @@ export component MainWindow inherits Window {
     if root.open-menu == 2 : MenuPanel {
         x: help-menu.absolute-position.x;
         y: help-menu.absolute-position.y + help-menu.height + 4px;
-        item-count: 1;
+        item-count: 2;
+        MenuAction {
+            label: "检查更新";
+            picked => { root.open-menu = 0; root.check-update-clicked(); }
+        }
         MenuAction {
             label: "关于 DSH Manager";
             picked => { root.open-menu = 0; root.about-visible = true; }
@@ -2399,6 +2446,99 @@ export component MainWindow inherits Window {
                             root.reinstall-prompt-visible = false;
                             root.reinstall-confirmed();
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    // ═══════════════ 本程序自己的更新（FR-38 / FR-39）═══════════════
+    // 显示与否完全由 Rust 决定（`update-prompt-visible`），包括启动时自动弹的那一次。
+    // ⚠ 四条关闭路径（点遮罩、Esc、右上角 X、〔以后再说〕）**都必须回到 Rust**
+    // （`update-later-clicked()`），不能在 Slint 里直接把属性置假：那样 Rust 侧仍
+    // 以为"要显示"，下一次 `project()` 会把它推回来 —— 表现为"关不掉的弹框"。
+    if root.update-prompt-visible : Rectangle {
+        background: Tokens.overlay;
+        TouchArea { clicked => { root.update-later-clicked(); } }
+        // ⚠ 空壳 FocusScope 必须自己抢焦点，否则 Esc 是死的（同其它弹框，已实测）。
+        FocusScope {
+            init => { self.focus(); }
+            key-pressed(e) => {
+                if (e.text == Key.Escape) { root.update-later-clicked(); return accept; }
+                return reject;
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            cross-axis-alignment: center;
+            Bezel {
+                width: 420px;
+                core-padding: 20px;
+                spacing: 0px;
+
+                HorizontalLayout {
+                    spacing: 10px;
+                    Text {
+                        text: "发现新版本";
+                        color: Tokens.ink;
+                        font-family: Font.display;
+                        font-size: 17px;
+                        font-weight: 600;
+                        letter-spacing: -0.2px;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    CloseButton { clicked => { root.update-later-clicked(); } }
+                }
+                Rectangle { height: 14px; }
+                // 版本号单独一行：`app-version` 与 `update-version` 都是可变长的，
+                // 塞进固定句式里会把句子挤断行（同重装确认框踩过的那个坑）。
+                Text {
+                    text: "当前 v" + root.app-version + "   →   新版本 v" + root.update-version;
+                    color: Tokens.ink;
+                    font-family: Font.mono;
+                    font-size: 12.5px;
+                    wrap: no-wrap;
+                }
+                Rectangle { height: 8px; }
+                Text {
+                    text: "下载完成后会启动安装向导，本程序随之退出以便替换文件。由本程序启动的 dsh web 会保留运行，重启后可在界面里重新认领。";
+                    color: Tokens.ink-2;
+                    font-family: Font.text;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                Rectangle { height: 10px; }
+                // 两个"不装"的档差别必须写出来，否则用户只能靠猜：
+                // 一个是"这次先算了"，另一个是"这个版本别再问了"。
+                Text {
+                    text: "〔以后再说〕下次启动仍会提示；〔忽略此版本〕记下来，不再自动提示 —— 顶栏徽标一直都在，点它可再看。";
+                    color: Tokens.ink-4;
+                    font-family: Font.text;
+                    font-size: 11.5px;
+                    wrap: word-wrap;
+                }
+                Rectangle { height: 18px; }
+                // 强调放在推荐动作上、且它在最右（与其它弹框同一条规则）。
+                HorizontalLayout {
+                    spacing: 9px;
+                    Rectangle { horizontal-stretch: 1; }
+                    PillButton {
+                        label: "以后再说";
+                        show-glyph: false;
+                        clicked => { root.update-later-clicked(); }
+                    }
+                    PillButton {
+                        label: "忽略此版本";
+                        show-glyph: false;
+                        clicked => { root.update-skip-clicked(); }
+                    }
+                    PillButton {
+                        label: "下载并安装";
+                        emphasis: true;
+                        show-glyph: false;
+                        clicked => { root.update-download-clicked(); }
                     }
                 }
             }

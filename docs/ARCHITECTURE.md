@@ -2,9 +2,9 @@
 
 | 项目 | 内容 |
 |---|---|
-| 文档版本 | 1.7 |
-| 日期 | 2026-09-22 |
-| 关联文档 | [docs/SRS.md](SRS.md) v1.4（需求依据） |
+| 文档版本 | 1.8 |
+| 日期 | 2026-09-23 |
+| 关联文档 | [docs/SRS.md](SRS.md) v1.5（需求依据） |
 | 技术栈 | Rust 2024 edition + Slint 1.18 |
 | 状态 | 待实现 |
 
@@ -368,6 +368,11 @@ export component MainWindow inherits Window {
     in property <string>     plugin-remove-name:    "";
     in property <string>     plugin-remove-version: "";
 
+    // ---- 本程序自身的更新（FR-38 / FR-39）----
+    in property <bool>   update-available:      false;  // 驱动顶栏徽标与弹框
+    in property <string> update-version:        "";     // 形如 "0.3.0"（Rust 填好，Slint 不解析）
+    in-out property <bool> update-prompt-visible: false; // ⚠ 唯一写入方是 Rust，见 §4.9.5
+
     // ---- 日志与忙碌态（FR-15、FR-28）----
     in property <[string]> log-lines:        [];
     in property <bool>     busy:             false;       // 版本事务与插件操作**共用**这一道闸门
@@ -408,6 +413,12 @@ export component MainWindow inherits Window {
     callback plugin-remove-confirmed();  // FR-37：确认框里的〔卸载〕→ 才派发
     callback plugin-refresh();
     callback quit-app();
+    // 本程序自身的更新（FR-38 / FR-39）
+    callback update-badge-clicked();     // 顶栏徽标 → 把弹框叫回来
+    callback check-update-clicked();     // 帮助 →〔检查更新〕（手动档）
+    callback update-later-clicked();     // 〔以后再说〕/遮罩/Esc/X：只关框
+    callback update-skip-clicked();      // 〔忽略此版本〕：写进 state.json
+    callback update-download-clicked();  // 〔下载并安装〕
     callback link-clicked(string);       // 来自 StyledText，交给系统浏览器
 }
 
@@ -1285,6 +1296,121 @@ Slint 的属性只能在 UI 线程写。所有 `UiMsg` 都由 UI 线程上那个
 
 ---
 
+### 4.9 本程序自身的更新（FR-38 / FR-39，v1.8 新增）
+
+#### 4.9.1 没有新模块
+
+整套更新只用了既有的四层：`dsh.rs`（网络与子进程）、`model.rs`（`NewRelease` 与两个
+`Job` / 两条 `UiMsg`）、`config.rs`（一栏"忽略过的版本"）、`main.rs`（编排）。
+**不新增文件、不新增依赖** —— 与 FR-33（系统代理）同一取舍：能力是"已有的东西换一种用法"，
+而不是新机制。`certutil.exe` 就是这一取舍的样板：算一次 SHA256 的活，够不上为它引一个
+`sha2`（GC-2 的精神）。
+
+#### 4.9.2 名字是契约：`OutputBaseFilename` ↔ 资产名 ↔ 更新器
+
+安装包的名字**同时**是发布流水线的产物名与更新器的查找键：
+
+```text
+installer/dsh-manager.iss : OutputBaseFilename=dsh-manager-v{#AppVersion}-windows-x64-setup
+.github/workflows/release.yml : 上传的资产名（gh 的资产名 = 文件名，`#label` 改不了它）
+src/dsh.rs : app_setup_asset_name(&Version)  ← 唯一的构造点
+```
+
+三处必须逐字一致。任一处改名，自动更新就**静默失效**（查得到新版本、找不到要下载的东西）。
+所以：① 名字只在 `app_setup_asset_name` 里拼；② 名字对不上时 `parse_app_release` 返回
+**`Err`** 而不是 `Ok(None)` —— 报成"已是最新"会让这个故障**永远隐形**（用户只会以为
+"最近没发新版"）。
+
+⚠ 这条在真实数据上立刻见效：v0.2.1 是用**旧名字**（`dsh-manager-0.2.1-setup.exe`）发布的，
+所以拿 `local = 0.1.0` 去查会得到
+`Err: release v0.2.1 里没有资产 dsh-manager-v0.2.1-windows-x64-setup.exe` —— 正是想要的
+响亮失败，而不是"已是最新"。
+
+#### 4.9.3 数据流
+
+```text
+启动 / 帮助→检查更新
+   Job::CheckAppUpdate { manual }        ← manual 只影响"失败去哪儿说"
+        ↓ worker
+   fetch_app_release(&local_version())   ← 15 s 超时 + FR-33 代理
+        ↓
+   UiMsg::AppUpdate { manual, result }   ← Ok(Some/None) / Err 三分
+        ↓ drain（UI 线程）
+   AppState.app_update / update_prompt_visible / 日志 / 状态栏
+        ↓ project()
+   徽标（update-available + update-version）与弹框（update-prompt-visible）
+
+〔下载并安装〕
+   Job::DownloadAppUpdate { release }    ← 载荷是**已解析**的 release，worker 不重查
+        ↓ worker：下载安装包 → 取 SHA256SUMS.txt → 落盘 %TEMP% → 校验 → launch_setup
+   UiMsg::AppUpdateLaunched { version, path }
+        ↓ drain：置 AppState.quit_keep_web = true
+        ↓ 80 ms timer：take(quit_keep_web) → make_quit(false) → quit_event_loop
+```
+
+**为什么"置标志 + timer 取走"而不是直接退出**：置真发生在 `drain`，而退出闭包由 `main()`
+持有 —— `drain` 的签名里没有它（只有 `state` 与 `job_tx`）。80 ms 的 timer 是唯一同时
+够得着"排空消息"与"持有闭包"的地方，于是退出请求经过一次显式的交接。代价是多一个
+`AppState` 字段，收益是 `drain` 不必为了退出而改变签名（那会牵动它的三条既有调用路径）。
+
+#### 4.9.4 退出语义分叉：`make_quit(stop_web)`
+
+FR-21 要求"退出先停掉本程序启动的 `dsh web`"，而 FR-39 的更新退出**必须不停**（用户可能
+正开着网页用那个会话）。实现是把原来那个内联闭包提成
+`make_quit(state, job_tx, stop_web) -> Rc<dyn Fn()>`，两条路径各持一个实例：
+
+| 入口 | `stop_web` | 行为 |
+|---|---|---|
+| 托盘"退出"、文件→退出、关闭时选"彻底退出" | `true` | 停 `dsh web` → 清 `running_port` → 退出（FR-21） |
+| FR-39 装更新 | `false` | **不动** `dsh web` → 退出。`running_port` 早在启动时就已落盘（FR-31），重启后按 FR-22 认成"外部 dsh web"，用户可继续用或自行停止 |
+
+⚠ **共用同一个函数而不是各写一遍**：`stop_by_pid` 前后那几段注释里的坑（"确知已停才清
+`running_port`"、"队列里还有 `StartWeb` 时要记端口"）对两种退出**同样成立** —— 复制一份
+必然只修其中一份。两条路径只差 `match (stop_web, pid)` 的第一个分支。
+
+⚠ 定义位置被这次改动**上移**到了 timer 之前：更新那条路由 worker 消息触发，而 timer 需要
+拿到这个闭包。原先"quit 在 timer 之后定义"的注释因此失效，已随代码改写。
+
+#### 4.9.5 弹框可见性：唯一写入方是 Rust
+
+`update-prompt-visible` 由 Rust 独占写入，Slint 侧**只调回调**（连点遮罩、Esc、右上角 X
+也走 `update-later-clicked()`）。这与 `settings-visible` / `about-visible` 那类"纯 UI 状态"
+的做法**不同**，多出来的是那个"关闭"回调，原因是：
+
+> `project()` 是**全量投影**，只要有任何状态变化就会把 `AppState` 里的值推给界面。
+> 若 Slint 自己把属性置假，`AppState` 里仍是 `true` —— 下一次任何状态变化（日志多一行、
+> 状态栏换句话）都会把它**推回来**，表现为"关不掉的弹框"。多一条回调换掉这个 bug 类，
+> 划算。
+
+同理，"自动弹一次"与"忽略过就不自动弹"这两个判断都在 `drain` 里做（`update_auto_shown`
+`skipped_app_version`），Slint 侧一个条件都不写。
+
+#### 4.9.6 顶栏徽标：`alignment: start` 里没有 stretch
+
+菜单栏那条 `HorizontalLayout` 必须 `alignment: start`（否则两个菜单标题会被摊成两根长条，
+v1.7 已记）。而 `start`/`center`/`end` 下**子项的 `horizontal-stretch` 不生效** —— 所以
+"加一根占位条把徽标顶到右边"是错的：徽标会紧贴着「帮助」落在左上角。
+
+**离屏探针实测**（`target/ui-probe-update/`）：
+```text
+占位条方案：徽标 diff bbox x 118..230  y 8..37   ← 压在那团氛围光上，明显不对
+嵌套布局后：徽标 diff bbox x 753..865  y 8..37   ← 右内边距 14px，正好收在 866
+```
+
+正确做法是外面再套一层**默认（stretch）**的 `HorizontalLayout`：里层放菜单、自己
+`alignment: start`，外层把富余宽度整份给里层，徽标自然落到最右。
+
+#### 4.9.7 已知限制与风险
+
+| 项 | 说明 / 升级路径 |
+|---|---|
+| 只认 `releases/latest` | GitHub 的该端点**不返回 prerelease**，所以预发布版收不到提示。要覆盖就得改用 `releases` 列表并自己按 semver 排序（含 prerelease 的优先级），当前不值得 |
+| 校验和的信任范围 | 安装包与 `SHA256SUMS.txt` 来自同一个 release，因此校验**防的是传输损坏**（下了一半、内容坏），**不是**防 GitHub 被攻破。它在本机确实有用：网络上确实见过中途断流 |
+| 装更新时 `dsh web` 变成"外部实例" | 这是 FR-21 例外的代价：重启后界面显示"检测到外部 dsh web"（FR-17 的第二档），可打开、可停止，但**不再受本程序的退出联动**保护。用户若想恢复联动，停掉再启动一次即可 |
+| "为所有用户安装"的副本 | 以管理员身份安装过的那份，其更新向导会要 UAC（B 档走**可见向导**，UAC 由用户处理；这也是不选静默安装的原因之一） |
+| 启动时检查失败是静默的 | 只进日志。这是刻意的：用户没要求程序去查，开机甩一句"检查更新失败"是噪音；想知道结果就点〔检查更新〕 |
+| 下载进度不显示 | 状态栏一句话 + 日志。要百分比得把 worker 的字节流搬过消息通道（且 ureq 的读循环要改成流式），与收益不成比例 |
+
 ## 5. 错误处理设计
 
 ### 5.1 错误分类
@@ -1337,6 +1463,10 @@ SRS §8.4 要求对核心逻辑做单元测试。以下逻辑被刻意设计为*
 | `PluginOp::args(&str)` | FR-35~FR-37 | 四种操作的**精确**参数序列（与 `pm_command_table_is_exact` 同款粒度） |
 | `PluginRow::updatable()` | FR-34 | 已是最新 / 最新版未知 / 未安装 / **最新版更旧**（不得把降级当更新）四种否定情形 |
 | `plugin::run_plugin_with(..)` | FR-37b | 假 `dsh.cmd`：参数**逐字**到达进程；退出码非零是**结果**不是 `Err` |
+| `dsh::app_setup_asset_name(&Version)` | FR-38 / FR-39 | 安装包资产名的**唯一构造点**，与 `.iss` 的 `OutputBaseFilename` 逐字对应（发布流水线按同一个名字上传） |
+| `dsh::parse_app_release(&str, &Version)` | FR-38 | 表驱动：严格大于才算新版本（相等/更旧 → `None`）、`prerelease`/`draft` → `None`、资产名不符 → **`Err`**（发布漏传必须留痕，不得报成"已是最新"）、tag 非法 → `Err` |
+| `dsh::parse_certutil_hash(&str)` | FR-39 | 中/英两种 certutil 输出**都能**取到哈希 —— 按 64 位十六进制的**形状**取，不按文案（文案随系统语言变化） |
+| `dsh::parse_sha256sums(&str, &str)` | FR-39 | `sha256sum` 两种写法（`<hash>  <name>` 与 `<hash> *<name>`）、CRLF、大小写不敏感、缺条目 → `None` |
 
 ### 6.2 事务引擎的失败路径测试
 
@@ -1479,3 +1609,4 @@ strip     = true
 | 1.5 | 2026-09-22 | **新增主题子系统**（`feat/theme-system`）：**①** 新增 **§4.7**（职责边界、Rust 唯一真相源、`Tokens.dark` 与 `Palette.color-scheme` **两条投影路径**及为何是两条、`system_dark` 刻意不进 `.slint`、`UiMsg::SystemThemeChanged` 与 80 ms 排空、§5.2 兜底变成条件可达的代价）；**②** `global Tokens` 的 40 条 brush 令牌改为双值（`dark ? #暗 : #浅`），暗色侧逐行不动；**③** `ThemeMode` 三档 + `resolve()` 唯一判据 + 与 winit 同源的 `system_dark()` + 无竞态监视线程；**④** `state.json` 增 `theme_mode`（缺 key = 跟随系统，旧三字段文件照常可用）；**⑤** 设置面板新增「主题」组（浅色/深色/跟随系统，强制档改不动系统标题栏已在面板内交代）；**⑥** 删掉全部 6 处过渡期 `#[allow(dead_code)]`，删除后仍是 0 警告、无真实死代码 |
 | 1.6 | 2026-09-22 | **新增出网代理（SRS v1.3 的 FR-33）并闭合 §7.1 的 TLS 待验证项**：**①** §7.1 的"待验证：`ureq` 3.4 的默认 TLS 后端"**已闭合** —— 默认是 `rustls` + **`webpki-roots`**（Mozilla 静态根，**非**系统证书库），随之记下它的反面：企业/MITM 代理注入的企业根**不被信任**，而该风险因 FR-33 从理论变为可达（本机实测未触发）；升级路径是 ureq 的 `platform-verifier` feature。**②** 更正本段原来引用的错误前提"当前环境未配置代理（SRS §2.2.5）"。**③** §7.1 依赖表**不变** —— FR-33 读系统代理走的是 `windows-sys` **已启用**的 `Win32_System_Registry` feature，**未新增依赖、未改 `Cargo.toml`**（GC-2 当初挡住的只有 `winreg` 那条路） |
 | 1.7 | 2026-09-22 | **新增插件卡（SRS v1.4 的 §3.9 / FR-34~FR-37b / NFR-12）**，并把同期的两处界面改版一并落档：**①** §1.3 模块图加 `plugin.rs`（叶子模块，依赖 `model`/`pm`/`dsh`，无人依赖它），§1.4 数据流加插件一条；**②** 新增 **§4.8 `src/plugin.rs`**（职责边界、为何转发 `dsh plugin` 而非直调 pnpm、为何用 `latest` tag 是对的、并行查询与失败隔离、UI 侧两条接缝）；**③** `Job::FetchPlugins` / `Job::PluginOp` / `UiMsg::Plugins` / `UiMsg::PluginOpDone` 与 `PluginsState`；**④** 属性契约去掉 PM 三件套与 `version-is-current`/`latest-version`，加 `pm-label`、`reinstall-*`、`plugin-*` 共 9 项与 6 个回调；**⑤** §6.1 纯函数表补 7 行；**⑥** §7.1 依赖表**不变**（零新增依赖，`serde_json`/`ureq`/`semver`/`windows-sys` 都已在）。**⚠ 本条同时记录一笔被证伪的设计前提**：初稿要求"插件变更前先停 `dsh web`"，理由是"profile 里有原生模块、运行中的进程会锁住 `.node` 文件"—— 实测该前提为假（profile 内零个 `.node`），而 `dsh plugin` 与运行中的服务共用同一把 profile 写锁、CLI 改完由 HMR 应用 ⇒ 不停服务才是既定路径。详见 §4.8.3 与 spec §13 |
+| 1.8 | 2026-09-23 | **新增本程序自身的更新（SRS v1.5 的 §3.10 / FR-38 / FR-39）**：**①** 新增 **§4.9**（无新模块的取舍、`OutputBaseFilename` ↔ 资产名 ↔ `app_setup_asset_name` 的三方名字契约与"名字不符必须 `Err`"、完整数据流、"置标志 + timer 交接退出"的理由、`make_quit(stop_web)` 的退出语义分叉、弹框可见性为何必须由 Rust 独占写入、**`alignment: start` 下 stretch 不生效导致徽标错位的探针实测**、6 条已知限制）；**②** §3.2 属性契约加 `update-available` / `update-version` / `update-prompt-visible` 与 5 个回调；**③** §6.1 纯函数表加 4 行；**④** `Job::CheckAppUpdate` / `Job::DownloadAppUpdate` / `UiMsg::AppUpdate` / `UiMsg::AppUpdateLaunched` / `model::NewRelease`；**⑤** `state.json` 增 `skipped_app_version`（缺 key / 非字符串 = 没忽略过）；**⑥** 依赖表**不变**：哈希用系统自带 `certutil.exe`，下载复用 `ureq`（只调两个参数：全局超时 120 s、体积上限 64 MB —— ureq 默认 10 MB，而安装包已 8.7 MB） |

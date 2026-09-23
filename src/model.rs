@@ -318,6 +318,26 @@ pub enum NotesError {
     Net(String),
 }
 
+/// FR-38：远端**本程序**最新 release 的已解析形态。
+///
+/// ⚠ 三个字段都是"下载安装包要用到的东西"，刻意不带 release 说明正文：
+/// 说明是给 `dsh` 的版本用的（FR-26），本程序的更新只做"提示 + 装"，
+/// 多拉一份正文只会多一次网络与一块 UI 面积。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewRelease {
+    /// tag 去掉 `v` 之后的版本（`v0.3.0` → `0.3.0`）。
+    pub version: Version,
+    /// 安装包资产名，如 `dsh-manager-v0.3.0-windows-x64-setup.exe`。
+    pub setup_name: String,
+    /// **api.github.com** 的资产地址（`assets[].url`）。
+    ///
+    /// ⚠ 不能用 `browser_download_url` —— 那是 `github.com`，本机实测不可达
+    /// （也是 GC-4 明令禁止本程序构造的那类链接）。
+    pub setup_url: String,
+    /// 同 release 的 `SHA256SUMS.txt` 资产地址；该 release 没带这个资产时为 `None`。
+    pub sums_url: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub enum Job {
     Probe,
@@ -332,6 +352,14 @@ pub enum Job {
     ///   `stop_by_pid`，任何未来的发送方都绕不过它。
     StopWeb { port: u16, own_pid: Option<u32> },
     OpenUrl { url: String },
+    /// FR-38：查本程序自己有没有新版本。
+    ///
+    /// `manual` 区分"启动时自动查"与"用户点了〔检查更新〕"：失败时后者要在状态栏
+    /// 说一句，**前者只进日志** —— 开机就报"检查更新失败"是噪音，用户没要求它去查。
+    CheckAppUpdate { manual: bool },
+    /// FR-39：下载更新安装包并启动安装向导。载荷是已解析好的 release，
+    /// worker 不再重新查一次（那会让"确认过的版本"与"下载的版本"有机会不一致）。
+    DownloadAppUpdate { release: NewRelease },
     /// 盘点 web profile 的第三方插件（读文件 + 并行查 registry）。
     ///
     /// ⚠ **刻意不进 `coalesce_notes` 的合并逻辑**：那个合并只对 `FetchNotes` 生效
@@ -385,6 +413,14 @@ pub enum UiMsg {
     SystemThemeChanged(bool),
     /// 插件盘点结果。`Err` 是"读 profile 失败"（不是"没有插件"—— 那是 `Ok(空表)`）。
     Plugins(Result<Vec<PluginRow>, String>),
+    /// FR-38 的结果：`Ok(None)` = **已是最新**（含"该 release 没有本平台的安装包"
+    /// 与"远端不比本地新"两种情形，对用户都是"没什么可做的"）；
+    /// `Err` = 没查出结论（网络、响应读不懂）—— 与"已是最新"必须分开，
+    /// 否则一次网络故障会被显示成"已是最新"，那是**替用户下了结论**。
+    AppUpdate { manual: bool, result: Result<Option<NewRelease>, String> },
+    /// FR-39：安装包已下载（`verified` = SHA256 校验通过）且**安装向导已启动**，
+    /// 本程序现在该退出了。
+    AppUpdateLaunched { version: Version, path: PathBuf },
     /// 一次插件操作结束。`ok` 只用于清 `busy` 与挑状态栏文案；
     /// 命令原文与 pnpm 的输出已经逐条走过 `UiMsg::Log`（FR-28）。
     PluginOpDone { op: PluginOp, ok: bool },

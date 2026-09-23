@@ -66,6 +66,12 @@ pub struct StateFile {
     pub theme_mode: Option<ThemeMode>,
     /// 出网是否走 Windows 系统代理。`None` = 从没设过 = **走**（见 `use_system_proxy()`）。
     pub use_system_proxy: Option<bool>,
+    /// FR-38：用户点过〔忽略此版本〕的**本程序**版本（如 `0.3.0`）。`None` = 没忽略过。
+    ///
+    /// ⚠ 存字符串而不是 `Version`：这一项只用于"是不是同一个版本"的相等比较，
+    /// 解析失败（手动改坏、将来降级运行）当"没忽略过"就够 —— 为它引入一条
+    /// 解析失败路径不划算。也**不**与 dsh 的版本混用（那是 registry 的事）。
+    pub skipped_app_version: Option<String>,
 }
 
 #[derive(Debug)]
@@ -109,6 +115,11 @@ pub fn load_from(path: Option<&Path>) -> Loaded {
         // 同款：认不出的值（缺 key、手改成字符串、将来降级运行）一律当"没记过"，
         // 也就是回到缺省档（走系统代理），而不是替用户猜成直连。
         use_system_proxy: v.get("use_system_proxy").and_then(|x| x.as_bool()),
+        // 同款：没有这个 key（旧版 state.json）或不是字符串 → "没忽略过"。
+        skipped_app_version: v
+            .get("skipped_app_version")
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
     })
 }
 
@@ -136,6 +147,15 @@ pub fn use_system_proxy() -> bool {
         Loaded::Ok(s) => s.use_system_proxy.unwrap_or(true),
         _ => true,
     }
+}
+
+/// FR-38：这个版本是不是被用户点过〔忽略此版本〕。
+///
+/// ⚠ 单独成一个函数而不是让调用方自己 `load()`：判据里那个"读不到就算没忽略过"
+/// 的分支（文件缺失/损坏/没这个 key）是**行为契约**的一部分 —— 它决定"更新还提不提示"，
+/// 值得有一处明确的实现与一条测试。
+pub fn app_update_skipped(version: &str) -> bool {
+    matches!(load(), Loaded::Ok(s) if s.skipped_app_version.as_deref() == Some(version))
 }
 
 pub fn state_path() -> Option<PathBuf> {
@@ -184,6 +204,7 @@ pub fn save_to(path: &Path, s: &StateFile) -> Result<(), String> {
         "close_behavior": s.close_behavior.map(CloseBehavior::as_str),
         "theme_mode": s.theme_mode.map(ThemeMode::as_str),
         "use_system_proxy": s.use_system_proxy,
+        "skipped_app_version": s.skipped_app_version,
     });
     let text = serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?;
     write_atomic(path, &text)
@@ -418,6 +439,7 @@ mod tests {
                 close_behavior: None,
                 theme_mode: None,
                 use_system_proxy: None,
+                skipped_app_version: None,
             },
         )
         .unwrap();
@@ -446,6 +468,7 @@ mod tests {
             close_behavior: Some(CloseBehavior::Quit),
             theme_mode: None,
             use_system_proxy: None,
+            skipped_app_version: None,
         };
         save_to(&p, &s).unwrap();
         match load_from(Some(&p)) {
@@ -474,6 +497,7 @@ mod tests {
             close_behavior: None,
             theme_mode: None,
             use_system_proxy: None,
+            skipped_app_version: None,
         };
         save_to(&p, &s).unwrap();
         let leftover = p.with_extension("json.tmp");
@@ -490,6 +514,7 @@ mod tests {
             close_behavior: None,
             theme_mode: None,
             use_system_proxy: None,
+            skipped_app_version: None,
         };
         save_to(&p, &s).unwrap();
         update_at(&p, |s| s.running_port = Some(8080)).unwrap();
@@ -541,6 +566,7 @@ mod tests {
             close_behavior: None,
             theme_mode: None,
             use_system_proxy: None,
+            skipped_app_version: None,
         };
         save_to(&p, &baseline).unwrap();
 
@@ -552,6 +578,7 @@ mod tests {
             close_behavior: None,
             theme_mode: None,
             use_system_proxy: None,
+            skipped_app_version: None,
         };
         assert!(save_to(&p, &different).is_err(), "写 .tmp 失败时 save_to 必须报错");
 
@@ -573,6 +600,7 @@ mod tests {
             close_behavior: None,
             theme_mode: Some(ThemeMode::Dark),
             use_system_proxy: None,
+            skipped_app_version: None,
         };
         save_to(&p, &s).unwrap();
         match load_from(Some(&p)) {
@@ -625,6 +653,7 @@ mod tests {
             close_behavior: None,
             theme_mode: Some(ThemeMode::Light),
             use_system_proxy: None,
+            skipped_app_version: None,
         };
         save_to(&p, &s).unwrap();
         let v: serde_json::Value =
@@ -665,6 +694,40 @@ mod tests {
         save_to(&p, &StateFile { use_system_proxy: Some(false), ..Default::default() }).unwrap();
         let text = std::fs::read_to_string(&p).unwrap();
         assert!(text.contains("\"use_system_proxy\": false"), "落盘形状不对: {text}");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// FR-38：被忽略的那个本程序版本必须活过一次重启。
+    ///
+    /// ⚠ 这条的**用户可见后果**才是它的价值：读不回来就等于"忽略"没生效，
+    /// 于是每次开机都弹同一个更新框 —— 而"忽略此版本"存在的全部理由就是不弹。
+    #[test]
+    fn skipped_app_version_roundtrips_and_absent_is_none() {
+        let p = tmp("skipped-app.json");
+
+        // 旧版 state.json：没有这个 key，必须读成"没忽略过"，且**不得**判为损坏
+        std::fs::write(&p, r#"{"preferred_port":3080}"#).unwrap();
+        match load_from(Some(&p)) {
+            Loaded::Ok(s) => assert_eq!(s.skipped_app_version, None),
+            other => panic!("缺 key 不是损坏。期望 Ok，得到 {other:?}"),
+        }
+
+        save_to(
+            &p,
+            &StateFile { skipped_app_version: Some("0.3.0".into()), ..Default::default() },
+        )
+        .unwrap();
+        match load_from(Some(&p)) {
+            Loaded::Ok(s) => assert_eq!(s.skipped_app_version.as_deref(), Some("0.3.0")),
+            other => panic!("期望 Ok，得到 {other:?}"),
+        }
+
+        // 手改成数字之类的非字符串 → 同样当"没忽略过"，不 panic、不判损坏
+        std::fs::write(&p, r#"{"skipped_app_version":300}"#).unwrap();
+        match load_from(Some(&p)) {
+            Loaded::Ok(s) => assert_eq!(s.skipped_app_version, None, "非字符串一律当没忽略过"),
+            other => panic!("期望 Ok，得到 {other:?}"),
+        }
         let _ = std::fs::remove_file(&p);
     }
 

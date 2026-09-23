@@ -116,6 +116,23 @@ struct AppState {
     /// 而列表可能在这期间被刷新过 —— 取不到就当作"列表变了，取消这次操作"，
     /// 绝不用一个可能过期的包名去执行卸载。
     plugin_remove_index: Option<usize>,
+    /// FR-38：查到的"比本程序新"的 release。`None` = 已是最新 / 还没查到 / 查失败。
+    ///
+    /// ⚠ 被〔忽略此版本〕之后**仍然留在这里** —— 顶栏徽标要一直在，
+    /// 被压下去的只是"自动弹框"这一个动作（见 `update_prompt_visible`）。
+    app_update: Option<NewRelease>,
+    /// FR-38：更新弹框是否可见。**唯一写入方是 Rust**（Slint 侧只调回调，不写它），
+    /// 于是 `project()` 每帧照推也不会把用户刚关掉的框弹回来。
+    update_prompt_visible: bool,
+    /// 本会话已经**自动**弹过一次更新框了。用户关掉之后不该再被弹回来；
+    /// 手动点〔检查更新〕不受它约束（那是用户明确要求看）。
+    update_auto_shown: bool,
+    /// FR-39：安装向导已启动，该退出了 —— 但**不停** `dsh web`（见 `make_quit`）。
+    ///
+    /// ⚠ 为什么是一个标志而不是直接调退出：置真发生在 `drain`（worker 消息）里，
+    /// 而退出闭包由 `main()` 持有、`drain` 拿不到；80ms 的 timer 是唯一同时够得着
+    /// 两边的地方，它取走这个标志再执行。
+    quit_keep_web: bool,
     log: Rc<VecModel<slint::SharedString>>,
 }
 
@@ -176,6 +193,10 @@ impl AppState {
             system_dark: theme::system_dark(),
             plugins: PluginsState { rows: Vec::new(), status: PluginsStatus::Loading },
             plugin_remove_index: None,
+            app_update: None,
+            update_prompt_visible: false,
+            update_auto_shown: false,
+            quit_keep_web: false,
             log: Rc::new(VecModel::default()),
         }
     }
@@ -483,6 +504,19 @@ fn project(state: &AppState, win: &MainWindow, tray: &AppTray) {
     // 与「关闭行为」同款：设置面板改的是 AppState，唯一点投影点是本函数。
     win.set_use_system_proxy(state.use_system_proxy);
 
+    // ── 本程序自己的更新（FR-38 / FR-39）──
+    // 徽标与弹框都只由 `app_update` 驱动：没有它，两者都不出现。
+    win.set_update_available(state.app_update.is_some());
+    win.set_update_version(
+        state
+            .app_update
+            .as_ref()
+            .map(|r| r.version.to_string())
+            .unwrap_or_default()
+            .into(),
+    );
+    win.set_update_prompt_visible(state.update_prompt_visible);
+
     // ── 推给托盘（独立实例，必须再推一次）──
     tray.set_web_running(state.web.is_running());
     tray.set_busy(state.busy);
@@ -679,6 +713,63 @@ fn drain(rx: &Receiver<UiMsg>, state: &Rc<RefCell<AppState>>, tx: &Sender<Job>) 
                         s.status = format!("{context}失败");
                         push_log(&s, format!("{context}失败: {message}"));
                     }
+
+                    UiMsg::AppUpdate { manual, result } => match result {
+                        Ok(Some(rel)) => {
+                            // ⚠ 忽略过的版本**不再自动弹框**，但徽标留着：
+                            // 用户忽略的是"每次开机被问一遍"，不是"不许知道有新版本"。
+                            let skipped = config::app_update_skipped(&rel.version.to_string());
+                            let auto = !s.update_auto_shown && !skipped;
+                            if manual || auto {
+                                s.update_prompt_visible = true;
+                                s.update_auto_shown = true;
+                            }
+                            push_log(
+                                &s,
+                                format!(
+                                    "发现新版本 v{}（当前 v{}）{}",
+                                    rel.version,
+                                    local_version(),
+                                    if skipped && !manual { " —— 该版本已被忽略，只留徽标" } else { "" }
+                                ),
+                            );
+                            if manual {
+                                s.status = format!("发现新版本 v{}", rel.version);
+                            }
+                            s.app_update = Some(rel);
+                        }
+                        Ok(None) => {
+                            // 说得具体一点：这句话是"没有更新"这一判断的**唯一**出口，
+                            // 用户手动点检查时靠它确认程序真的查过。
+                            push_log(&s, format!("本程序已是最新（v{}）", local_version()));
+                            if manual {
+                                s.status = "已是最新版本".into();
+                            }
+                            // ⚠ 不在这里清 `app_update`：启动时查到过、之后手动再查
+                            // 仍返回同一个 release 时留着徽标；真降级/删 release 的场景
+                            // 不值得为它加一条状态迁移。
+                        }
+                        Err(e) => {
+                            // 启动时的失败**只进日志**：用户没要求程序去查，
+                            // 开机就甩一句"检查更新失败"是噪音。
+                            push_log(&s, format!("检查更新失败: {e}"));
+                            if manual {
+                                s.status = "检查更新失败".into();
+                            }
+                        }
+                    },
+
+                    UiMsg::AppUpdateLaunched { version, path } => {
+                        push_log(&s, format!("安装向导已启动（v{version}）：{}", path.display()));
+                        push_log(
+                            &s,
+                            "本程序即将退出以便替换文件；由本程序启动的 dsh web **保留运行**，\
+                             重启后会把它认成外部实例，可继续使用或自行停止",
+                        );
+                        s.status = "正在安装更新…".into();
+                        // FR-39：与托盘"退出"（FR-21）**不同**，这次不停 dsh web。
+                        s.quit_keep_web = true;
+                    }
                 }
             }
             Err(mpsc::TryRecvError::Empty) => break,
@@ -846,6 +937,28 @@ fn panic_detail(payload: &(dyn std::any::Any + Send)) -> String {
         .unwrap_or_else(|| "未知 panic（载荷不是字符串）".into())
 }
 
+/// 本程序自己的版本。
+///
+/// 与 exe 的 `FILEVERSION` 同源（都是 `CARGO_PKG_VERSION`，由 build.rs 注入），
+/// 所以"更新检查比的那个版本"与"资源管理器里看到的版本"不可能不一致。
+/// 解析失败不该发生（build.rs 已经按 semver 解析过一次），故这里 expect。
+fn local_version() -> Version {
+    env!("CARGO_PKG_VERSION").parse().expect("CARGO_PKG_VERSION 必须是合法 semver")
+}
+
+/// FR-39：安装包落盘的位置 —— `%TEMP%\dsh-manager-update\`。
+///
+/// ⚠ 用**本程序自己的子目录**而不是直接丢在 `%TEMP%` 根下：安装向导要在本程序退出
+/// **之后**继续读这个文件，路径必须是确定的、也不能与别人的临时文件撞名；
+/// 一个专属目录还让"重试"只需覆盖同一个文件。
+fn update_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("TEMP").map(|t| std::path::PathBuf::from(t).join("dsh-manager-update"))
+}
+
+/// 下载时状态栏那一句。安装包实测 8.7 MB / 本机 4 秒，但慢线路上要几十秒 ——
+/// 把量级说出来，免得用户以为卡死了。
+const DOWNLOAD_HINT: &str = "约 9 MB，视网速可能要一会儿";
+
 /// 唯一的 worker 线程。**无状态** —— 它需要的一切都在 Job 载荷里。
 /// 串行执行天然满足 FR-15（禁止并发事务）。
 ///
@@ -953,6 +1066,99 @@ fn execute(job: Job, tx: &Sender<UiMsg>) {
         }
 
         Job::FetchPlugins => send(UiMsg::Plugins(plugin::fetch_all())),
+
+        Job::CheckAppUpdate { manual } => {
+            let result = dsh::fetch_app_release(&local_version());
+            send(UiMsg::AppUpdate { manual, result });
+        }
+
+        Job::DownloadAppUpdate { release } => {
+            send(UiMsg::Log(format!("正在下载 {}（{DOWNLOAD_HINT}）", release.setup_name)));
+            let bytes = match dsh::download_asset(&release.setup_url) {
+                Ok(b) => b,
+                Err(e) => {
+                    send(UiMsg::Failed { context: "更新下载", message: e });
+                    return;
+                }
+            };
+
+            // 校验和是**可选**的：release 没带 SHA256SUMS.txt（或里面没有这一条）时
+            // 只记一句日志就继续 —— 它防的是"下了一半/内容损坏"（本机网络实测会中途断），
+            // 不是防 GitHub 被攻破，所以缺了它不该让更新整体不可用。
+            let expected = release
+                .sums_url
+                .as_deref()
+                .and_then(|u| match dsh::download_asset(u) {
+                    Ok(b) => {
+                        let got =
+                            dsh::parse_sha256sums(&String::from_utf8_lossy(&b), &release.setup_name);
+                        if got.is_none() {
+                            send(UiMsg::Log(format!(
+                                "SHA256SUMS.txt 里没有 {} 的条目 —— 跳过校验",
+                                release.setup_name
+                            )));
+                        }
+                        got
+                    }
+                    Err(e) => {
+                        send(UiMsg::Log(format!("取 SHA256SUMS.txt 失败（{e}）—— 跳过校验")));
+                        None
+                    }
+                });
+
+            let Some(path) = update_dir().map(|d| d.join(&release.setup_name)) else {
+                send(UiMsg::Failed {
+                    context: "更新下载",
+                    message: "取不到 %TEMP%，无法落盘".into(),
+                });
+                return;
+            };
+            if let Some(dir) = path.parent() {
+                if let Err(e) = std::fs::create_dir_all(dir) {
+                    send(UiMsg::Failed {
+                        context: "更新下载",
+                        message: format!("创建 {} 失败: {e}", dir.display()),
+                    });
+                    return;
+                }
+            }
+            if let Err(e) = std::fs::write(&path, &bytes) {
+                send(UiMsg::Failed {
+                    context: "更新下载",
+                    message: format!("写入 {} 失败: {e}", path.display()),
+                });
+                return;
+            }
+            send(UiMsg::Log(format!("已下载 {} 字节到 {}", bytes.len(), path.display())));
+
+            match expected {
+                Some(exp) => match dsh::sha256_file(&path) {
+                    Ok(actual) if actual == exp => {
+                        send(UiMsg::Log(format!("SHA256 校验通过：{actual}")));
+                    }
+                    Ok(actual) => {
+                        // 不匹配 = 这个文件**不能运行**。删掉它，让用户重试一次干净的。
+                        let _ = std::fs::remove_file(&path);
+                        send(UiMsg::Failed {
+                            context: "更新下载",
+                            message: format!(
+                                "SHA256 不匹配（期望 {exp}，实得 {actual}）—— 已删除下载的文件，请重试"
+                            ),
+                        });
+                        return;
+                    }
+                    // certutil 缺失/异常不阻断：校验是尽力而为的一步，
+                    // 拿不到哈希只意味着"这次没校验"，不意味着安装包坏了。
+                    Err(e) => send(UiMsg::Log(format!("算 SHA256 失败（{e}）—— 未校验，继续"))),
+                },
+                None => send(UiMsg::Log("该 release 未提供校验和 —— 未校验，继续".into())),
+            }
+
+            match dsh::launch_setup(&path) {
+                Ok(()) => send(UiMsg::AppUpdateLaunched { version: release.version, path }),
+                Err(e) => send(UiMsg::Failed { context: "启动安装向导", message: e }),
+            }
+        }
 
         Job::PluginOp { op } => {
             // FR-28：命令原文进日志，形状与事务引擎那句 `$ <exe> <args…>` 一致。
@@ -1801,6 +2007,168 @@ fn wire_callbacks(
         let q = quit.clone();
         win.on_quit_app(move || q());
     }
+
+    // ── 本程序自己的更新（FR-38 / FR-39）──
+    //
+    // ⚠ `update-prompt-visible` 的**唯一写入方是 Rust**：Slint 侧只调回调，不直接写它。
+    // 所以 `project()` 每帧照推不会把用户刚关掉的框弹回来 —— 若两边都写，
+    // 关闭动作会被下一次投影覆盖，表现为"关不掉的弹框"。
+    {
+        // 顶栏徽标：本会话关过也照样把它叫回来（徽标就是"我还能看"的入口）。
+        let state = state.clone();
+        win.on_update_badge_clicked(move || {
+            let mut s = state.borrow_mut();
+            s.update_prompt_visible = true;
+            s.dirty = true;
+        });
+    }
+
+    {
+        // 帮助 →〔检查更新〕：手动检查的失败要在状态栏说话（与启动时的静默相反）。
+        let state = state.clone();
+        let send = send.clone();
+        win.on_check_update_clicked(move || {
+            {
+                let mut s = state.borrow_mut();
+                s.status = "正在检查更新…".into();
+                s.dirty = true;
+            }
+            send(Job::CheckAppUpdate { manual: true });
+        });
+    }
+
+    {
+        // 〔以后再说〕：只关框。下次启动还会提示 —— 这与〔忽略此版本〕的差别
+        // 就写在框里，别让两个按钮的语义靠猜。
+        let state = state.clone();
+        win.on_update_later_clicked(move || {
+            let mut s = state.borrow_mut();
+            s.update_prompt_visible = false;
+            s.dirty = true;
+        });
+    }
+
+    {
+        // 〔忽略此版本〕：写进 state.json，之后**不再自动弹框**（徽标仍在）。
+        let state = state.clone();
+        win.on_update_skip_clicked(move || {
+            let ver = state.borrow().app_update.as_ref().map(|r| r.version.to_string());
+            if let Some(v) = ver {
+                {
+                    let mut s = state.borrow_mut();
+                    s.update_prompt_visible = false;
+                    s.dirty = true;
+                }
+                // ⚠ 写盘失败**也要**关框：用户点的是"别再问了"，这是本会话必须兑现的事；
+                // 写不进去只影响"下次启动还问不问"，记一条日志就够。
+                match config::update(|f| f.skipped_app_version = Some(v.clone())) {
+                    Ok(()) => push_log(
+                        &state.borrow(),
+                        format!("已忽略 v{v}：该版本不再自动提示（顶栏徽标仍在，点它可再看）"),
+                    ),
+                    Err(e) => push_log(
+                        &state.borrow(),
+                        format!("已忽略 v{v}（仅本次会话）：写入 state.json 失败 {e}"),
+                    ),
+                }
+            }
+        });
+    }
+
+    {
+        // 〔下载并安装〕：关框 → 派发下载 → worker 下完会启动安装向导并回报
+        // `AppUpdateLaunched`，由 timer 执行"退出但保留 dsh web"。
+        let state = state.clone();
+        let send = send.clone();
+        win.on_update_download_clicked(move || {
+            let Some(rel) = state.borrow().app_update.clone() else { return };
+            {
+                let mut s = state.borrow_mut();
+                s.update_prompt_visible = false;
+                s.status = format!("正在下载更新 v{} …", rel.version);
+                push_log(&s, format!("开始下载更新 v{}（{}）", rel.version, rel.setup_name));
+                s.dirty = true;
+            }
+            send(Job::DownloadAppUpdate { release: rel });
+        });
+    }
+}
+
+/// 退出路径。`stop_web` 决定要不要先停掉本程序启动的 `dsh web`：
+///
+/// - `true`（托盘"退出"、文件→退出、关闭窗口选"彻底退出"）：FR-21 要求先停，
+///   不留孤儿 `node.exe`。
+/// - `false`（**FR-39 装更新专用**）：**不停**。用户可能正在浏览器里用那个会话，
+///   而更新只是换掉本程序的 exe。`running_port` 在启动 `dsh web` 时就已落盘
+///   （FR-31），所以重启后的程序会按 FR-22 把它认成"外部 dsh web" ——
+///   界面显示运行中、可打开、也可停止，不会变成失联的孤儿。
+///
+/// ⚠ 两条路径共用同一个函数而不是各写一遍：`stop_by_pid` 前后那几段注释里的坑
+/// （确知已停才清 running_port、排队中的启动要记端口）对两种退出**同样成立**，
+/// 复制一份必然只修其中一份。
+///
+/// ⚠ `stop_by_pid` 是同步的子进程调用，落在 UI 线程上 —— 它是【关机路径】上的
+/// 有界动作（一次 taskkill），且必须在 `quit_event_loop()` 之前完成；
+/// 改成 worker 往返需要一个"停完再退"的握手，与收益不成比例。
+fn make_quit(state: Rc<RefCell<AppState>>, job_tx: Sender<Job>, stop_web: bool) -> Rc<dyn Fn()> {
+    Rc::new(move || {
+        let s = state.borrow();
+        let pid = s.web_pid;
+        // ⚠ Ruling 93：读的是**接受启动时**记下的端口，不是此刻的 `preferred_port`。
+        // 排队期间用户改了端口输入框的话，后者指向一个 worker 根本不会用的端口 ——
+        // 记录就白记了，真正被 spawn 的实例依旧失联（FR-31 的全部意义）。
+        let pending_port = s.start_port;
+        drop(s);
+        match (stop_web, pid) {
+            (true, Some(pid)) => {
+                // ⚠ 只有**确知已停**才清 running_port（评审轮 1）。无条件清除的话，
+                // taskkill 失败时孤儿还活着、而它唯一的恢复信号（FR-31 的运行态端口）
+                // 已经被抹掉 —— FR-22 的孤儿恢复与 FR-31 会同时失效，下次启动再也
+                // 认不出这个进程。worker 的 Job::StopWeb 臂也正是这么写的（Ok 才清）。
+                match dsh::stop_by_pid(pid) {
+                    Ok(()) => {
+                        let _ = config::update(|f| f.running_port = None);
+                        push_log(
+                            &state.borrow(),
+                            format!("退出前已停止本程序启动的 dsh web（pid {pid}）"),
+                        );
+                    }
+                    Err(e) => push_log(
+                        &state.borrow(),
+                        format!(
+                            "退出前停止 dsh web（pid {pid}）失败：{e}；保留运行态记录，下次启动会重新探测"
+                        ),
+                    ),
+                }
+            }
+            // FR-39：装更新时保留实例 —— `running_port` 早在启动时就写好了，
+            // 这里**什么都不用做**，只要别去停它。
+            (false, Some(_)) => push_log(
+                &state.borrow(),
+                "更新期间保留 dsh web；重启后会按运行态端口把它认成外部实例",
+            ),
+            // 没有 pid（两种停法都可能）：队列里或许还有 StartWeb 没跑完。
+            (_, None) => {
+                if let Some(port) = pending_port {
+                    // ⚠ 队列里还有 StartWeb（或它正在跑）时退出：worker 可能在我们退出
+                    // **之后**才真正 spawn 出子进程，而那时界面已经没了 pid —— 于是留下
+                    // 一个既不认识（quit 只认 web_pid）又找不回（state.json 里没有
+                    // running_port）的孤儿。pid 在 UI 线程上无从得知，但端口可以记下来，
+                    // 让 FR-31 下次启动认出它。
+                    //
+                    // 分支条件用 `start_port` 而不是 `start_pending`：两者同生共死
+                    // （见字段说明），而这里需要的恰恰是端口本身。
+                    let _ = config::update(|f| f.running_port = Some(port));
+                    push_log(
+                        &state.borrow(),
+                        format!("退出时有启动任务未完成；已记录运行态端口 {port}，下次启动会探测"),
+                    );
+                }
+            }
+        }
+        let _ = job_tx; // 不再接受新任务
+        slint::quit_event_loop().ok();
+    })
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -1897,6 +2265,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 闩锁都保留。采纳理由与完整说明见下方 `drop(msg_tx)` 处（Ruling 18 / Ruling 83）。
     theme::spawn_watcher(msg_tx.clone());
 
+    // 退出路径有两种停法（见 `make_quit`）：托盘/菜单"退出"按 FR-21 先停 dsh web，
+    // 而 FR-39 装更新时**不能停** —— 用户可能正在用那个会话。
+    //
+    // ⚠ 必须定义在 timer **之前**：更新那条路由 worker 消息（`drain`）触发，
+    // 而 `drain` 拿不到闭包 —— 80ms 的 timer 是唯一同时够得着两边的地方。
+    let quit = make_quit(state.clone(), job_tx.clone(), true);
+    let quit_keep_web = make_quit(state.clone(), job_tx.clone(), false);
+
     // 决策 3：80ms Timer 排空。实测 timer 精度 ±1.2ms，未被节流。
     // ⚠ GC-15：timer 必须存活到事件循环结束，且其捕获的 Rc 永不离开 UI 线程。
     let timer = Timer::default();
@@ -1905,6 +2281,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let tray_w = tray.as_weak();
         let state = state.clone();
         let job_tx = job_tx.clone();
+        let quit_keep_web = quit_keep_web.clone();
         timer.start(TimerMode::Repeated, Duration::from_millis(80), move || {
             // ⚠ 两个来源都要看：除了排空消息，**回调也可能直接改了状态而没有消息**
             // （`on_install_clicked` 的两条拒绝路径就是这样）。只看 drain 的话，
@@ -1917,6 +2294,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     project(&state.borrow(), &w, &t);
                 }
             }
+            // FR-39：安装向导已启动 —— 退出，但**保留** dsh web（见 `make_quit`）。
+            // 只有这里能做：置真发生在 `drain`，而退出闭包由 `main()` 持有。
+            if std::mem::take(&mut state.borrow_mut().quit_keep_web) {
+                quit_keep_web();
+            }
         });
     }
 
@@ -1925,6 +2307,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = job_tx.send(Job::FetchCatalog);
     // FR-34：插件盘点也在启动时做一次（读文件是毫秒级，查最新版是 6 个并行请求）。
     let _ = job_tx.send(Job::FetchPlugins);
+    // FR-38：本程序自己的更新检查。与上面几项同款 —— **每次启动查一次，不做轮询**。
+    // `manual: false` 让失败只进日志：用户没要求程序去查，开机就报错是噪音。
+    let _ = job_tx.send(Job::CheckAppUpdate { manual: false });
 
     // FR-31：若上次有未清除的运行态端口，探测它 —— 这正是 FR-22 的
     // 孤儿恢复机制入口。无法确认时**保留**记录，只有确知端口空闲才清除。
@@ -2003,65 +2388,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 排空两条 —— 那是对 `drain` 的结构性改动，不在 Task 6 范围。
     drop(msg_tx);
 
-    // FR-23 修订版的关闭语义（隐藏 / 退出 / 每次询问）连同询问框一起挂在
-    // wire_callbacks 里 —— 退出路径 `quit` 必须已经就绪，而它在这之下才定义。
-
-    // FR-21：退出必须先停掉本程序启动的 dsh web，不留孤儿 node 进程。
-    // ⚠ 用 AppState.web_pid（由 drain 的 WebState 臂维护：Starting 与 Running 都带
-    // pid）而**不是** find_listener_pid：后者会拿到外部实例的 pid，退出时把它一起杀掉。
-    // ⚠ 这里的 stop_by_pid 是同步的子进程调用，落在 UI 线程上 —— 它是
-    // 【关机路径】上的有界动作（一次 taskkill），且必须在 quit_event_loop()
-    // 之前完成；改成 worker 往返需要一个"停完再退"的握手，与收益不成比例。
-    let quit: Rc<dyn Fn()> = {
-        let state = state.clone();
-        let job_tx = job_tx.clone();
-        Rc::new(move || {
-            let s = state.borrow();
-            let pid = s.web_pid;
-            // ⚠ Ruling 93：读的是**接受启动时**记下的端口，不是此刻的 `preferred_port`。
-            // 排队期间用户改了端口输入框的话，后者指向一个 worker 根本不会用的端口 ——
-            // 记录就白记了，真正被 spawn 的实例依旧失联（FR-31 的全部意义）。
-            let pending_port = s.start_port;
-            drop(s);
-            if let Some(pid) = pid {
-                // ⚠ 只有**确知已停**才清 running_port（评审轮 1）。无条件清除的话，
-                // taskkill 失败时孤儿还活着、而它唯一的恢复信号（FR-31 的运行态端口）
-                // 已经被抹掉 —— FR-22 的孤儿恢复与 FR-31 会同时失效，下次启动再也
-                // 认不出这个进程。worker 的 Job::StopWeb 臂也正是这么写的（Ok 才清）。
-                match dsh::stop_by_pid(pid) {
-                    Ok(()) => {
-                        let _ = config::update(|f| f.running_port = None);
-                        push_log(
-                            &state.borrow(),
-                            format!("退出前已停止本程序启动的 dsh web（pid {pid}）"),
-                        );
-                    }
-                    Err(e) => push_log(
-                        &state.borrow(),
-                        format!(
-                            "退出前停止 dsh web（pid {pid}）失败：{e}；保留运行态记录，下次启动会重新探测"
-                        ),
-                    ),
-                }
-            } else if let Some(port) = pending_port {
-                // ⚠ 队列里还有 StartWeb（或它正在跑）时退出：worker 可能在我们退出
-                // **之后**才真正 spawn 出子进程，而那时界面已经没了 pid —— 于是留下
-                // 一个既不认识（quit 只认 web_pid）又找不回（state.json 里没有
-                // running_port）的孤儿。pid 在 UI 线程上无从得知，但端口可以记下来，
-                // 让 FR-31 下次启动认出它。
-                //
-                // 分支条件用 `start_port` 而不是 `start_pending`：两者同生共死
-                // （见字段说明），而这里需要的恰恰是端口本身。
-                let _ = config::update(|f| f.running_port = Some(port));
-                push_log(
-                    &state.borrow(),
-                    format!("退出时有启动任务未完成；已记录运行态端口 {port}，下次启动会探测"),
-                );
-            }
-            let _ = job_tx; // 不再接受新任务
-            slint::quit_event_loop().ok();
-        })
-    };
 
     // 托盘"退出"也走同一条路径
     wire_callbacks(&win, &tray, &job_tx, &state, win.as_weak(), quit);

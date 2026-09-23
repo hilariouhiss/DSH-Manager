@@ -14,6 +14,7 @@ use std::time::Duration;
 use std::os::windows::ffi::OsStrExt;
 
 use std::io::{BufRead, BufReader, Read};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
 use std::thread::{self, JoinHandle};
@@ -24,8 +25,23 @@ use crate::pm;
 
 pub const REGISTRY_URL: &str = "https://registry.npmjs.org/@deepseek-ai/dsh";
 pub const GITHUB_REPO: &str = "deepseek-ai/deepseek-harness";
+/// FR-38：**本程序自己**的仓库。与 `GITHUB_REPO`（被管理的那个 CLI）刻意分开：
+/// 两者都会拼 `api.github.com` 的地址，混用会去 dsh 的 release 里找本程序的安装包。
+pub const APP_REPO: &str = "hilariouhiss/DSH-Manager";
 /// GC-5：只允许 registry.npmjs.org 与 api.github.com。github.com 实测不可达。
 pub const USER_AGENT: &str = "dsh-manager";
+
+/// NFR-3 的超时上限：元数据请求（目录、说明、更新检查）用 15 秒。
+const METADATA_TIMEOUT_SECS: u64 = 15;
+
+/// FR-39：安装包的下载超时。**不能沿用 15 秒** —— 安装包已经 8.7 MB，
+/// 15 秒等于要求 4.6 Mbps，慢一点的线路必然失败；而失败的代价是用户
+/// 点了〔下载并安装〕之后眼睁睁看着它报错。
+const DOWNLOAD_TIMEOUT_SECS: u64 = 120;
+
+/// 单个资产的大小上限。ureq 的默认上限是 10 MB，而安装包已经 8.7 MB ——
+/// 再长几版就会撞上，且报的是 "body too large" 这种与"下载失败"毫无相似之处的错。
+const ASSET_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// 出网失败时挂给用户的**自我解释**提示（控制器裁决）。
 ///
@@ -44,7 +60,16 @@ pub const PROXY_HINT: &str =
 
 /// NFR-3：全局超时上限，超时后进入失败路径而非无限等待。
 pub fn agent() -> ureq::Agent {
-    let mut builder = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(15)));
+    build_agent(Duration::from_secs(METADATA_TIMEOUT_SECS))
+}
+
+/// FR-39：下载安装包用的 agent，超时比元数据请求宽得多。
+///
+/// ⚠ 复用同一条代理解析路径（`resolve_proxy`）是**必须的**：本机在 Ruling 89
+/// 之前唯一的出网方式就是系统代理，给下载单独写一个 builder 等于把那条路掐掉，
+/// 表现为"检查得到新版本、却永远下不下来"。
+fn build_agent(timeout: Duration) -> ureq::Agent {
+    let mut builder = ureq::Agent::config_builder().timeout_global(Some(timeout));
     // ⚠ 只有在**确实解析出代理**时才覆盖 config：`config_builder()` 的缺省
     // 是 `Proxy::try_from_env()`，显式传 `None` 会把环境变量那条路一起掐掉 ——
     // 而 `HTTPS_PROXY` 正是 V-6 验过的、以及本机在 Ruling 89 之前唯一的出网方式。
@@ -491,6 +516,182 @@ pub fn fetch_notes(version: &Version) -> Result<String, NotesError> {
     parse_release_body(&body)
 }
 
+// ═══════════════════ FR-38 / FR-39：本程序自己的更新 ═══════════════════
+//
+// 与上面那套（FR-6 / FR-26）刻意分开：那套管的是**被管理的 `dsh`**，走 npm registry
+// 与 `deepseek-ai/deepseek-harness` 的 release；这套管的是**本程序自己**，
+// 走本仓库的 `releases/latest`。两者只共用 `agent()` 与 `PROXY_HINT`。
+
+/// 安装包资产名的**唯一构造点**。
+///
+/// ⚠ 与 `installer/dsh-manager.iss` 的
+/// `OutputBaseFilename=dsh-manager-v{#AppVersion}-windows-x64-setup` 逐字对应，
+/// 而发布流水线也按同一个名字把文件传上 Release。三处只要有一处改名，自动更新就
+/// **静默失效**（查得到新版本、却找不到要下载的东西），所以名字只在这里拼。
+pub fn app_setup_asset_name(version: &Version) -> String {
+    format!("dsh-manager-v{version}-windows-x64-setup.exe")
+}
+
+/// 校验和资产名。发布流水线固定用它，格式与 `sha256sum` 的输出一致。
+pub const APP_SUMS_ASSET_NAME: &str = "SHA256SUMS.txt";
+
+/// 允许下载的资产地址前缀。资产 URL 来自**响应体**，属信任边界：
+/// 只认 api.github.com —— 把 GC-5 从"约定"变成代码里的守卫。
+const ASSET_URL_PREFIX: &str = "https://api.github.com/repos/";
+
+/// FR-38：查本程序的最新 release。
+///
+/// `local` 由调用方给（main.rs 传 `env!("CARGO_PKG_VERSION")`），于是"有没有更新"
+/// 这件事可以在测试里用任意本地版本驱动，不必真的把程序降级。
+pub fn fetch_app_release(local: &Version) -> Result<Option<NewRelease>, String> {
+    let url = format!("https://api.github.com/repos/{APP_REPO}/releases/latest");
+    let mut resp = match agent()
+        .get(&url)
+        .header("User-Agent", USER_AGENT) // GitHub API 对无 UA 的请求返回 403
+        .header("Accept", "application/vnd.github+json")
+        .call()
+    {
+        Ok(r) => r,
+        // 一个 release 都没有（新仓库、或全被删了）—— 不是错误，是"没有新版本"
+        Err(ureq::Error::StatusCode(404)) => return Ok(None),
+        Err(e) => return Err(format!("{e}{PROXY_HINT}")),
+    };
+    let body = resp
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| format!("响应读取失败: {e}"))?;
+    parse_app_release(&body, local)
+}
+
+/// FR-38 的纯函数部分：release JSON → 有没有比 `local` 新的版本。
+///
+/// 判据与 FR-34 的"可更新"**逐字一致**：远端**严格大于**本地才算新版本 ——
+/// 相等不提示；更旧（远端被回滚过）也不提示，否则点下去就是给用户降级。
+/// `draft` / `prerelease` 一律不算：`releases/latest` 本就不该返回它们，
+/// 这里再挡一道，免得将来换了端点就把测试版推给所有人。
+pub fn parse_app_release(json: &str, local: &Version) -> Result<Option<NewRelease>, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("release 响应不是 JSON: {e}"))?;
+    if v.get("draft").and_then(|x| x.as_bool()) == Some(true)
+        || v.get("prerelease").and_then(|x| x.as_bool()) == Some(true)
+    {
+        return Ok(None);
+    }
+    let tag = v
+        .get("tag_name")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| "release 响应里没有 tag_name".to_string())?;
+    // tag 形如 `v0.3.0`；不带 `v` 也认（GitHub 上两种写法都存在）
+    let version = Version::parse(tag.trim_start_matches('v'))
+        .map_err(|e| format!("release tag `{tag}` 不是合法版本号: {e}"))?;
+    if version <= *local {
+        return Ok(None);
+    }
+
+    let assets = v.get("assets").and_then(|x| x.as_array());
+    let find = |name: &str| -> Option<String> {
+        assets?
+            .iter()
+            .find(|a| a.get("name").and_then(|n| n.as_str()) == Some(name))
+            .and_then(|a| a.get("url"))
+            .and_then(|u| u.as_str())
+            .map(str::to_string)
+    };
+    // ⚠ 资产名对不上时返回 `Err` 而不是 `Ok(None)`：名字对不上意味着**这次发布漏传了
+    // 安装包**（改名、流水线出错），那是真问题，必须留痕；报成"已是最新"会让它
+    // 彻底隐形 —— 用户永远发现不了自动更新已经坏了。
+    let setup_name = app_setup_asset_name(&version);
+    let setup_url = find(&setup_name)
+        .ok_or_else(|| format!("release {tag} 里没有资产 {setup_name}"))?;
+    Ok(Some(NewRelease {
+        version,
+        setup_name,
+        setup_url,
+        // 校验和是**可选**的：缺了只降级成"不校验"，不该让整个更新不可用。
+        sums_url: find(APP_SUMS_ASSET_NAME),
+    }))
+}
+
+/// FR-39：下载一个资产到内存。
+pub fn download_asset(url: &str) -> Result<Vec<u8>, String> {
+    // 信任边界：URL 来自响应体，不是本程序拼的。
+    if !url.starts_with(ASSET_URL_PREFIX) {
+        return Err(format!("拒绝下载非 api.github.com 的资产地址: {url}"));
+    }
+    let mut resp = build_agent(Duration::from_secs(DOWNLOAD_TIMEOUT_SECS))
+        .get(url)
+        .header("User-Agent", USER_AGENT)
+        .header("Accept", "application/octet-stream")
+        .call()
+        .map_err(|e| format!("下载失败: {e}{PROXY_HINT}"))?;
+    resp.body_mut()
+        .with_config()
+        .limit(ASSET_LIMIT_BYTES)
+        .read_to_vec()
+        .map_err(|e| format!("下载失败（读取响应体）: {e}"))
+}
+
+/// FR-39：算文件的 SHA256。**零新增依赖** —— 用系统自带的 `certutil.exe`，
+/// 而不是为一个只跑一次的校验引入 `sha2`（GC-2 的精神）。
+pub fn sha256_file(path: &Path) -> Result<String, String> {
+    #[cfg(windows)]
+    use std::os::windows::process::CommandExt;
+
+    let mut cmd = Command::new("certutil.exe"); // GC-7：全名
+    cmd.arg("-hashfile").arg(path).arg("SHA256");
+    #[cfg(windows)]
+    cmd.creation_flags(pm::CREATE_NO_WINDOW); // GC-8
+    let out = cmd.output().map_err(|e| format!("无法执行 certutil.exe: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("certutil.exe 退出码 {:?}", out.status.code()));
+    }
+    parse_certutil_hash(&String::from_utf8_lossy(&out.stdout))
+        .ok_or_else(|| "certutil.exe 的输出里没有 64 位十六进制哈希".to_string())
+}
+
+/// 纯函数：从 `certutil -hashfile` 的输出里取哈希。
+///
+/// ⚠ **按形状取，不按文案取**：certutil 的首行与末行都随系统语言变化
+/// （中文是「SHA256 的 <文件> 哈希:」/「CertUtil: -hashfile 命令成功完成。」），
+/// 按文案匹配的实现在另一种语言的系统上必然失败。哈希本身永远是独占一行的
+/// 64 位十六进制 —— 只有这一条与语言无关。
+pub fn parse_certutil_hash(out: &str) -> Option<String> {
+    out.lines()
+        .map(str::trim)
+        .find(|l| l.len() == 64 && l.chars().all(|c| c.is_ascii_hexdigit()))
+        .map(|l| l.to_ascii_lowercase())
+}
+
+/// 纯函数：从 `SHA256SUMS.txt` 里取指定文件的哈希。
+///
+/// 认 `sha256sum` 的两种写法（`<hash>  <name>` 与 `<hash> *<name>`）以及 CRLF
+/// 行尾。文件名按**大小写不敏感**比较 —— Windows 的文件系统如此，
+/// 在这里比出个假阴性只会让校验白白失败。
+pub fn parse_sha256sums(text: &str, file_name: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let mut it = line.split_whitespace();
+        let (hash, name) = (it.next()?, it.next()?);
+        (hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()))
+            .then(|| name.trim_start_matches('*'))
+            .filter(|n| n.eq_ignore_ascii_case(file_name))
+            .map(|_| hash.to_ascii_lowercase())
+    })
+}
+
+/// FR-39：启动安装向导。**不等待** —— 向导必须活到本程序退出之后，
+/// 而它要替换的正是本程序自己的 exe。
+pub fn launch_setup(path: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    use std::os::windows::process::CommandExt;
+
+    let mut cmd = Command::new(path); // 绝对路径：调用方给的是 %TEMP% 下我们自己的目录
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    #[cfg(windows)]
+    cmd.creation_flags(pm::CREATE_NO_WINDOW); // GC-8
+    cmd.spawn().map_err(|e| format!("启动安装向导失败: {e}"))?;
+    Ok(())
+}
+
 /// FR-17：端口占用探测。stdlib 实现，无依赖。
 ///
 /// ⚠ "连接被拒"与"连接超时"必须区别对待，不能只看 `is_ok()`。
@@ -786,6 +987,166 @@ mod tests {
     fn v(s: &str) -> Version {
         s.parse().unwrap()
     }
+
+    // ══════════════════ FR-38 / FR-39：本程序自身的更新 ══════════════════
+
+    /// 真实 `releases/latest` 响应的**精简形态**（只留用到的字段：tag_name、
+    /// draft/prerelease、assets 的 name 与 url）。与 registry 那组夹具同款做法。
+    fn app_release_json(tag: &str, draft: bool, prerelease: bool, assets: &[(&str, &str)]) -> String {
+        let assets: Vec<String> = assets
+            .iter()
+            .map(|(n, u)| format!(r#"{{"name":"{n}","url":"{u}"}}"#))
+            .collect();
+        format!(
+            r#"{{"tag_name":"{tag}","draft":{draft},"prerelease":{prerelease},"assets":[{}]}}"#,
+            assets.join(",")
+        )
+    }
+
+    fn api_asset(name: &str, id: u32) -> (String, String) {
+        (
+            name.to_string(),
+            format!("https://api.github.com/repos/hilariouhiss/DSH-Manager/releases/assets/{id}"),
+        )
+    }
+
+    /// U-3：判据是**严格大于**（相等/更旧都不得提示），资产**按名字**定位。
+    ///
+    /// ⚠ 三条否定用例各自对应一个真实故障：
+    /// - 相等 → 提示了就是"每次开机都让你装同一个版本"；
+    /// - 更旧 → 提示了就是**给用户降级**（与 FR-34 同一条判据）；
+    /// - prerelease / draft → 把测试版推给所有人。
+    #[test]
+    fn parse_app_release_strictly_greater_and_asset_by_name() {
+        let (n, u) = api_asset(&app_setup_asset_name(&v("0.3.0")), 1);
+        let (sn, su) = api_asset(APP_SUMS_ASSET_NAME, 2);
+        let json = app_release_json("v0.3.0", false, false, &[(&sn, &su), (&n, &u)]);
+
+        let got = parse_app_release(&json, &v("0.2.1")).unwrap().expect("0.2.1 < 0.3.0 应当有新版本");
+        assert_eq!(got.version, v("0.3.0"));
+        assert_eq!(got.setup_name, "dsh-manager-v0.3.0-windows-x64-setup.exe");
+        // 用的是 API 地址，不是 browser_download_url（那是 github.com，本机不可达）
+        assert!(got.setup_url.starts_with("https://api.github.com/repos/"));
+        assert_eq!(got.sums_url.as_deref(), Some(su.as_str()));
+
+        // 相等 / 更旧 / prerelease / draft → 都不算"有新版本"
+        assert!(parse_app_release(&json, &v("0.3.0")).unwrap().is_none(), "相等不得提示");
+        assert!(parse_app_release(&json, &v("0.3.1")).unwrap().is_none(), "更旧不得提示（那是降级）");
+        let pre = app_release_json("v0.3.0", false, true, &[(&n, &u)]);
+        assert!(parse_app_release(&pre, &v("0.2.1")).unwrap().is_none(), "prerelease 不得提示");
+        let draft = app_release_json("v0.3.0", true, false, &[(&n, &u)]);
+        assert!(parse_app_release(&draft, &v("0.2.1")).unwrap().is_none(), "draft 不得提示");
+
+        // 没有 SHA256SUMS.txt 的 release 仍然可用（校验降级为"不校验"）
+        let no_sums = app_release_json("v0.3.0", false, false, &[(&n, &u)]);
+        assert_eq!(parse_app_release(&no_sums, &v("0.2.1")).unwrap().unwrap().sums_url, None);
+
+        // tag 不带 v 也认
+        let bare = app_release_json("0.3.0", false, false, &[(&n, &u)]);
+        assert_eq!(parse_app_release(&bare, &v("0.2.1")).unwrap().unwrap().version, v("0.3.0"));
+    }
+
+    /// U-3：**资产名不符必须 `Err`**，不得报成"已是最新"。
+    ///
+    /// 这是本模块最重要的一条断言：发布流水线改名/漏传安装包时，若这里返回
+    /// `Ok(None)`，用户只会看到"已是最新"，而这个故障将**永远隐形**。
+    /// 真机已经撞到过一次（v0.2.1 用的是旧资产名）。
+    #[test]
+    fn parse_app_release_rejects_unusable_shapes() {
+        let (n, u) = api_asset(&app_setup_asset_name(&v("0.3.0")), 1);
+
+        // 资产名不符（例如历史上的 dsh-manager-0.2.1-setup.exe）
+        let wrong = app_release_json("v0.3.0", false, false, &[("dsh-manager-0.2.1-setup.exe", &u)]);
+        let e = parse_app_release(&wrong, &v("0.2.1")).unwrap_err();
+        assert!(e.contains("dsh-manager-v0.3.0-windows-x64-setup.exe"), "错误里必须有期望的资产名: {e}");
+
+        // 完全没有 assets
+        let none = app_release_json("v0.3.0", false, false, &[]);
+        assert!(parse_app_release(&none, &v("0.2.1")).is_err());
+
+        // tag 不是版本号 / 缺 tag_name / JSON 坏了
+        let bad_tag = app_release_json("nightly", false, false, &[(&n, &u)]);
+        assert!(parse_app_release(&bad_tag, &v("0.2.1")).is_err());
+        assert!(parse_app_release(r#"{"assets":[]}"#, &v("0.2.1")).is_err());
+        assert!(parse_app_release("not json", &v("0.2.1")).is_err());
+    }
+
+    /// U-4：`SHA256SUMS.txt` 的行匹配。
+    ///
+    /// 三种写法都要认：`sha256sum` 的两个空格、二进制标记 `*`、以及 Windows 上写出来的
+    /// CRLF 行尾。文件名按**大小写不敏感**比较（Windows 的文件系统如此）。
+    #[test]
+    fn parse_sha256sums_matches_exact_file_name() {
+        const H: &str = "bc4007dd9d3512e5227e8ad0426a6a2fa131ac3770e771a34aa04c687211feaa";
+        const OTHER: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+        let text = format!(
+            "{OTHER}  dsh-manager-v0.3.0-windows-x64.exe\r\n\
+             {H}  dsh-manager-v0.3.0-windows-x64-setup.exe\r\n\
+             {OTHER} *dsh-manager-v0.4.0-windows-x64-setup.exe\n"
+        );
+        assert_eq!(
+            parse_sha256sums(&text, "dsh-manager-v0.3.0-windows-x64-setup.exe").as_deref(),
+            Some(H)
+        );
+        // 大小写不敏感
+        assert_eq!(
+            parse_sha256sums(&text, "DSH-MANAGER-V0.3.0-WINDOWS-X64-SETUP.EXE").as_deref(),
+            Some(H)
+        );
+        // 二进制标记写法
+        assert_eq!(
+            parse_sha256sums(&text, "dsh-manager-v0.4.0-windows-x64-setup.exe").as_deref(),
+            Some(OTHER)
+        );
+        // 缺条目 / 空文件 / 哈希长度不对
+        assert_eq!(parse_sha256sums(&text, "dsh-manager-v0.9.0-windows-x64-setup.exe"), None);
+        assert_eq!(parse_sha256sums("", "x.exe"), None);
+        assert_eq!(parse_sha256sums("deadbeef  x.exe\n", "x.exe"), None);
+        // 同名前缀的另一个资产不得误命中
+        assert_eq!(
+            parse_sha256sums(&text, "dsh-manager-v0.3.0-windows-x64.exe"),
+            Some(OTHER.to_string())
+        );
+    }
+
+    /// U-5：certutil 的解析**不依赖系统语言**。
+    ///
+    /// 夹具是中文与英文两种真实输出形状：首行与末行都随语言变化，只有哈希那一行
+    /// （独占一行的 64 位十六进制）与语言无关 —— 按文案匹配的实现在另一种语言上必然失败。
+    #[test]
+    fn parse_certutil_hash_reads_both_locales() {
+        const H: &str = "bc4007dd9d3512e5227e8ad0426a6a2fa131ac3770e771a34aa04c687211feaa";
+        let zh = format!("SHA256 的 C:/Temp/x.exe 哈希:\r\n{H}\r\nCertUtil: -hashfile 命令成功完成。\r\n");
+        let en = format!(
+            "SHA256 hash of C:/Temp/x.exe:\r\n{H}\r\nCertUtil: -hashfile command completed successfully.\r\n"
+        );
+        for (name, out) in [("zh", &zh), ("en", &en)] {
+            assert_eq!(parse_certutil_hash(out).as_deref(), Some(H), "{name} 输出应能取到哈希");
+        }
+        // 大写要归一成小写（与 SHA256SUMS.txt 里的小写做字符串比较）
+        let upper = format!("SHA256 hash:\n{}\n", H.to_uppercase());
+        assert_eq!(parse_certutil_hash(&upper).as_deref(), Some(H));
+        // 失败输出里没有 64 位十六进制 → None（调用方据此降级为"未校验"）
+        assert_eq!(parse_certutil_hash("CertUtil: -hashfile FAILED\n"), None);
+        assert_eq!(parse_certutil_hash(""), None);
+    }
+
+    /// U-6：资产地址是**信任边界** —— URL 来自响应体，不是本程序拼的。
+    #[test]
+    fn download_asset_rejects_non_api_github_hosts() {
+        for url in [
+            "https://github.com/hilariouhiss/DSH-Manager/releases/download/v0.3.0/x.exe",
+            "https://evil.example.com/x.exe",
+            "http://api.github.com/repos/x/y",
+            "file:///C:/x.exe",
+        ] {
+            let e = download_asset(url).unwrap_err();
+            assert!(e.contains("拒绝下载"), "{url} 必须被拒绝，得到: {e}");
+        }
+    }
+
+
+
 
     /// 取自 registry 真实响应的精简形态
     const FIXTURE: &str = r#"{
@@ -1130,3 +1491,4 @@ mod tests {
         }
     }
 }
+
