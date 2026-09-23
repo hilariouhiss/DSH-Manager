@@ -97,7 +97,10 @@ jobs:
           $v = $tag.TrimStart('v')
           # 参数先攒进数组再整体 splat：`$x = if (...) { @('--prerelease') }` 会退化成
           # 字符串，`@x` 于是按**字符**展开（已实测），必须用数组的 += 追加
-          $ghArgs = @($tag, '--title', $tag, '--generate-notes')
+          # 正文取**注解 tag 的说明**：本仓库的 tag 说明一直是按版本写好的 changelog，
+          # 而 `--generate-notes` 对直接推到 main 的提交只会给一行 compare 链接。
+          # 轻量 tag 会退回用提交说明（checkout 的 fetch 后 tag 对象确实在本地，已实测）。
+          $ghArgs = @($tag, '--title', $tag, '--notes-from-tag')
           # 带 `-` 的 tag 标成 prerelease，免得它被 GitHub 当成 Latest release
           if ($tag -match '-') { $ghArgs += '--prerelease' }
           gh release create @ghArgs `

@@ -101,10 +101,11 @@ cargo test                     # 单元测试
 
 ## 发布新版本
 
-改 `Cargo.toml` 的 `version` 并提交，然后打 tag 推上去：
+改 `Cargo.toml` 的 `version` 并提交，然后打 **注解 tag** 推上去：
 
 ```powershell
-git tag v0.3.0
+# 注解 tag（-a）的说明会直接成为 Release 正文 —— 按 changelog 写；轻量 tag 会退回用提交说明
+git tag -a v0.3.0 -m "DSH Manager v0.3.0 —— 这次发了什么"
 git push origin main --tags
 ```
 
@@ -114,7 +115,7 @@ git push origin main --tags
 2. 校验 **tag 与 `Cargo.toml` 版本一致**（不一致立即失败，不浪费一次构建）；
 3. `cargo build --locked --release`，并校验 exe 的 `FileVersion` 与 tag 一致（防"没嵌上版本资源"）；
 4. 编译安装包，生成 `SHA256SUMS.txt`；
-5. `gh release create` 建 Release，附上 `dsh-manager.exe`、`dsh-manager-<版本>-setup.exe`、`SHA256SUMS.txt`（含 `-` 的 tag 自动标为 prerelease）。
+5. `gh release create` 建 Release（正文取注解 tag 的说明），附上 `dsh-manager.exe`、`dsh-manager-<版本>-setup.exe`、`SHA256SUMS.txt`（含 `-` 的 tag 自动标为 prerelease）。
 
 日常 CI（[`ci.yml`](.github/workflows/ci.yml)）在 push 到 `main` 与 PR 上跑 `cargo test --locked`。
 
