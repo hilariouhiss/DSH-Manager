@@ -1335,6 +1335,29 @@ fn execute(job: Job, tx: &Sender<UiMsg>) {
     }
 }
 
+/// FR-27b：更新说明正文里点到一个链接 → **只有绝对 http(s) 的**才派发打开。
+///
+/// 正文里的站内链接不是浏览器地址：开头那行语言导航
+/// `[中文](#cn-v0.1.7-alpha.2) | [English](#en-v0.1.7-alpha.2)`
+/// （实测 20 个 dsh release 的正文第一行全是它）与 `[SAFETY.md](SAFETY.md)` 这类
+/// 相对路径 —— 面板里没有锚点目标（FR-27 已裁决不做中英切换），它们既打不开，
+/// 也不是"打开失败"，所以**不派发任何任务**。
+///
+/// ⚠ 这个判别就是用户报的那条刷屏的唯一开关：原状是
+/// `send(Job::OpenUrl { url })` **无条件**派发，而白名单（Ruling 65，`open_url`
+/// 里的第二道，没动）会把它拒掉 —— 于是每点一次语言导航行，日志里就多一条
+/// `打开网页失败: 拒绝打开非 http(s) 链接: #en-v0.1.7-alpha.2`。
+/// 判据与白名单**共用** `dsh::is_web_url`：这里不要再写一遍 `starts_with`。
+///
+/// 派发走调用方给的 `send`（与 `dispatch_plugin_op` 同款），而不是自己抓通道：
+/// 单测因此能用**真通道**断言"收件箱里到底有没有东西"，接线那一跳也在覆盖之内。
+fn dispatch_notes_link(url: &str, send: &impl Fn(Job)) {
+    if !dsh::is_web_url(url) {
+        return;
+    }
+    send(Job::OpenUrl { url: url.to_string() });
+}
+
 /// FR-16 / FR-17。启动流程抽成函数，供 StartWeb 与事务后重启复用。
 fn start_web(port: u16, tx: &Sender<UiMsg>) {
     let send = |m: UiMsg| {
@@ -1779,8 +1802,9 @@ fn wire_callbacks(
     {
         let send = send.clone();
         win.on_link_clicked(move |url| {
-            // FR-27b：说明正文自带的链接透传给系统浏览器
-            send(Job::OpenUrl { url: url.to_string() });
+            // FR-27b：判别在 `dispatch_notes_link` 里（它有单测 —— 它就是用户报的
+            // 刷屏的唯一开关，别在这里改回无条件 `send(Job::OpenUrl { … })`）。
+            dispatch_notes_link(&url, &send);
         });
     }
 
@@ -2402,4 +2426,61 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     slint::run_event_loop_until_quit()?; // FR-23：不是 run_event_loop()
     drop(timer);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 与运行时同一条路径：给 `dispatch_notes_link` 一个**真通道**，看 worker
+    /// 的收件箱里到底有没有东西。这样"判别"和"接线"（回调里那一跳）一起被覆盖
+    /// —— 只测一个返回 `Option` 的分类函数挡不住"接线被改回无条件派发"。
+    fn dispatch_into_channel(url: &str) -> Result<Job, mpsc::TryRecvError> {
+        let (tx, rx) = mpsc::channel::<Job>();
+        dispatch_notes_link(url, &|j| {
+            let _ = tx.send(j);
+        });
+        rx.try_recv()
+    }
+
+    /// ★ 判别性：点更新说明里的**站内**链接，不得派发任何任务。
+    ///
+    /// 它捕获的变异：把 `dispatch_notes_link` 改回无条件派发（原状）—— 那样
+    /// `#en-v0.1.7-alpha.2` 会一路走到白名单被拒，变成一条
+    /// `打开网页失败: 拒绝打开非 http(s) 链接: …`（用户报的刷屏）。
+    ///
+    /// 四个取值都取自真实正文：导航行两种写法（`0.1.7-alpha.2` 用
+    /// `#cn-v…/#en-v…`，更早的两个 release 用 `#chinese/#english`）与相对路径。
+    #[test]
+    fn in_page_notes_links_dispatch_nothing() {
+        for url in [
+            "#en-v0.1.7-alpha.2",
+            "#cn-v0.1.7-alpha.2",
+            "#english", // 更早的 release 用这种短锚点 —— 判据必须按"前缀"而不是按版本号形状
+            "SAFETY.md",
+        ] {
+            assert!(
+                dispatch_into_channel(url).is_err(),
+                "{url} 不该派发任何任务（用户报的刷屏就是它）"
+            );
+        }
+    }
+
+    /// 反面：真链接照旧派发，且 Url **逐字**透传（不重写、不补前缀）。
+    ///
+    /// 少了这条，一个"什么都不派发"的实现也能让上面那条测试全绿 ——
+    /// 而那样正文末尾的 Full Changelog 这类真链接就成了点不动的死链。
+    #[test]
+    fn real_notes_links_still_dispatch_verbatim() {
+        let url = "https://github.com/deepseek-ai/deepseek-harness/compare/dsh-v0.1.7-alpha.1...dsh-v0.1.7-alpha.2";
+        match dispatch_into_channel(url) {
+            Ok(Job::OpenUrl { url: got }) => assert_eq!(got, url),
+            other => panic!("真链接必须派发 OpenUrl，实得 {other:?}"),
+        }
+        // 「打开网页」按钮那条路不是本函数，但它构造的地址也必须在这条判据之内
+        assert!(matches!(
+            dispatch_into_channel("http://127.0.0.1:3080"),
+            Ok(Job::OpenUrl { .. })
+        ));
+    }
 }

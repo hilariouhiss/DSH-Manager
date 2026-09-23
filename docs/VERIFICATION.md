@@ -954,3 +954,123 @@ certutil 实算 = 66be154564d24d59f8013599fdb06101fb0c1e4e6ad1fcd4004348ac6c0a99
 - **真机端到端（V-28~V-30）**：需要"比当前版本更新的 release"存在，因此只能在 v0.3.0 发布之后由用户执行。
 - **静默安装档**：本轮按用户选择只做 B 档（下载 + 可见向导）。C 档（`/SILENT`）在"为所有用户安装"的副本上会卡 UAC，未实现。
 - **下载进度百分比**：未做（见 ARCHITECTURE §4.9.7）。
+
+---
+
+## 8. 更新说明里的站内链接不再误报（2026-09-23，SRS v1.6 / ARCHITECTURE v1.9）
+
+**用户报的现象**：更新 dsh（npm `0.1.7-alpha.1 → 0.1.7-alpha.2`）后，日志里反复出现
+`打开网页失败：拒绝打开非 http(s) 连接: #en-v0.1.7-alpha.2`（截图里 10 条，`#en-…` 8 条 / `#cn-…` 2 条）。
+⚠ 上面这句是**照截图/用户原话**抄的；代码产出的那一行是
+`打开网页失败: 拒绝打开非 http(s) 链接: #en-v0.1.7-alpha.2`（半角 `: `，且是「**链接**」不是「连接」——
+分隔符来自 `main.rs` 的 `format!("{context}失败: {message}")`，文案来自 `dsh::open_url` 的 `Err`）。
+
+### 8.1 根因（先定位，再改）
+
+| 环节 | 事实 | 证据 |
+|---|---|---|
+| 触发源 | 说明正文**第一行**就是语言导航行 `[中文](#cn-v0.1.7-alpha.2) \| [English](#en-v0.1.7-alpha.2)` | `GET /repos/deepseek-ai/deepseek-harness/releases/tags/dsh-v0.1.7-alpha.2` 的 `body` 首行（本次实测） |
+| 放大到全部版本 | 20 个 dsh release **每个都有**这一行；正文链接分类：锚点 40 条、相对路径 6 条（`SAFETY.md` / `SAFETY.zh.md` / `BRAND_GUIDELINES*.md`）、真 https 8 条 | 同上，`releases?per_page=100` 全量正则统计（本次实测，评审者独立复测一致）。**锚点写法有三种**：`#cn-v…`/`#en-v…`（近期）、`#chinese`/`#english`、`#cn`/`#en`（更早）—— 所以判据必须是"**不是 http(s)**"这个通用前缀，而不是"以 `#cn-` 开头" |
+| 派发 | `win.on_link_clicked` **无条件**把字符串变成 `Job::OpenUrl` | 代码：`src/main.rs`（修复前）—— 两处转发（`NoteText` → `NoteBlockView`，再 `NoteBlockView` → `MainWindow` 的 `root.link-clicked`；说明面板本身就在 `MainWindow` 里）都不判别 |
+| 报错 | `dsh::open_url` 的白名单（Ruling 65）在 `spawn` 之前 `Err` → `UiMsg::Failed{context:"打开网页"}` → 日志一行 | 白名单是**正确**的：改的不能是它。全仓库只有这一处 `context: "打开网页"` |
+| 一次点击 = 一条日志 | `link-clicked` 只在 Slint 的 `MouseEvent::Released{Left}` 落在链接上时发一次 | `i-slint-core-1.18.0/src/items/text.rs:311`（`Released` 分支）→ `:319`（`link_clicked.call`）；shared-parley 路径，该 feature 在默认集合里。该文件里 `key_event` / `focus_event` 都不发它、也没有 accessibility 发射路径 ⇒ **没有**键盘/无障碍的第二条生产者。截图里的十几条 = 用户反复点击（点了没反应会继续点），不是自动循环 |
+| 不是事务触发的 | 更新事务走的是"重探环境 → `start_web(port)`"，那条路上**没有**任何 `Job::OpenUrl`；日志也不落盘（`state.json` 无日志字段），启动时不会重放 | 代码：`Job::TxDone` 分支（`src/main.rs`）；`Job::StartWeb` 只有两个发送点，`start_web` 不发 `OpenUrl` |
+
+### 8.2 改法
+
+- `dsh::is_web_url(&str) -> bool`：新的纯函数（前缀判据、大小写不敏感）。`open_url` 的白名单改用它 —— 判据从此只有一份。
+- `main::dispatch_notes_link(url, &impl Fn(Job))`：新的纯函数，`on_link_clicked` 的**准入**（与既有的 `dispatch_plugin_op` 同款：派发走调用方给的 `send`）。非 http(s) 的正文链接（锚点 / 相对路径）**一个任务都不派发**：不打开、不报错、不写日志（面板里没有锚点目标 —— FR-27 已裁决不做中英切换，它们既打不开也不是"打开失败"）。
+- **白名单与 `explorer.exe` 单参数的注入防线一字未动**（Ruling 65 仍是第二道，只是不再有人往它嘴里塞站内链接）；`open_url` 的 `Err` 文案也逐字未变（`git show HEAD:src/dsh.rs` 对照）。
+
+### 8.3 自动化证据（本机实测）
+
+| 项 | 结果 |
+|---|---|
+| `cargo test` | **138 passed / 0 failed**（本轮新增 4 条；`HEAD` 为 134 条：`#[test]` 计数 dsh 33→35、main 0→2，其余文件不变） |
+| `open_url_refuses_non_web_targets`（dsh） | `#en-v0.1.7-alpha.2` / `#cn-…` / `SAFETY.md` / `file:///…calc.exe` / `javascript:` / 空串逐条 `Err`，且都发生在 `spawn` 之前 —— 钉住 Ruling 65 的**顺序**。判别性的一步 `file:///…calc.exe` 不会弹出计算器：跑完该测试后 `tasklist /FI "IMAGENAME eq CalculatorApp.exe"`（与 `calc.exe`）均为 *No tasks*（跑前跑后各查一次） |
+| `notes_in_page_links_are_not_web_urls`（dsh） | 锚点与相对路径 → `false`；`github.com/…/compare\|blob`、`http://127.0.0.1:3080`、`HTTPS://…`（大小写混写）→ `true` —— 判据本身的表驱动 |
+| `in_page_notes_links_dispatch_nothing`（main） | **判别性的一条**，且**覆盖接线**：给 `dispatch_notes_link` 一个真通道，断言 worker 收件箱里什么都没有。四个取自真实正文的取值：`#en-v0.1.7-alpha.2`、`#cn-v0.1.7-alpha.2`、`#english`（更早 release 的短锚点）、`SAFETY.md`。红-绿实测：把 `dispatch_notes_link` 的判别整个去掉（= 修复前的无条件派发，**不留下任何"未被调用的辅助函数"**）→ 该测试**失败**于第一条断言（`#en-v0.1.7-alpha.2 不该派发任何任务（用户报的刷屏就是它）`；删掉那三行后 `panicked at src\main.rs:2459`，行号会随删改前移，以文案为准）；改回后 138/138 全绿 |
+| `real_notes_links_still_dispatch_verbatim`（main） | 反面：真链接仍派出 `Job::OpenUrl`，且 Url **逐字**透传。反向变异实测：把 `dispatch_notes_link` 改成"什么都不派发" → 该测试失败于 `真链接必须派发 OpenUrl，实得 Err(Empty)`。没有它，一个"什么都不派发"的实现也能骗过上面那条 —— 那等于把正文末尾的 Full Changelog 变成死链 |
+| `cargo build` | **0 警告**（`touch src/*.rs` 后强制重编，`grep -c '^warning'` = 0；`HEAD` 的 134 条计数与"main.rs 第一个测试模块"同样在这轮核对） |
+| 单测没有泄漏进产物 | `cargo build --release`（exit 0、0 警告）后：`grep -c "不该派发任何任务" target/release/dsh-manager.exe` → **0**、`grep -c "真链接必须派发 OpenUrl"` → **0**（测试专用文案不在产物里），对照 `grep -c "拒绝打开非 http(s) 链接"` → **1**（非测试代码在） |
+| 路径唯一性（评审者独立复核） | `Job::OpenUrl` 的生产发送点只有三个：本函数、窗口「打开网页」、托盘「打开 DSH 网页」（后两个恒为 `http://127.0.0.1:<port>`）；`link-clicked` 全仓库只有一条 Slint 转发链 + 一处 Rust 注册，无 `invoke_*`、无拖放、无第二条 URL 回调 |
+
+### 8.4 未做（诚实记录）
+
+- **真机点击回放**：`link-clicked` 是 GUI 回调，本仓库按 §6.3 的边界不做 GUI 自动化；本轮**没有**真机点一遍语言导航行。判据 = 上表那四条单测（含接线那一跳）+ 路径唯一性。想亲眼确认的话：打开任一版本的更新说明，点第一行的〔English〕—— 日志**不应**新增任何行。
+- **点击仍然"没反应"是有意的**：站内链接点了什么都不发生（不弹、不跳、不写日志）。Ruling 92 把"用户可见的静默失败"列为缺陷类，这里刻意选择静默 —— 依据是 FR-27 已裁决不做中英切换（面板里根本没有锚点目标），且报错本身正是用户报的 bug。要改成"跳转"属增量功能，见下条。
+- **锚点跳转（点〔English〕滚到英文段）**：未做，与"不做中英切换"同一条裁决；要做需把 `<h3 id="…">` 的锚点带进 `NoteBlock`、在 Slint 侧换算滚动位置（`ScrollView.viewport-y` 需要各块 y 偏移，块高要等布局跑完），属增量功能。
+
+---
+
+## 9. 输出面板的正文可选中复制（2026-09-23，SRS v1.7 / ARCHITECTURE v1.10）
+
+**用户要求**：输出（FR-28 的日志面板）里的文字可以选中复制。
+**改法**：`ui/app.slint` 的 `LogLine` 里那个 `Text` 换成 `read-only: true` 的 `TextInput`
+（Slint 的 `Text` 没有任何选区支持；`read-only` 的官方语义是"能选不能改"）。
+**Rust 侧零改动、零新增依赖** —— `Ctrl+C` 的剪贴板写入由 Slint 自己做。
+
+### 9.1 源码依据（不是猜的）
+
+| 事实 | 出处 |
+|---|---|
+| 左键按下即 `GrabMouse` ⇒ 外层 `ListView`(Flickable) 抢不走拖动 | `i-slint-core-1.18.0/items/text.rs` 的 `input_event`（`MouseEvent::Pressed{Left}` 分支 `return InputEventResult::GrabMouse`） |
+| `Ctrl+A` / `Ctrl+C` 在 `read_only` 下**照旧有效**（被挡的只有 Paste/Cut/Undo/Redo） | 同文件 `key_event`：`StandardShortcut::SelectAll` / `Copy` 无 `read_only` 条件；`Paste|Cut|Undo|Redo if !self.read_only()` |
+| `read-only` 时插入光标不画 | 同文件 `show_cursor`：`if self.read_only() \|\| !self.has_focus() { hide }` |
+| 剪贴板写的是"系统剪贴板"，且 Windows 上**没有**主选区剪贴板 | `Platform::set_clipboard_text` + `i-slint-backend-winit-1.18.0/clipboard.rs` 的 `select_clipboard`：`SelectionClipboard` → `SilentClipboardContext`（空实现） |
+| `Text` 默认无障碍角色是 `text`，`TextInput` 默认是 `text-input` | `i-slint-common-1.18.0/enums.rs` 的 `AccessibleRole`（两条 doc 注释各写明"automatically applied"） |
+
+### 9.2 离屏探针实测（`target/ui-probe-copy/`，⚠ 探针不入库，配方见 §9.5）
+
+| 项 | 结果 |
+|---|---|
+| **行几何：改动前 vs 改动后** | **逐字段一致**：三行墨迹带 `y 393..404 / 413..424 / 433..444`（高 12，行距 20），左边缘 `x=30`，宽度 83/77/96，墨色 `#BCC5F7`（命令）/`#7FB4E4`（成功）/`#F07178`（错误）。⇒ 换 `TextInput` **没有动排版** |
+| **长行（375 字）** | 改动前后同一条：`y 393..404  x 30..416 (w 387)  px 1720` ⇒ 长行仍是"按内容宽度画出去、被卡片裁掉"，`TextInput` **没有**引入内部横向滚动 |
+| 拖选整行 + `Ctrl+C` | **PASS**，剪贴板 = `"probe-ok-two"` —— 即该行正文，`✓ ` 前缀已剥 |
+| 只拖选、不按 `Ctrl+C`（判别性对照） | **PASS**，剪贴板为空 ⇒ 上一条那串字确实是 `Ctrl+C` 写进去的，不是探针/选区自己写的 |
+| 点一下 + `Ctrl+A` + `Ctrl+C` | **PASS**，剪贴板 = `"probe-err-three"`（整行） |
+| 只读：打字 `X` | **PASS**，打字前后两帧 diff **0 px** ⊂ 内容没被改 |
+| 选区确实画出来了 | 拖动后 vs 三行基准帧：`893 px, bbox x 30..106 y 412..423`，底色 `#101019 → #353952`（`Tokens.accent-line`）—— 正是第二行的文字区 |
+| **亮色主题（`copy light`）** | A~D 同样 **ALL PASS**；行几何与暗色同结构（同 y 带、同 20px 行距），墨色换成亮色侧（`#2E6C9E` / `#9C3F41`），选区底色 `#FCFCFD → #D4D7E5` ⇒ 选区在两个主题下都可见 |
+| `cargo test` / `cargo build` | **138 passed / 0 failed**；`touch src/*.rs` 后强制重编 **0 警告** |
+
+### 9.3 待用户执行（真机端到端）
+
+| # | 步骤 | 通过判据 | 状态 |
+|---|---|---|---|
+| **V-31** | ① 按住左键横向拖过日志里的一行 → `Ctrl+C` → 粘贴到记事本；② 点一行后 `Ctrl+A` + `Ctrl+C` → 粘贴；③ 换一行**只拖不按** `Ctrl+C` → 粘贴；④ 在日志行上打字 | ①② 依次得到"剥掉前缀的那行正文"与"整行正文"；③ 剪贴板**不变**（仍是上一步那份）；④ 内容不变。另：拖选时日志区**不跟着滚动**（滚轮 / 滚动条仍可滚） | ⬜ |
+
+### 9.4 未做（诚实记录）
+
+- **真机端到端**：探针走的是自写 `Platform`（Windows 语义：只认 `DefaultClipboard`），它证明的是
+  "Slint 这条链会把选中文字写进剪贴板"，**没有**真的往 Windows 剪贴板写、再粘到记事本。
+  上面那张表（V-31）就是留给这一步的。
+- **跨行选择 / 复制全部**：按 SRS FR-28 v1.7 的决定**不做**。
+- **探针的两处自身缺陷（已修，记下来免得下一个人重踩）**：① 组合键必须**按住**修饰键
+  （`KeyPressed(Control)` → `KeyPressed("c")` → `KeyReleased("c")` → `KeyReleased(Control)`）；
+  写成 `key(Control)` 再 `key("c")` 会因为中间那次 `KeyReleased` 清掉控制位而永远按不出
+  `Ctrl+C`（假阴性）；② 拖选起点必须落在 `TextInput` **内部**（它的左边缘 = 文字左边缘），
+  落在左边 3px 就是点在控件外，拖动没人接。
+
+### 9.5 探针配方（重建用）
+
+```text
+target/ui-probe-copy/
+  Cargo.toml    # [package] edition="2021"、空 [workspace]；slint / slint-build 1.18
+                # （features 同主程序：image-default-formats；renderer-software 本就是默认 feature）
+  build.rs      # slint_build::compile("../../ui/app.slint")   ← 编译真实的 app.slint
+  src/main.rs   # ① 自写 Platform：create_window_adapter 交出 MinimalSoftwareWindow
+                #   (RepaintBufferType::NewBuffer)，set_clipboard_text **只记 DefaultClipboard**
+                #   （照抄 winit 在 Windows 的语义，见 §9.1）
+                # ② MainWindow::new() → global::<Tokens>().set_dark(true) → show()
+                # ③ 帧 = request_redraw + draw_if_needed(render) 连渲两帧，回读 Vec<Rgb8Pixel>
+                # ④ geometry：空日志帧 vs 三行日志帧做差集 → 每行的 y 带 / x 范围 / 墨色
+                # ⑤ copy：在真帧上 dispatch_event(PointerPressed → PointerMoved×8 →
+                #   PointerReleased) + Ctrl+A/Ctrl+C，读回探针记下的剪贴板
+# 三个模式：
+cargo run -- geometry   # 行几何（改前/改后各跑一次比对）
+cargo run -- long       # 375 字长行的墨迹边界
+cargo run -- copy       # 四个场景 A~D，全 PASS 退出码 0
+cargo run -- copy light # 同上，亮色主题（选区在两个主题下都要看得见）
+# 「改动前」的帧怎么拿：`git stash push -- ui/app.slint` → 跑 → `git stash pop`
+```

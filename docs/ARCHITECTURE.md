@@ -2,9 +2,9 @@
 
 | 项目 | 内容 |
 |---|---|
-| 文档版本 | 1.8 |
+| 文档版本 | 1.10 |
 | 日期 | 2026-09-23 |
-| 关联文档 | [docs/SRS.md](SRS.md) v1.5（需求依据） |
+| 关联文档 | [docs/SRS.md](SRS.md) v1.7（需求依据） |
 | 技术栈 | Rust 2024 edition + Slint 1.18 |
 | 状态 | 待实现 |
 
@@ -419,7 +419,9 @@ export component MainWindow inherits Window {
     callback update-later-clicked();     // 〔以后再说〕/遮罩/Esc/X：只关框
     callback update-skip-clicked();      // 〔忽略此版本〕：写进 state.json
     callback update-download-clicked();  // 〔下载并安装〕
-    callback link-clicked(string);       // 来自 StyledText，交给系统浏览器
+    callback link-clicked(string);       // 来自 StyledText；只有绝对 http(s) 的交出去
+                                         // （main::dispatch_notes_link，见 FR-27b：
+                                         //  站内锚点 / 相对路径不派发、不报错）
 }
 
 // ⚠ `PluginRow` 的**字段全是格式化好的字符串**（可更新与否、显示"未安装"还是"—"都由
@@ -436,6 +438,15 @@ export enum NotesStatus { loading, ok, missing, failed }
 
 1. **下拉列表用格式化字符串而不是自定义 delegate**。下拉（v1.3 起为 `GlassSelect`，此前是 `ComboBox`）接受 `[string]`，把通道与"当前"标记直接拼进文案（`"0.1.6-alpha.2  (alpha)  ← 当前"`），省掉一整套自定义 delegate。SRS FR-10 只要求"标注通道"与"标识当前版本"，格式化字符串已满足。⚠️ v1.3 后通道后缀与"← 当前"已按用户要求移到行尾/标题，本条只保留"不写自定义 delegate"这一半。
 2. **日志用 `[string]` + `ListView`**，不用"整段文本"属性。原因：日志会持续增长，整段拼接是每次更新 O(n)；`VecModel` 追加是 O(1)，且 `ListView` 自带虚拟化。
+   **每行是 `read-only: true` 的 `TextInput`（v1.10 改，SRS v1.7 的 FR-28 修订）**：
+   Slint 的 `Text` **完全没有选区**，`TextInput` 才有；`read-only` 的官方语义就是
+   "能选不能改"。三处必须一起记住：
+   - 左键按下即 `GrabMouse`（`i-slint-core items/text.rs` 的 `input_event`）⇒ 拖选能拿到鼠标，
+     但**日志区按住拖动不再滚动**（滚轮 / 滚动条 / `PageUp` 照旧）；
+   - `Ctrl+A` / `Ctrl+C` 不受 `read-only` 影响（被它挡掉的只有 Paste/Cut/Undo/Redo），
+     剪贴板由 Slint 自己写 ⇒ **本功能零 Rust、零依赖**；
+   - `accessible-role: text` 不能省：`Text` 的默认角色是 `text`，`TextInput` 的默认角色是
+     `text-input` —— 不写它，读屏会把每行日志当成一个可编辑输入框。
 3. **`notes-blocks` 是 `[NoteBlock]`，每块自带 kind 与一段 `styled-text`**（v1.4 改）。
    原因：Slint 的 `StyledText` 官方 Currently Unsupported 列表里有 **Headings**，且它
    **没有字重属性、只有一个字号** —— 单段文字表达不了"标题比正文大"；列表也只是渲染成
@@ -911,11 +922,18 @@ pub fn is_node(pid: u32) -> bool {
     // tasklist /FI "PID eq <pid>" /FO CSV  → 进程名 == "node.exe"
 }
 
-/// FR-20：打开默认浏览器。URL 由端口号拼成，不含外部输入。
+/// FR-20：打开默认浏览器。
+///
+/// ⚠ 这里早先画的是 `cmd /c start`，已被 Ruling 65 换掉：URL 来自**网络**
+/// （release notes 正文里的链接），属信任边界，而 Rust 的参数编码**不**转义
+/// cmd 的元字符（`& | ^ < > % !`）。现在是 `explorer.exe` + 单参数（无 shell）
+/// 加协议白名单 `dsh::is_web_url` —— 非 http(s) 在 `spawn` 之前就返回 `Err`。
 pub fn open_url(url: &str) -> Result<(), String> {
-    // Command::new("cmd").args(["/c", "start", "", url])
-    //                                    ↑ 空标题参数，start 处理带引号 URL 时必需
-    //   .creation_flags(CREATE_NO_WINDOW)
+    if !is_web_url(url) {
+        return Err(format!("拒绝打开非 http(s) 链接: {url}"));
+    }
+    // Command::new("explorer.exe").arg(url)     ← GC-7：全名；单个参数没有 shell
+    //   .creation_flags(CREATE_NO_WINDOW)       ← GC-8
 }
 ```
 
@@ -1454,6 +1472,8 @@ SRS §8.4 要求对核心逻辑做单元测试。以下逻辑被刻意设计为*
 | `find_dsh_on_path(dirs, exists)` | FR-3 | 传入假目录数组 + 假 `exists`，验证取第一个命中 |
 | `owner_of(shim, bins)` | FR-3 | 验证大小写不敏感、`dsh.exe` 与 `dsh.cmd` 都能命中 |
 | `parse_notes_blocks(&str)` | FR-27 | 输入真实 release notes 片段，验证 HTML 被剥离、标题成 Heading 块、列表标记被去掉、软换行合段 |
+| `dsh::is_web_url(&str)` | FR-20 / FR-27b | 表驱动：真实正文取值 —— `#en-v0.1.7-alpha.2` / `#cn-…`（锚点）与 `SAFETY.md`（相对路径）**不算**；`https://…/compare\|blob`、`http://127.0.0.1:3080`、大小写混写**算**。判据只有这一份（`open_url` 的白名单与 `dispatch_notes_link` 的准入共用），别各写一遍 `starts_with` |
+| `main::dispatch_notes_link(&str, &impl Fn(Job))` | FR-27b | `main.rs` 的**第一个**测试模块（这里是纯函数、无 I/O，不属于 §6.3 排除的 GUI 测试）：给一个**真通道**再断言 worker 收件箱里有没有东西 —— 站内取值（`#en-v0.1.7-alpha.2` / `#cn-…` / `#english` / `SAFETY.md`）→ 什么都没有；真链接 → `Job::OpenUrl` 且 Url 逐字透传。**判别与接线一起被覆盖**（只测一个返回 `Option` 的分类函数挡不住"接线被改回无条件派发"）。红-绿实测见 VERIFICATION §8.3 |
 | `is_safe_version(&str)` | NFR-6 | 验证字符集边界 |
 | `plugin::valid_spec(&str)` | FR-35 / §7 信任边界 | 表驱动：registry 规格通过；`file:` / `link:` / `git+` / `github:` / URL / 路径 / 空白 / 引号 / `^1.0.0` **逐条拒绝** |
 | `plugin::parse_latest(&str)` | FR-34 | 真实 packument 片段；缺 `dist-tags` / JSON 非法 / 版本号非法 → `None`（**不是** Err） |
@@ -1535,7 +1555,7 @@ strip     = true
 | `tokio` / `async-std` | CON-3 明令禁止；本项目全部 I/O 可阻塞执行于 worker 线程 |
 | `reqwest` | 拉入 tokio，过重 |
 | markdown 解析库（`pulldown-cmark` 等） | Slint 内建 `StyledText::from_markdown`（SRS FR-27 明令不得引入） |
-| `open` / `webbrowser` | `cmd /c start` 三行即可 |
+| `open` / `webbrowser` | stdlib 三行即可（`explorer.exe` + 单个参数 + 自己那条 http(s) 白名单；见 §4.3） |
 | `tray-icon` / `winit` | Slint 内建 `SystemTrayIcon` |
 | `anyhow` / `thiserror` | 见 §5.3 |
 | `dirs` / `directories` | 只需要一个 `%APPDATA%` 路径，`std::env::var_os("APPDATA")` 即可（SRS FR-30 明令不得引入） |
@@ -1553,7 +1573,7 @@ strip     = true
 | **1** | §9.1 文件结构 | 列出 7 个文件，`Job`/`UiMsg`/`AppState` 无归属 | 新增 **`src/model.rs`**（共享类型层，被所有模块依赖且不依赖任何模块）；`worker` 循环并入 `src/main.rs` | v1.1 |
 | **2** | §4.3 | TR-5 仅要求"补偿前探测 PM_old 完好性" | 增补 **TR-11：补偿中的所有动作必须先探测目标状态再执行**。TR-5 是其特例。依据：若对不存在的包执行卸载，卸载命令的非零退出会被误判为补偿失败，从而错误地报告 `Degraded` | v1.1 |
 | **3** | FR-27 | 只说"用 `StyledText::from_markdown` 渲染" | 补充 **`StyledText` 不支持 Headings 与 HTML 标签**（官方 Currently Unsupported 列表），必须先做轻量预处理，否则 `### 新增功能` 与 `<h3 id="...">` 会原样显示 | v1.1 |
-| **4** | §5.2 / FR-27 | "禁止任何指向 GitHub 网页的界面链接" | 明确适用范围：**我们自己不生成** GitHub 网页链接。release notes **正文中自带的**链接通过 `link-clicked` 交给系统浏览器处理，不算违反 | v1.1 |
+| **4** | §5.2 / FR-27 | "禁止任何指向 GitHub 网页的界面链接" | 明确适用范围：**我们自己不生成** GitHub 网页链接。release notes **正文中自带的 http(s)** 链接通过 `link-clicked` 交给系统浏览器处理，不算违反（v1.6：非 http(s) 的站内链接连派发都不派发，见 FR-27b） | v1.1 |
 
 ### 8.1 已增补的非功能需求
 
@@ -1610,3 +1630,5 @@ strip     = true
 | 1.6 | 2026-09-22 | **新增出网代理（SRS v1.3 的 FR-33）并闭合 §7.1 的 TLS 待验证项**：**①** §7.1 的"待验证：`ureq` 3.4 的默认 TLS 后端"**已闭合** —— 默认是 `rustls` + **`webpki-roots`**（Mozilla 静态根，**非**系统证书库），随之记下它的反面：企业/MITM 代理注入的企业根**不被信任**，而该风险因 FR-33 从理论变为可达（本机实测未触发）；升级路径是 ureq 的 `platform-verifier` feature。**②** 更正本段原来引用的错误前提"当前环境未配置代理（SRS §2.2.5）"。**③** §7.1 依赖表**不变** —— FR-33 读系统代理走的是 `windows-sys` **已启用**的 `Win32_System_Registry` feature，**未新增依赖、未改 `Cargo.toml`**（GC-2 当初挡住的只有 `winreg` 那条路） |
 | 1.7 | 2026-09-22 | **新增插件卡（SRS v1.4 的 §3.9 / FR-34~FR-37b / NFR-12）**，并把同期的两处界面改版一并落档：**①** §1.3 模块图加 `plugin.rs`（叶子模块，依赖 `model`/`pm`/`dsh`，无人依赖它），§1.4 数据流加插件一条；**②** 新增 **§4.8 `src/plugin.rs`**（职责边界、为何转发 `dsh plugin` 而非直调 pnpm、为何用 `latest` tag 是对的、并行查询与失败隔离、UI 侧两条接缝）；**③** `Job::FetchPlugins` / `Job::PluginOp` / `UiMsg::Plugins` / `UiMsg::PluginOpDone` 与 `PluginsState`；**④** 属性契约去掉 PM 三件套与 `version-is-current`/`latest-version`，加 `pm-label`、`reinstall-*`、`plugin-*` 共 9 项与 6 个回调；**⑤** §6.1 纯函数表补 7 行；**⑥** §7.1 依赖表**不变**（零新增依赖，`serde_json`/`ureq`/`semver`/`windows-sys` 都已在）。**⚠ 本条同时记录一笔被证伪的设计前提**：初稿要求"插件变更前先停 `dsh web`"，理由是"profile 里有原生模块、运行中的进程会锁住 `.node` 文件"—— 实测该前提为假（profile 内零个 `.node`），而 `dsh plugin` 与运行中的服务共用同一把 profile 写锁、CLI 改完由 HMR 应用 ⇒ 不停服务才是既定路径。详见 §4.8.3 与 spec §13 |
 | 1.8 | 2026-09-23 | **新增本程序自身的更新（SRS v1.5 的 §3.10 / FR-38 / FR-39）**：**①** 新增 **§4.9**（无新模块的取舍、`OutputBaseFilename` ↔ 资产名 ↔ `app_setup_asset_name` 的三方名字契约与"名字不符必须 `Err`"、完整数据流、"置标志 + timer 交接退出"的理由、`make_quit(stop_web)` 的退出语义分叉、弹框可见性为何必须由 Rust 独占写入、**`alignment: start` 下 stretch 不生效导致徽标错位的探针实测**、6 条已知限制）；**②** §3.2 属性契约加 `update-available` / `update-version` / `update-prompt-visible` 与 5 个回调；**③** §6.1 纯函数表加 4 行；**④** `Job::CheckAppUpdate` / `Job::DownloadAppUpdate` / `UiMsg::AppUpdate` / `UiMsg::AppUpdateLaunched` / `model::NewRelease`；**⑤** `state.json` 增 `skipped_app_version`（缺 key / 非字符串 = 没忽略过）；**⑥** 依赖表**不变**：哈希用系统自带 `certutil.exe`，下载复用 `ureq`（只调两个参数：全局超时 120 s、体积上限 64 MB —— ureq 默认 10 MB，而安装包已 8.7 MB） |
+| 1.9 | 2026-09-23 | **说明正文的站内链接不再当浏览器地址派发（SRS v1.6 的 FR-27b 补充；用户报的 bug）**：`on_link_clicked` 原先无条件把 `link-clicked` 的字符串派发成 `Job::OpenUrl`，而 DSH 的 release 正文第一行就是语言导航行 `[中文](#cn-…) \| [English](#en-…)`（实测 20 个 release 共 40 条锚点链接，另有 6 条 `SAFETY.md` 类相对路径）—— 于是每点一次就写一条 `打开网页失败: 拒绝打开非 http(s) 链接: #en-v0.1.7-alpha.2`。**①** 新增纯函数 `dsh::is_web_url`（判据只有这一份）+ `main::dispatch_notes_link`（准入：站内链接一个任务都不派发）；**②** §3.2 属性契约 `link-clicked` 那行注释同步，**§4.3 的 `open_url` 代码块同时更正**（它还画着 Ruling 65 之前的 `cmd /c start`，并误称"URL 不含外部输入"）；**③** §6.1 纯函数表加 2 行 —— 含 `main.rs` 的**第一个**测试模块（纯函数、真通道，不是 §6.3 排除的 GUI 测试），判别与接线一起覆盖；**④** 依赖表**不变**（零新增依赖：判据是前缀，不引 url crate）。**⚠ 白名单本身未动**（Ruling 65 仍是 `open_url` 的第二道），改的是"什么算可打开的目标"这层准入；面板里**不做**锚点跳转（与"不做中英切换"同一条裁决）。红-绿实测与真实正文的取值统计见 VERIFICATION §8 |
+| 1.10 | 2026-09-23 | **日志正文可选中复制（SRS v1.7 的 FR-28 修订；用户要求"输出中的文字可以选中复制"）**：`LogLine` 里那个 `Text` 换成 `read-only: true` 的 `TextInput` —— Slint 的 `Text` 没有任何选区支持，只有 `TextInput` 有，而 `read-only` 的语义正是"能选不能改"。**①** §3.2 设计要点 2 补三处必知（按下即 `GrabMouse` ⇒ 拖动改成划选、`Ctrl+A`/`Ctrl+C` 不受 read-only 影响 ⇒ 零 Rust 零依赖、`accessible-role: text` 保住读屏语义）；**②** 选区配色复用既有令牌（底色 `Tokens.accent-line`、前景色 = 本行语义色，与 `GlassField` 同款），**未新增令牌**；**③** 依赖表**不变**；**④** 离屏探针实测（VERIFICATION §9）：三行日志的行几何与墨色与改动前**逐像素一致**（y 393/413/433、x0=30、20px 行距、三种墨色），375 字长行的墨迹右边界也一致（x 30..416 —— 长行仍是"画出去被卡片裁掉"，`TextInput` 没有引入内部横向滚动）；拖选→`Ctrl+C` 得 `probe-ok-two`、`Ctrl+A`+`Ctrl+C` 得 `probe-err-three`、只拖不复制则剪贴板为空、打字不改内容。**⚠ 代价已落档**：日志区按住拖动不再滚动（滚轮/滚动条/PageUp 仍可） |

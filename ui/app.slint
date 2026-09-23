@@ -740,14 +740,37 @@ component LogLine inherits Rectangle {
     height: 20px;
     background: transparent;
 
-    Text {
+    // 本行的正文色。⚠ 它被**两个**属性用：`color` 与 `selection-foreground-color`
+    // —— 后者是 `<color>`，前者是 `<brush>`，同一个表达式写两遍迟早漂移。
+    property <brush> ink: root.is-cmd ? Tokens.accent-ink
+                       : root.is-err ? Tokens.danger
+                       : root.is-ok ? Tokens.good
+                       : root.is-warn ? Tokens.warn
+                       : Tokens.ink-3;
+
+    // ⚠ 这里是 `TextInput` 而**不是** `Text`：Slint 的 `Text` 完全没有选区，
+    // 只有 `TextInput` 有。`read-only: true` 的官方语义正是"能选不能改"：
+    //   · 选区：左键按下即 `GrabMouse`（i-slint-core items/text.rs 的 input_event），
+    //     所以外层 ListView(Flickable) **抢不走**这个拖动 —— 代价是"按住拖动 = 划选"，
+    //     日志区不再能按住拖动滚动（滚轮 / 滚动条 / PageUp 照旧）。
+    //   · Ctrl+A 全选本行、Ctrl+C 复制（`StandardShortcut::Copy` 与 `SelectAll`
+    //     不受 read-only 影响；Paste/Cut/Undo/Redo 被它挡掉），剪贴板由 Slint 自己写。
+    //   · `read-only` 时插入光标不显示、打字不进内容。
+    //   · 复制出来的正文 = 屏幕上那串（`$ `/`✓ `/`ER:`/`WR:` 已剥掉）——
+    //     前缀是本程序的着色约定，不该跟着进剪贴板。
+    // ⚠ `accessible-role: text` 不能省：`Text` 的默认角色是 `text`，而 `TextInput`
+    // 的默认角色是 `text-input` —— 不写它，读屏会把 2000 行日志当成 2000 个可编辑输入框。
+    TextInput {
         x: 0;
         text: root.raw-line.replace-all("$ ", "").replace-all("✓ ", "").replace-all("ER:", "").replace-all("WR:", "");
-        color: root.is-cmd ? Tokens.accent-ink
-             : root.is-err ? Tokens.danger
-             : root.is-ok ? Tokens.good
-             : root.is-warn ? Tokens.warn
-             : Tokens.ink-3;
+        read-only: true;
+        single-line: true;
+        color: root.ink;
+        // 与 GlassField（本文件里的输入框）同款：选区底色走 accent-line，
+        // 前景色保持本行语义色，于是"选中的错误行"仍然是红的。
+        selection-background-color: Tokens.accent-line;
+        selection-foreground-color: root.ink;
+        accessible-role: text;
         font-family: Font.mono;
         font-size: 11px;
         vertical-alignment: center;

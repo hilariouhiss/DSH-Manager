@@ -3723,6 +3723,11 @@ export component MainWindow inherits Window {
                     wrap: no-wrap;
                 }
             }
+
+    // ⚠ **已被取代**：上面这段"日志行 = `Text`"是当时的实现（留痕）。后来日志行改成了
+    // `LogLine` 组件（前缀着色 + 剥前缀），到 SRS v1.7 又换成 `read-only` 的 `TextInput`
+    // —— 因为 Slint 的 `Text` 没有任何选区支持，而用户要求"输出里的文字可以选中复制"。
+    // 现行实现见 `ui/app.slint` 的 `LogLine`，依据与实测见 SRS FR-28 与 VERIFICATION §9。
         }
 
         // ═══ 底部状态栏 ═══
@@ -4969,6 +4974,12 @@ fn wire_callbacks(
             send(Job::OpenUrl { url: url.to_string() });
         });
     }
+
+    // ⚠ **已被取代（SRS v1.6 / ARCHITECTURE v1.9）**：上面这段是当时的实现，留着是为了留痕。
+    // 它把正文里**所有**链接都当浏览器地址派发，而 DSH 的 release 正文第一行就是语言导航行
+    // `[中文](#cn-…) | [English](#en-…)` —— 每点一次就写一条
+    // `打开网页失败: 拒绝打开非 http(s) 链接: #en-v0.1.7-alpha.2`。现在只有绝对 http(s) 的
+    // 才派发（`main::dispatch_notes_link` + `dsh::is_web_url`），见 SRS FR-27b 与 VERIFICATION §8。
 
     // ── 托盘 ──
     {

@@ -948,6 +948,25 @@ fn taskkill_says_gone(out: &pm::CmdOut) -> bool {
     msg.contains("not found") || msg.contains("没有找到") || msg.contains("找不到")
 }
 
+/// FR-20 / FR-27b：这个字符串是不是"能交给浏览器"的绝对 http(s) 地址。
+///
+/// 判据是**前缀**，不是"能被解析成 URL" —— 为这一条引入 url crate 不值得，
+/// 而前缀恰好就是白名单要表达的东西。大小写不敏感：正文是网络来的。
+///
+/// ⚠ 两个调用方，两种用途，别把任一边删掉：
+/// - `open_url`：**安全边界**（Ruling 65）。非 http(s) 在 spawn 之前就返回 Err，
+///   不给 `explorer.exe` 解释 `file:` / 裸路径的机会。
+/// - `main::dispatch_notes_link`：**准入**。更新说明正文里的站内链接
+///   （`[中文](#cn-v0.1.7-alpha.2) | [English](#en-v0.1.7-alpha.2)` 这条语言导航行
+///   是每个 dsh release 正文的第一行；另有 `[SAFETY.md](SAFETY.md)` 这类相对路径）
+///   在面板里没有锚点目标（FR-27：不做中英切换），既打不开也不是"打开失败"，
+///   所以一个任务都不派发 —— 否则每点一次就写一条
+///   `打开网页失败: 拒绝打开非 http(s) 链接: #en-v0.1.7-alpha.2`（用户报的刷屏）。
+pub fn is_web_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
+
 /// FR-20：在默认浏览器打开 URL。
 ///
 /// **不经 shell**：`cmd.exe /c start "" <url>` 会把 URL 交给 cmd 自己的解析器，
@@ -957,12 +976,11 @@ fn taskkill_says_gone(out: &pm::CmdOut) -> bool {
 /// **网络**（release notes 里的链接），属信任边界，因此不能用 shell。
 /// `explorer.exe` + 单个参数没有 shell，也就没有可注入的解析层。
 ///
-/// 协议白名单是**防御性**的第二道：本程序只打开 http/https，其它 scheme
-/// （`file:`、裸可执行文件路径等）一律在 spawn 之前就拒绝 —— 不给
+/// 协议白名单是**防御性**的第二道（见 `is_web_url`）：本程序只打开 http/https，
+/// 其它 scheme（`file:`、裸可执行文件路径等）一律在 spawn 之前就拒绝 —— 不给
 /// `explorer.exe` 任何机会去解释一个非 Web 的目标。
 pub fn open_url(url: &str) -> Result<(), String> {
-    let lower = url.to_ascii_lowercase();
-    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+    if !is_web_url(url) {
         return Err(format!("拒绝打开非 http(s) 链接: {url}"));
     }
 
@@ -1489,6 +1507,60 @@ mod tests {
                 p.uri()
             );
         }
+    }
+
+    // ══════════ FR-27b：更新说明正文里的链接（站内锚点 / 相对路径 / 真链接）══════════
+
+    /// Ruling 65 的白名单本身：非 http(s) 一律在 spawn **之前**返回 Err。
+    ///
+    /// ⚠ 这条测试**不会**弹出任何东西 —— 拒绝发生在 `Command::spawn` 之前，
+    /// 这正是白名单要保证的顺序（`file:///…/calc.exe` 那行就是判别性的：
+    /// 真让它走到 explorer 就等于开了计算器）。
+    #[test]
+    fn open_url_refuses_non_web_targets() {
+        for target in [
+            "#en-v0.1.7-alpha.2",           // 用户报的那条
+            "#cn-v0.1.7-alpha.2",           // 语言导航行的另一半
+            "SAFETY.md",                    // 正文里的相对路径
+            "file:///C:/Windows/System32/calc.exe",
+            "javascript:alert(1)",
+            "",                             // 空串不是"默认值"，是垃圾输入
+        ] {
+            // ⚠ 用 match 而不是 `expect_err("…{target}…")`：后者的 `&str` 参数
+            // **不做**格式化（expect_err 收的是普通字符串），`{target}` 会原样印出来
+            // —— 这条测试正是要靠"哪一条没被拒"来定位。
+            let err = match open_url(target) {
+                Err(e) => e,
+                Ok(()) => panic!("{target} 必须被白名单拒绝，却真的交给 explorer.exe 了"),
+            };
+            assert!(err.contains("拒绝打开非 http(s) 链接"), "{target} → {err}");
+        }
+    }
+
+    /// ★ 判别性：更新说明里的**站内**链接不是浏览器 URL。
+    ///
+    /// 它钉住的是**判据本身**（"哪条路径不打开"）；"于是不派发 Job"那一跳由
+    /// `main.rs` 的 `in_page_notes_links_dispatch_nothing` 钉住 —— 两条合起来才是
+    /// 用户报的刷屏的完整回归钉子（少了这条，判据被改成恒真时哨兵就哑了）。
+    ///
+    /// 两边的取值都取自**真实正文**（实测 releases API：20 个 release 共 40 条
+    /// `#cn-…/#en-…` 锚点、6 条 `SAFETY*.md`/`BRAND_GUIDELINES*.md` 相对路径、
+    /// 8 条 `github.com/…/compare|blob` 真链接）。
+    #[test]
+    fn notes_in_page_links_are_not_web_urls() {
+        assert!(!is_web_url("#en-v0.1.7-alpha.2"));
+        assert!(!is_web_url("#cn-v0.1.7-alpha.2"));
+        assert!(!is_web_url("SAFETY.md"));
+        assert!(!is_web_url("SAFETY.zh.md"));
+
+        assert!(is_web_url("https://github.com/deepseek-ai/deepseek-harness/compare/dsh-v0.1.7-alpha.1...dsh-v0.1.7-alpha.2"));
+        assert!(is_web_url("https://github.com/deepseek-ai/deepseek-harness/blob/dsh-v0.1.6-alpha.2/SAFETY.md"));
+        assert!(is_web_url("http://127.0.0.1:3080"), "「打开网页」按钮构造的地址");
+        // 正文是**网络来的**，大小写不保证；白名单判定必须大小写不敏感
+        assert!(is_web_url("HTTPS://Example.com/x"));
+        // shell 元字符由 explorer.exe 的单参数形态挡住（见 open_url 的注释），
+        // 不是靠这里 —— 这条只是钉住"白名单不误伤正文里的真链接"。
+        assert!(is_web_url("https://a/&calc.exe"));
     }
 }
 
