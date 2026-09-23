@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # 本程序是 Windows 专用（CON-1）：build.rs 要嵌 PE 资源、依赖 windows-sys、
+    # 安装包是 Inno Setup —— 在 Linux runner 上跑不出有意义的结果。
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # 用 runner 自带的 stable，不引第三方 toolchain action。版本写进日志，
+      # 构建出问题时能一眼对上号（Slint 1.18 要求 ≥ 1.92）。
+      - name: 工具链
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: 缓存
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      # ⚠ 这步不是装饰：runner 上 npm 是装好的，但**全局 prefix 目录**未必存在，
+      # 而 `pm.rs` 的 list_args_run_for_installed_pms 会真的去跑
+      # `npm ls -g --depth=0` —— 目录不存在时 npm 直接 ENOENT 且 stdout 为空
+      # （npm 10.9 与 12 均已实测），测试会误报成"list_args 参数表写错了"。
+      - name: 预备 npm 全局目录
+        run: |
+          if (Get-Command npm -ErrorAction SilentlyContinue) {
+            $prefix = npm prefix -g
+            if (-not (Test-Path $prefix)) { New-Item -ItemType Directory -Force $prefix | Out-Null }
+            Write-Host "npm prefix -g = $prefix"
+          }
+
+      # --locked：Cargo.lock 已入库，CI 不该悄悄把依赖升上去
+      - name: 测试
+        run: cargo test --locked

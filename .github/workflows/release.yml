@@ -1,0 +1,106 @@
+name: Release
+
+# 推一个版本 tag（v0.3.0 / v0.3.0-beta.1 …）即自动构建并发布：
+#   git tag v0.3.0 && git push origin main --tags
+on:
+  push:
+    tags: ["v*"]
+
+# gh release create 需要写权限，其余一律不给
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 工具链
+        run: |
+          rustc --version
+          cargo --version
+
+      # 版本号在 Cargo.toml 里只写一次 —— 安装包的名字与版本都从它派生。
+      # 先查再构建：不一致时立刻红，不必等十几分钟编译完才发现。
+      - name: 校验 tag 与 Cargo.toml 版本一致
+        run: |
+          $tag = $env:GITHUB_REF_NAME.TrimStart('v')
+          $v = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          if ($v -ne $tag) {
+            throw "Cargo.toml 的 version 是 '$v'，tag 是 '$tag' —— 先改 Cargo.toml 再打 tag"
+          }
+          Write-Host "版本一致：$v"
+
+      # rc.exe 不在 runner 的 PATH 上（Windows SDK 的 bin 目录要 VS 开发者环境才进 PATH），
+      # 而 build.rs 是**只查 PATH**、找不到只告警不失败 —— 少了这一步，exe 里没有
+      # VS_VERSION_INFO，.iss 的 GetFileVersionString() 读回空串，安装包会叫
+      # dsh-manager--setup.exe。用 build.rs 已支持的 RC 环境变量显式指路，不改代码。
+      - name: 指定资源编译器（嵌图标与版本资源）
+        run: |
+          $rc = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\rc.exe" -ErrorAction SilentlyContinue |
+                Sort-Object FullName -Descending | Select-Object -First 1
+          if ($rc) {
+            "RC=$($rc.FullName)" >> $env:GITHUB_ENV
+            Write-Host "RC = $($rc.FullName)"
+          } else {
+            Write-Warning "PATH 上没有 rc.exe —— 下面的 exe 版本校验会因此失败"
+          }
+
+      # 同 ci.yml：npm 的全局 prefix 目录不存在时 `npm ls -g` 会 ENOENT（stdout 为空），
+      # 而测试用例会真的跑它，于是误报成"list_args 参数表写错了"
+      - name: 预备 npm 全局目录
+        run: |
+          if (Get-Command npm -ErrorAction SilentlyContinue) {
+            $prefix = npm prefix -g
+            if (-not (Test-Path $prefix)) { New-Item -ItemType Directory -Force $prefix | Out-Null }
+            Write-Host "npm prefix -g = $prefix"
+          }
+
+      - name: 测试
+        run: cargo test --locked
+
+      - name: 构建 release
+        run: cargo build --locked --release
+
+      # 版本链的守门人：Cargo.toml → build.rs 嵌进 exe 的资源 → tag
+      - name: 校验 exe 的版本资源
+        run: |
+          $tag = $env:GITHUB_REF_NAME.TrimStart('v')
+          $v = (Get-Item target\release\dsh-manager.exe).VersionInfo.FileVersion
+          if ($v -ne $tag) {
+            throw "exe 的 FileVersion 是 '$v'，tag 是 '$tag' —— exe 里没有版本资源（多半是没找到资源编译器）"
+          }
+          Write-Host "exe FileVersion = $v"
+
+      - name: 编译安装包
+        run: |
+          # 镜像自带 Inno Setup 6；万一哪天没了就现装一个（choco 的 shim 落在已在 PATH 上的目录里）
+          if (-not (Get-Command ISCC.exe -ErrorAction SilentlyContinue)) { choco install innosetup -y --no-progress }
+          ISCC.exe installer\dsh-manager.iss
+
+      - name: 生成校验和
+        run: |
+          $setup = "dist\dsh-manager-$($env:GITHUB_REF_NAME.TrimStart('v'))-setup.exe"
+          if (-not (Test-Path $setup)) { throw "没生成 $setup —— 安装包编译失败或版本号对不上" }
+          Get-FileHash target\release\dsh-manager.exe, $setup -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } |
+            Set-Content dist\SHA256SUMS.txt
+          Get-Content dist\SHA256SUMS.txt
+
+      - name: 创建 Release
+        env:
+          # 不要用 ${{ github.ref_name }} 拼进脚本：tag 名是外部输入，走环境变量交付
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $v = $tag.TrimStart('v')
+          # 参数先攒进数组再整体 splat：`$x = if (...) { @('--prerelease') }` 会退化成
+          # 字符串，`@x` 于是按**字符**展开（已实测），必须用数组的 += 追加
+          $ghArgs = @($tag, '--title', $tag, '--generate-notes')
+          # 带 `-` 的 tag 标成 prerelease，免得它被 GitHub 当成 Latest release
+          if ($tag -match '-') { $ghArgs += '--prerelease' }
+          gh release create @ghArgs `
+            "target\release\dsh-manager.exe#免安装可执行文件" `
+            "dist\dsh-manager-$v-setup.exe#安装包（Inno Setup）" `
+            "dist\SHA256SUMS.txt"
