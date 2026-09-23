@@ -928,6 +928,26 @@ certutil 实算 = 66be154564d24d59f8013599fdb06101fb0c1e4e6ad1fcd4004348ac6c0a99
 | `dsh-manager-v0.3.0-windows-x64.exe` | 17 186 304 | 与 `SHA256SUMS.txt` 一致（免安装副本） |
 | `SHA256SUMS.txt` | 210 | 两行、文件名与资产名逐字一致 |
 
+### 7.2c 发布之后复验（2026-09-23，v0.4.0 已上线）
+
+同 §7.2b 的配方（临时 `#[ignore]` 测试 → `cargo test tmp_net_check -- --ignored --nocapture` → **跑完删除**，
+已确认 `git status` 干净）：
+
+```text
+local 0.1.0 → 有新版本 0.4.0 | setup=dsh-manager-v0.4.0-windows-x64-setup.exe | api_host=true | sums=true
+local 0.3.0 → 有新版本 0.4.0 | setup=dsh-manager-v0.4.0-windows-x64-setup.exe | api_host=true | sums=true
+local 0.4.0 → 已是最新
+```
+
+三条各有分工：**①** v0.3.0 的用户点〔检查更新〕**真的会看到 v0.4.0**（发布这件事对更新器是可见的，
+而不只是"Release 页上多了个 tag"）；**②** 安装包资产名与 `app_setup_asset_name` 的构造逐字一致、
+走的是 `api.github.com`（不是不可达的 `browser_download_url`）、`SHA256SUMS.txt` 也在；
+**③** 新版本不提示自己（严格大于的判据在真数据上成立）。
+
+另：发布物本身的校验链也在真资产上跑了一遍 —— `gh release download v0.4.0` 取回安装包与
+`SHA256SUMS.txt`，用系统 `certutil -hashfile … SHA256`（FR-39 走的就是它）实算得到
+`826ffa6f7193e19b7f1c6b8f302cad82ae4a29dda7d54b170ae0bc51577398a8`，与发布页声明的**逐字符一致**。
+
 ### 7.3 离屏探针（`target/ui-probe-update/`，配方同 §2.4）
 
 复用 §2.4 的一次性探针配方（新开一个 `target/` 下的独立包，`build.rs` 编译**真实的** `ui/app.slint`），量本轮新增的两处界面：
