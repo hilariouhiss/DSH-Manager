@@ -959,6 +959,31 @@ fn update_dir() -> Option<std::path::PathBuf> {
     std::env::var_os("TEMP").map(|t| std::path::PathBuf::from(t).join("dsh-manager-update"))
 }
 
+/// 清掉 `dir` 整棵（我们自己的子目录），返回值是"要不要说一句话"。
+///
+/// ⚠ **为什么清理发生在下一次启动，而不是"装完立刻删"**：本程序必须**先退出**安装
+/// 程序才能替换自己的 exe，所以删安装包这件事没有任何活着的本程序进程能做；而安装
+/// 程序自己也删不掉它 —— 那个 exe 正被 SetupLdr 占着（它要等内层 setup 跑完）。
+/// 更新成功后本程序几秒内就会被安装程序拉起来，用户感知上仍然是"装完就没了"。
+/// 顺带还覆盖了"下载了却没能启动安装程序"的残留（例如 spawn 失败）。
+///
+/// ⚠ 只删这个专属目录，**不碰** `%TEMP%` 里别的东西。删不掉也不算错误（安装程序
+/// 可能还占着、杀毒软件可能锁着）：那就留着，反正下次启动还会再试一遍。
+fn clean_dir(dir: &std::path::Path) -> Option<String> {
+    if !dir.exists() {
+        return None; // 绝大多数启动都是这条：没更新过，什么都不用说
+    }
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => Some(format!("已删除上次更新留下的安装包：{}", dir.display())),
+        Err(e) => Some(format!("清理上次更新的安装包失败（{e}）：{}", dir.display())),
+    }
+}
+
+/// 清理的**调用点**：`%TEMP%` 取不到就什么都不做（与 `update_dir` 同一个门）。
+fn clean_update_dir() -> Option<String> {
+    clean_dir(&update_dir()?)
+}
+
 /// 下载时状态栏那一句。安装包实测 8.7 MB / 本机 4 秒，但慢线路上要几十秒 ——
 /// 把量级说出来，免得用户以为卡死了。
 const DOWNLOAD_HINT: &str = "约 9 MB，视网速可能要一会儿";
@@ -2433,6 +2458,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(note) = startup_note {
         push_log(&state.borrow(), note);
     }
+    // FR-39 修订：清掉上次更新留下的安装包（`%TEMP%\dsh-manager-update\`）。
+    // ⚠ 位置在"启动日志之后、首帧之前"：删一个文件是微秒级的事，不进启动预算的关键路径；
+    // 而且**必须**在这里 —— 更新成功后本程序是被安装程序重新拉起来的，那次启动就是
+    // 唯一能删掉它的时机（本程序在安装期间是死的，安装程序又删不掉自己正在跑的那个文件）。
+    if let Some(note) = clean_update_dir() {
+        push_log(&state.borrow(), note);
+    }
 
     // 首帧之前的初始主题。⚠ `Palette.color-scheme` 由 .slint 的 `changed` 处理器
     // 跟着 `Tokens.dark` 走（见 ui/app.slint 的 MainWindow），这里只写 Tokens。
@@ -2728,6 +2760,31 @@ mod tests {
         assert!(!show_requested(first), "取走之后必须回到未点亮（自动重置）");
         // 句柄刻意不关：它就是"我在跑"这件事本身，关掉等于放行第三个实例。
         // 与生产路径同一取舍（`claim` 的注释）。
+    }
+
+    // ══════════ FR-39 修订：装完清掉 `%TEMP%` 里的安装包 ══════════
+
+    /// ★ 判别性：有东西 → 整棵树删掉并报一句；没东西 → 一个字都不说。
+    ///
+    /// ⚠ 它捕获的变异有两个方向：① 把清理写成"无条件报一句"（没更新过的启动也会多一行
+    /// 日志噪音）；② 只删文件不删目录（`update_dir` 会一直留着，空的也算残留）。
+    ///
+    /// ⚠ 用**测试专属**目录名：拿真的 `%TEMP%\dsh-manager-update\` 来测，跑一次就可能
+    /// 把用户**正等着安装**的那份安装包删掉。
+    #[test]
+    fn clean_dir_reports_only_when_it_removed_something() {
+        let dir = std::env::temp_dir()
+            .join(format!("dsh-manager-clean-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(clean_dir(&dir).is_none(), "目录不存在时必须什么都不说");
+
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("dsh-manager-v0.0.0-windows-x64-setup.exe"), b"x").unwrap();
+        let said = clean_dir(&dir).expect("删掉了东西就必须报一句");
+        assert!(said.contains("已删除"), "文案没说是删掉了：{said}");
+        assert!(!dir.exists(), "整棵目录都该没了：{said}");
+        assert!(clean_dir(&dir).is_none(), "第二次必须恢复安静");
     }
 
     /// 跨文件契约：`WINDOW_TITLE` 必须与 `ui/app.slint` 里主窗口的 `title:` 逐字一致。

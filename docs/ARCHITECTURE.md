@@ -1386,12 +1386,13 @@ src/dsh.rs : app_setup_asset_name(&Version)  ← 唯一的构造点
 | `/NORESTART` | 静默 + 需要重启时，Inno 会弹 "Reboot now?" 询问框（帮助原文），那正是要消灭的点击。代价：真要重启才能换文件时不会提示（本程序只有一个 exe，用不上那条路径） |
 | 不传 `/DIR` | `UsePreviousAppDir` 缺省 `yes`（帮助原文），升级时 Setup 自己从注册表取回上次的安装目录。**传 `/DIR` 反而是错的**：本程序只知道自己 exe 在哪，开发机上那正好是 `target\release`，等于把一次更新变成新装一个目录 |
 | `[Run]` 加一条 `skipifnotsilent runasoriginaluser` | "装完把程序拉起来"只能由安装程序做 —— 本程序必须先退出才能换掉自己的 exe。`skipifnotsilent` 是文档明写的判据；**不能**靠"去掉原条的 `skipifsilent`"，因为 `postinstall` 的语义是"完成页上的勾选框"，而静默模式没有完成页。`runasoriginaluser` 防的是：万一是提权安装，拉起来的也不该是个管理员进程（否则托盘与 `%APPDATA%` 全都变成管理员所有） |
+| 安装包在**下一次启动**时清掉 | 用户要求"安装完成后删除安装包"。**没有任何活着的本程序进程能在安装期间删它**（要换掉自己的 exe 就必须先退出），而安装程序也删不掉 —— 那个文件正被 SetupLdr 占着。于是清理放在 `main()` 的启动路径上：`clean_update_dir()` 删掉整个 `%TEMP%\dsh-manager-update\`。更新成功后本程序几秒内就被拉起来，用户感知上仍是"装完就没了"；顺带清掉"下载了却没能启动安装程序"的残包。⚠ 删一个目录是微秒级动作、不进启动预算的关键路径；只删这一个专属目录，删不掉只记一句日志、下次再试 |
 
 ⚠ **`RestartApplications` 不顶用**（v1.10 的原文在此更正）：它只重启**被 Setup 用 Restart
 Manager 关掉的**程序，而本程序是自己退出的、也没调 `RegisterApplicationRestart`
 （帮助原文："the application needs to be using the Windows RegisterApplicationRestart API"）。
 
-⚠ **Restart Manager 的时序**（真机实测，VERIFICATION §8.3）：`CloseApplications=yes` 在静默
+⚠ **Restart Manager 的时序**（真机实测，VERIFICATION §10.4）：`CloseApplications=yes` 在静默
 模式下会**自动关停**占用待替换文件的程序，且不给用户任何选择。实测 Setup 从进程创建到
 "Shutting down applications using our files"只要 **0.40 s**，而本程序从 spawn 安装程序到
 自己退出是 **0.15–0.24 s**（80 ms timer 交接 + 实测 132–146 ms 的退出耗时）—— 本程序总是
