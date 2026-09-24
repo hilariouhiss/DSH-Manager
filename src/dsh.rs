@@ -678,17 +678,37 @@ pub fn parse_sha256sums(text: &str, file_name: &str) -> Option<String> {
     })
 }
 
-/// FR-39：启动安装向导。**不等待** —— 向导必须活到本程序退出之后，
-/// 而它要替换的正是本程序自己的 exe。
+/// FR-39 修订：静默安装的参数。
+///
+/// - `/SILENT`：不要向导、不要点击，只留一个安装进度窗。**刻意不加
+///   `/SUPPRESSMSGBOXES`** —— 真出事时（例如当初装在受保护目录里、这次没有写权限）
+///   错误框照常弹出；静默失败比多点一下糟得多。
+/// - `/NORESTART`：Inno 在静默模式下若认为需要重启，会弹 "Reboot now?" 询问框
+///   （帮助原文："If a restart is necessary and the /NORESTART command isn't used
+///   and Setup is silent, it will display a Reboot now? message box"）—— 那正是
+///   本次修订要消灭的点击。
+///
+/// **刻意不传 `/DIR`**：`UsePreviousAppDir` 的缺省值是 `yes`（Inno 帮助原文），
+/// 升级时 Inno 自己从注册表取回上一次的安装目录 —— 既满足"装进已有目录"，
+/// 又不会把开发机上那次 `cargo build` 的 `target\release` 误装成一个新目录。
+fn setup_args() -> [&'static str; 2] {
+    ["/SILENT", "/NORESTART"]
+}
+
+/// FR-39：**静默**启动安装程序。**不等待** —— 安装程序必须活到本程序退出之后，
+/// 而它要替换的正是本程序自己的 exe。安装完成后的重启由安装包里的
+/// `[Run]` 条目负责（`skipifnotsilent` 那条，见 `installer/dsh-manager.iss`）：
+/// 本进程必须死掉才能换掉自己的 exe，所以"重启"这件事**只能**由还活着的安装程序做。
 pub fn launch_setup(path: &Path) -> Result<(), String> {
     #[cfg(windows)]
     use std::os::windows::process::CommandExt;
 
     let mut cmd = Command::new(path); // 绝对路径：调用方给的是 %TEMP% 下我们自己的目录
+    cmd.args(setup_args());
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     #[cfg(windows)]
     cmd.creation_flags(pm::CREATE_NO_WINDOW); // GC-8
-    cmd.spawn().map_err(|e| format!("启动安装向导失败: {e}"))?;
+    cmd.spawn().map_err(|e| format!("启动安装程序失败: {e}"))?;
     Ok(())
 }
 
@@ -1507,6 +1527,18 @@ mod tests {
                 p.uri()
             );
         }
+    }
+
+    // ══════════ FR-39 修订：静默安装 + 自动重启══════════
+
+    /// 参数**逐字**钉住，与 `pm_command_table_is_exact` 同款做法。
+    ///
+    /// ⚠ 挡的是"少一个参数"这类**静默**回归：少 `/SILENT`，用户又要手点一遍向导
+    /// —— 本次修订要消灭的正是这个；少 `/NORESTART`，静默模式下 Inno 认为需要重启时
+    /// 会弹 "Reboot now?" 询问框（Inno 帮助原文），同样是一次点击。
+    #[test]
+    fn setup_args_are_exact() {
+        assert_eq!(setup_args(), ["/SILENT", "/NORESTART"]);
     }
 
     // ══════════ FR-27b：更新说明正文里的链接（站内锚点 / 相对路径 / 真链接）══════════

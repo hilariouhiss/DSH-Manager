@@ -2,9 +2,9 @@
 
 | 项目 | 内容 |
 |---|---|
-| 文档版本 | 1.10 |
-| 日期 | 2026-09-23 |
-| 关联文档 | [docs/SRS.md](SRS.md) v1.7（需求依据） |
+| 文档版本 | 1.11 |
+| 日期 | 2026-09-24 |
+| 关联文档 | [docs/SRS.md](SRS.md) v1.8（需求依据） |
 | 技术栈 | Rust 2024 edition + Slint 1.18 |
 | 状态 | 待实现 |
 
@@ -1035,11 +1035,14 @@ fn stop_web(...) -> ... {
 
 #### 4.4.6 已知限制
 
-**假设单实例运行。** 程序不阻止用户启动第二个实例；两个实例会争用同一个 `state.json`（后写覆盖先写）并出现两个托盘图标。
+**单实例由 FR-40 保证**（v1.11 改写；原文是"假设单实例运行、不做守护"，理由为"SRS 未要求"）。
+v0.4.0 的实际行为是"再双击一次图标就再起一个实例"：两个实例各写各的 `state.json`
+（后写覆盖先写）、两个托盘图标、两个窗口，而两个实例本来就无法正确协同管理同一个
+`dsh web`。SRS v1.8 的 §3.11 / FR-40 已把这条补成需求，实现见 §4.10。
 
-这不是持久化引入的问题 —— 两个实例本来就无法正确协同管理同一个 `dsh web`。但持久化让"互相覆盖"成为新的表现形态，故记录在此。
-
-**不做单实例守护**（锁文件 / 命名互斥体）：SRS 未要求，且属独立功能。
+⚠ **`config::update` 的进程内锁挡不住第二个进程**：`UPDATE_LOCK` 是进程内的 `Mutex`，
+它防的是"本进程三个线程交错写"，不是"两个进程各写各的"。跨进程那一层靠的就是 FR-40 的
+互斥体（在 `main()` 的第一件事里就拿到了）。
 
 ### 4.5 `src/main.rs` — 入口与 UI 循环
 
@@ -1360,16 +1363,40 @@ src/dsh.rs : app_setup_asset_name(&Version)  ← 唯一的构造点
 
 〔下载并安装〕
    Job::DownloadAppUpdate { release }    ← 载荷是**已解析**的 release，worker 不重查
-        ↓ worker：下载安装包 → 取 SHA256SUMS.txt → 落盘 %TEMP% → 校验 → launch_setup
+        ↓ worker：下载安装包 → 取 SHA256SUMS.txt → 落盘 %TEMP% → 校验
+        ↓ launch_setup：spawn 安装程序，参数固定 `/SILENT /NORESTART`（v1.11）
    UiMsg::AppUpdateLaunched { version, path }
         ↓ drain：置 AppState.quit_keep_web = true
         ↓ 80 ms timer：take(quit_keep_web) → make_quit(false) → quit_event_loop
+        ↓ 安装程序：换掉 exe → 静默模式下的 [Run] 条目把本程序拉起来
 ```
 
 **为什么"置标志 + timer 取走"而不是直接退出**：置真发生在 `drain`，而退出闭包由 `main()`
 持有 —— `drain` 的签名里没有它（只有 `state` 与 `job_tx`）。80 ms 的 timer 是唯一同时
 够得着"排空消息"与"持有闭包"的地方，于是退出请求经过一次显式的交接。代价是多一个
 `AppState` 字段，收益是 `drain` 不必为了退出而改变签名（那会牵动它的三条既有调用路径）。
+
+#### 4.9.3b 静默安装与"装完自己回来"（v1.11 新增）
+
+三个决定连在一起，任何一个错了都会让用户重新面对点击：
+
+| 决定 | 依据 |
+|---|---|
+| `/SILENT`（不是 `/VERYSILENT`，也不加 `/SUPPRESSMSGBOXES`） | 保留进度窗 = 用户看得见"正在装"；不压消息框 = 真失败时错误框照弹。Inno 帮助原文："When Setup is silent the wizard and the background window are not displayed but the installation progress window is… error messages during installation are displayed (if you haven't disabled them with the /SUPPRESSMSGBOXES command-line option)" |
+| `/NORESTART` | 静默 + 需要重启时，Inno 会弹 "Reboot now?" 询问框（帮助原文），那正是要消灭的点击。代价：真要重启才能换文件时不会提示（本程序只有一个 exe，用不上那条路径） |
+| 不传 `/DIR` | `UsePreviousAppDir` 缺省 `yes`（帮助原文），升级时 Setup 自己从注册表取回上次的安装目录。**传 `/DIR` 反而是错的**：本程序只知道自己 exe 在哪，开发机上那正好是 `target\release`，等于把一次更新变成新装一个目录 |
+| `[Run]` 加一条 `skipifnotsilent runasoriginaluser` | "装完把程序拉起来"只能由安装程序做 —— 本程序必须先退出才能换掉自己的 exe。`skipifnotsilent` 是文档明写的判据；**不能**靠"去掉原条的 `skipifsilent`"，因为 `postinstall` 的语义是"完成页上的勾选框"，而静默模式没有完成页。`runasoriginaluser` 防的是：万一是提权安装，拉起来的也不该是个管理员进程（否则托盘与 `%APPDATA%` 全都变成管理员所有） |
+
+⚠ **`RestartApplications` 不顶用**（v1.10 的原文在此更正）：它只重启**被 Setup 用 Restart
+Manager 关掉的**程序，而本程序是自己退出的、也没调 `RegisterApplicationRestart`
+（帮助原文："the application needs to be using the Windows RegisterApplicationRestart API"）。
+
+⚠ **Restart Manager 的时序**（真机实测，VERIFICATION §8.3）：`CloseApplications=yes` 在静默
+模式下会**自动关停**占用待替换文件的程序，且不给用户任何选择。实测 Setup 从进程创建到
+"Shutting down applications using our files"只要 **0.40 s**，而本程序从 spawn 安装程序到
+自己退出是 **0.15–0.24 s**（80 ms timer 交接 + 实测 132–146 ms 的退出耗时）—— 本程序总是
+先走一步。反过来（本程序届时不退出）会被 RM 卡住 30 s 再弹一个 Abort/Retry/Ignore 框：
+这条已实测复现，也正是 §4.9.4 那道幂等闸门存在的理由之一。
 
 #### 4.9.4 退出语义分叉：`make_quit(stop_web)`
 
@@ -1388,6 +1415,16 @@ FR-21 要求"退出先停掉本程序启动的 `dsh web`"，而 FR-39 的更新�
 
 ⚠ 定义位置被这次改动**上移**到了 timer 之前：更新那条路由 worker 消息触发，而 timer 需要
 拿到这个闭包。原先"quit 在 timer 之后定义"的注释因此失效，已随代码改写。
+
+⚠ **退出只走一次，先到的那条说了算**（v1.11 新增的闸门 `take_quit_turn`）。这不是防御性
+编程，而是静默安装带出来的真实时序：Setup 会用 Restart Manager 关停占用文件的程序
+（§4.9.3b），那会给本程序发一次 `WM_CLOSE`；而按用户的关闭偏好，`WM_CLOSE` 可能走进
+`make_quit(true)` —— 于是把用户正在用的 `dsh web` 会话 `taskkill` 掉，正好推翻 FR-39
+那句"装更新不许杀掉用户的会话"。闸门在 `AppState.quitting` 上，`make_quit` 的第一行就取；
+第二条退出请求直接返回。
+
+⚠ 闸门**不改变**哪条退出获胜：`quit_keep_web`（FR-39）在 timer 里先被取走，托盘/关闭那条
+只在用户真的点了之后才可能到达。它保证的是"先起飞的那条不会被后来者按另一种语义重放"。
 
 #### 4.9.5 弹框可见性：唯一写入方是 Rust
 
@@ -1425,9 +1462,111 @@ v1.7 已记）。而 `start`/`center`/`end` 下**子项的 `horizontal-stretch` 
 | 只认 `releases/latest` | GitHub 的该端点**不返回 prerelease**，所以预发布版收不到提示。要覆盖就得改用 `releases` 列表并自己按 semver 排序（含 prerelease 的优先级），当前不值得 |
 | 校验和的信任范围 | 安装包与 `SHA256SUMS.txt` 来自同一个 release，因此校验**防的是传输损坏**（下了一半、内容坏），**不是**防 GitHub 被攻破。它在本机确实有用：网络上确实见过中途断流 |
 | 装更新时 `dsh web` 变成"外部实例" | 这是 FR-21 例外的代价：重启后界面显示"检测到外部 dsh web"（FR-17 的第二档），可打开、可停止，但**不再受本程序的退出联动**保护。用户若想恢复联动，停掉再启动一次即可 |
-| "为所有用户安装"的副本 | 以管理员身份安装过的那份，其更新向导会要 UAC（B 档走**可见向导**，UAC 由用户处理；这也是不选静默安装的原因之一） |
+| "为所有用户安装"的副本 | 以管理员身份安装过的那份会在更新时提一次权。这一档**不用我们写代码**：`UsePreviousPrivileges` 缺省 `yes`（帮助原文："Setup will look in the registry to see if the same application is already installed in one of the two install modes, and if so, it will use that install mode"），Setup 自己按上一次的安装模式走 UAC。UAC 那一句"是"是提权本身要付的代价，不是可以消灭的点击 |
+| 静默安装没有"问用户"的余地 | `/SILENT` 下 Inno 不会停下来问任何问题。真遇到写不进去的目录，它会弹错误框然后失败 —— 此时本程序已经退出，用户看到的是一个错误框 + 一个没更新的程序（**不是**更糟的"装了一半"：`[Files]` 只有一条 `ignoreversion`，写失败即安装失败，旧 exe 还在） |
+| RM 关停的时序余量 | 见 §4.9.3b：本程序自己退出（0.15–0.24 s）快于 Setup 的 RM 关停（0.40 s），但这是**实测出来的余量**、不是协议保证。真被 RM 抓住也只是多等 30 s 再出现一个询问框；升级路径是把"退出"提前到 spawn 之前（需要一个中间人进程，当前不值得） |
 | 启动时检查失败是静默的 | 只进日志。这是刻意的：用户没要求程序去查，开机甩一句"检查更新失败"是噪音；想知道结果就点〔检查更新〕 |
 | 下载进度不显示 | 状态栏一句话 + 日志。要百分比得把 worker 的字节流搬过消息通道（且 ureq 的读循环要改成流式），与收益不成比例 |
+
+---
+
+### 4.10 单实例（FR-40，v1.11 新增）
+
+#### 4.10.1 没有新模块，全部在 `main.rs` 的入口处
+
+四个函数、零新增依赖、零新增 `windows-sys` feature（`CreateMutexW` / `CreateEventW` /
+`OpenEventW` / `SetEvent` / `WaitForSingleObject` / `AllowSetForegroundWindow` /
+`FindWindowW` / `ShowWindow` / `SetForegroundWindow` 所需的四个 feature 本来就都开着 ——
+它们分别是 `Win32_System_Threading`、`Win32_UI_WindowsAndMessaging`、`Win32_Foundation`、
+`Win32_Security`）。
+
+仲裁放在 `main()` 的**第一行**：第二个实例不建窗口、不建托盘、不读也不写 `state.json`、
+不探测包管理器 —— 一个字节的副作用都不该有。
+
+#### 4.10.2 判据：具名互斥体，`Local\` 作用域
+
+```text
+Local\dsh-manager-single-instance   ← 判据（CreateMutexW + ERROR_ALREADY_EXISTS）
+Local\dsh-manager-show-window       ← 交接（第二个实例 SetEvent，第一个实例轮询）
+```
+
+⚠ **两个对象名是函数的参数、不是函数体内的常量**：单元测试必须能用独立的名字隔离。
+拿生产名去测的话，本机正开着 DSH Manager 时测试会认领到**别人**的互斥体，
+`cargo test` 的结果就取决于用户此刻开没开程序。
+
+⚠ **创建顺序：事件在前、互斥体在后**。反过来的话，"互斥体已存在"与"事件还没建出来"
+之间有一个微秒级窗口；落在这个窗口里的第二个实例会 `OpenEventW` 失败 —— 而它已经决定
+要退出了，于是用户双击图标**什么都不会发生**（既没有新窗口，也没叫醒旧窗口）。
+
+⚠ **两个句柄都刻意不关**：它们就是"我在跑"这件事本身。关掉互斥体等于放行第三个实例，
+关掉事件等于让后面的实例叫不醒我们。进程结束时由内核回收（这也是 Inno 帮助里那句
+"It is not necessary to explicitly destroy the mutex object upon your application's
+termination"）。
+
+⚠ **`CreateMutexW` 失败时不认领**：判据读不到就是"判断不出来"，此时退化成修订之前的
+行为（允许第二个实例）。误判成"已有实例"的代价是**谁也起不来**，比多开一个窗口糟得多。
+
+#### 4.10.3 为什么由第一个实例自己 `show()`，而不是第二个进程去戳窗口
+
+这是本轮最容易写错的一处，值得写清。看似更直接的做法是：第二个实例 `FindWindowW` 找到
+第一个实例的窗口，直接 `ShowWindow(SW_RESTORE)` + `SetForegroundWindow`，然后退出。
+**这个做法有个隐蔽的后遗症**：
+
+> Slint 1.18 的 winit 后端在 `set_visibility` 的**第一行**就是
+> `if visibility == self.shown.get() { return Ok(()); }`
+> （`i-slint-backend-winit-1.18.0/winitwindowadapter.rs:1628`）。
+> 外部把原生窗口显示出来之后，Slint 自己仍然记着 `Hidden` —— 于是此后**本进程的每一次
+> 隐藏/关闭都会变成空操作**（`w.hide()` 早退、点 X 也不消失）。用户会看到一个关不掉的窗口。
+
+所以信号只传"请你弹窗"这一件事，真正的 `show()` 由**持有 Slint 状态机的那个进程**调用：
+`claim` 返回的事例句柄交给既有的 80 ms timer 非阻塞轮询（`WaitForSingleObject(…, 0)`），
+命中就 `w.show()`。事件是**自动重置**的，问一次清一次，不会每个 tick 重弹窗口。
+
+⚠ **不新增线程、不新增 `UiMsg`**：这条 timer 本来就每 80 ms 跑一次，多一次微秒级的内核
+调用不值得多一个线程 + 一条消息臂。（主题监视那处必须开线程，是因为
+`RegNotifyChangeKeyValue` 是**阻塞**等待。）
+
+#### 4.10.4 前台：一次实测出来的失败与它的修法
+
+`w.show()` 只保证"显示"：最小化的窗口仍是最小化，被别的窗口盖住时也不会自己跑到前面。
+所以显示之后还要原生地 `SW_RESTORE` + `SetForegroundWindow`。
+
+**真机实测的第一版是错的**（探针见 VERIFICATION §8.2）：窗口**从隐藏到显示**那条路全绿，
+**从最小化还原**那条路却失败了 —— 窗口确实回到了屏幕上（`IsWindowVisible` 为真、
+`IsIconic` 为假），但 `GetForegroundWindow()` 不是它。根因是 Windows 的前台锁：它按
+**调用进程**判，而真正调 `SetForegroundWindow` 的是**第一个实例**（一个后台进程，没有
+这份权利）。
+
+修法是把权利交给"有的那一方"：**第二个实例**是用户这次点击拉起来的（属于"当前前台进程
+启动的进程"，持有这份权利），它在点亮事件**之前**调一次
+`AllowSetForegroundWindow(ASFW_ANY)`，把这份权利临时让出去（有效期止于下一次前台变更，
+不是常驻授权）。改完两轮 13 项探针全绿。
+
+⚠ 顺序不能反：先 `AllowSetForegroundWindow` 再 `SetEvent`。反了就是在"还没授权"的时间窗
+里让第一个实例去抢前台。
+
+#### 4.10.5 窗口查找键是跨语言契约
+
+`focus_main_window()` 用 `FindWindowW(null, "DSH Manager")` 找窗口 —— 而那个标题写在
+`ui/app.slint` 里。这是本模块唯一一处 Rust ↔ Slint 的字符串契约，漂移的后果是**静默的**
+（旧实例确实 `show()` 了，只是没被拉到最前；最小化或被遮挡时看起来就是"双击没反应"）。
+
+因此有一条测试直接读源文件比对，而不是在 Rust 里维护第二份副本：
+
+```rust
+include_str!("../ui/app.slint").contains(&format!("title: \"{WINDOW_TITLE}\";"))
+```
+
+（与 §4.9.2 那组"名字是契约"同一条思路：契约要么有唯一构造点，要么有一条会响的测试。）
+
+#### 4.10.6 与更新流程的配合
+
+更新时本程序会先退出（§4.9.4），互斥体随之释放；安装完成后由安装程序把新版本拉起来
+（§4.9.3b），此时没有别的实例在跑 —— 单实例不会把"更新后的重启"挡在门外。
+反过来，万一真有两个实例同时被拉起（`RestartApplications` 的极端情形），第二个也只会
+聚焦第一个，不会出现两份 `state.json` 互相覆盖。
+
+---
 
 ## 5. 错误处理设计
 
@@ -1487,6 +1626,10 @@ SRS §8.4 要求对核心逻辑做单元测试。以下逻辑被刻意设计为*
 | `dsh::parse_app_release(&str, &Version)` | FR-38 | 表驱动：严格大于才算新版本（相等/更旧 → `None`）、`prerelease`/`draft` → `None`、资产名不符 → **`Err`**（发布漏传必须留痕，不得报成"已是最新"）、tag 非法 → `Err` |
 | `dsh::parse_certutil_hash(&str)` | FR-39 | 中/英两种 certutil 输出**都能**取到哈希 —— 按 64 位十六进制的**形状**取，不按文案（文案随系统语言变化） |
 | `dsh::parse_sha256sums(&str, &str)` | FR-39 | `sha256sum` 两种写法（`<hash>  <name>` 与 `<hash> *<name>`）、CRLF、大小写不敏感、缺条目 → `None` |
+| `dsh::setup_args()` | FR-39 修订 | 逐字断言 `["/SILENT", "/NORESTART"]` —— 与 `pm_command_table_is_exact` 同款：少一个参数是**静默**回归（少 `/SILENT` 用户又要手点一遍；少 `/NORESTART` 会弹 "Reboot now?"） |
+| `main::claim(mutex, event)` | FR-40 | 用**测试专用**对象名连 claim 两次：第二次必须返回 `None`；且第一个句柄必须能读到"已点亮"（`show_requested`）—— 少了这一跳就是"双击图标没反应"（判据与交接一次钉住） |
+| `main::take_quit_turn(&mut AppState)` | FR-39 修订 | 连问三次：第一条放行、此后每条作废（退出幂等 —— 防 RM 的 `WM_CLOSE` 用另一种语义重放退出） |
+| `main::WINDOW_TITLE` ↔ `ui/app.slint` | FR-40 | `include_str!("../ui/app.slint")` 里必须含 `title: "DSH Manager";` —— 跨语言契约漂移的后果是静默的（旧实例 `show()` 了但没到最前） |
 
 ### 6.2 事务引擎的失败路径测试
 
@@ -1632,3 +1775,4 @@ strip     = true
 | 1.8 | 2026-09-23 | **新增本程序自身的更新（SRS v1.5 的 §3.10 / FR-38 / FR-39）**：**①** 新增 **§4.9**（无新模块的取舍、`OutputBaseFilename` ↔ 资产名 ↔ `app_setup_asset_name` 的三方名字契约与"名字不符必须 `Err`"、完整数据流、"置标志 + timer 交接退出"的理由、`make_quit(stop_web)` 的退出语义分叉、弹框可见性为何必须由 Rust 独占写入、**`alignment: start` 下 stretch 不生效导致徽标错位的探针实测**、6 条已知限制）；**②** §3.2 属性契约加 `update-available` / `update-version` / `update-prompt-visible` 与 5 个回调；**③** §6.1 纯函数表加 4 行；**④** `Job::CheckAppUpdate` / `Job::DownloadAppUpdate` / `UiMsg::AppUpdate` / `UiMsg::AppUpdateLaunched` / `model::NewRelease`；**⑤** `state.json` 增 `skipped_app_version`（缺 key / 非字符串 = 没忽略过）；**⑥** 依赖表**不变**：哈希用系统自带 `certutil.exe`，下载复用 `ureq`（只调两个参数：全局超时 120 s、体积上限 64 MB —— ureq 默认 10 MB，而安装包已 8.7 MB） |
 | 1.9 | 2026-09-23 | **说明正文的站内链接不再当浏览器地址派发（SRS v1.6 的 FR-27b 补充；用户报的 bug）**：`on_link_clicked` 原先无条件把 `link-clicked` 的字符串派发成 `Job::OpenUrl`，而 DSH 的 release 正文第一行就是语言导航行 `[中文](#cn-…) \| [English](#en-…)`（实测 20 个 release 共 40 条锚点链接，另有 6 条 `SAFETY.md` 类相对路径）—— 于是每点一次就写一条 `打开网页失败: 拒绝打开非 http(s) 链接: #en-v0.1.7-alpha.2`。**①** 新增纯函数 `dsh::is_web_url`（判据只有这一份）+ `main::dispatch_notes_link`（准入：站内链接一个任务都不派发）；**②** §3.2 属性契约 `link-clicked` 那行注释同步，**§4.3 的 `open_url` 代码块同时更正**（它还画着 Ruling 65 之前的 `cmd /c start`，并误称"URL 不含外部输入"）；**③** §6.1 纯函数表加 2 行 —— 含 `main.rs` 的**第一个**测试模块（纯函数、真通道，不是 §6.3 排除的 GUI 测试），判别与接线一起覆盖；**④** 依赖表**不变**（零新增依赖：判据是前缀，不引 url crate）。**⚠ 白名单本身未动**（Ruling 65 仍是 `open_url` 的第二道），改的是"什么算可打开的目标"这层准入；面板里**不做**锚点跳转（与"不做中英切换"同一条裁决）。红-绿实测与真实正文的取值统计见 VERIFICATION §8 |
 | 1.10 | 2026-09-23 | **日志正文可选中复制（SRS v1.7 的 FR-28 修订；用户要求"输出中的文字可以选中复制"）**：`LogLine` 里那个 `Text` 换成 `read-only: true` 的 `TextInput` —— Slint 的 `Text` 没有任何选区支持，只有 `TextInput` 有，而 `read-only` 的语义正是"能选不能改"。**①** §3.2 设计要点 2 补三处必知（按下即 `GrabMouse` ⇒ 拖动改成划选、`Ctrl+A`/`Ctrl+C` 不受 read-only 影响 ⇒ 零 Rust 零依赖、`accessible-role: text` 保住读屏语义）；**②** 选区配色复用既有令牌（底色 `Tokens.accent-line`、前景色 = 本行语义色，与 `GlassField` 同款），**未新增令牌**；**③** 依赖表**不变**；**④** 离屏探针实测（VERIFICATION §9）：三行日志的行几何与墨色与改动前**逐像素一致**（y 393/413/433、x0=30、20px 行距、三种墨色），375 字长行的墨迹右边界也一致（x 30..416 —— 长行仍是"画出去被卡片裁掉"，`TextInput` 没有引入内部横向滚动）；拖选→`Ctrl+C` 得 `probe-ok-two`、`Ctrl+A`+`Ctrl+C` 得 `probe-err-three`、只拖不复制则剪贴板为空、打字不改内容。**⚠ 代价已落档**：日志区按住拖动不再滚动（滚轮/滚动条/PageUp 仍可） |
+| 1.11 | 2026-09-24 | **两条用户要求（v0.4.0 之后的第一批）**：**① 更新改为静默安装 + 装完自动重启**（SRS v1.8 的 FR-39 修订）—— 新增 **§4.9.3b**：`/SILENT /NORESTART` 三个决定的依据（保留进度窗、不压消息框、不传 `/DIR` 靠 `UsePreviousAppDir`）、`[Run]` 那条 `skipifnotsilent runasoriginaluser`、以及**更正 v1.10 的一句错话** —— "`RestartApplications` 缺省就会重启"不成立（它只重启被 Setup 关掉的程序，本程序是自己退出的）；§4.9.4 补**退出幂等闸门** `take_quit_turn`：RM 关停会发 `WM_CLOSE`，没有闸门它会按「彻底退出」taskkill 掉用户正在用的 `dsh web`，把 FR-39 的承诺当场推翻；§4.9.7 更新"为所有用户安装"那一行（`UsePreviousPrivileges` 自己走 UAC）并新增三条限制（静默没有问用户的余地、RM 时序余量、PowerShell 探针里的残留进程坑）。**② 新增单实例**（SRS v1.8 的 §3.11 / FR-40）—— 新增 **§4.10**：`Local\` 具名互斥体 + 具名事件的交接、**为什么不能让第二个进程从外部 `ShowWindow`**（Slint 1.18 的 `set_visibility` 在状态未变时早退 ⇒ 此后窗口关不掉，`winitwindowadapter.rs:1628`）、前台锁的**实测失败与修法**（`AllowSetForegroundWindow(ASFW_ANY)` 必须由第二个实例、且在 `SetEvent` 之前调）、窗口标题这条 Rust ↔ Slint 契约由 `include_str!` 测试钉住；§4.4.6 那条"假设单实例运行 / 不做单实例守护"随之改写。**③ 依赖表不变**（所需 windows-sys feature 本来就都开着）；`cargo test` 142/142、`cargo build` 0 警告；真机证据（13 项 + 12 项探针）见 [VERIFICATION.md](VERIFICATION.md) §10 |

@@ -1,7 +1,8 @@
 ; ═══════════════════════════════════════════════════════════════════════════
-;  DSH Manager 安装脚本（Inno Setup 6）
+;  DSH Manager 安装脚本（Inno Setup 6 / 7 —— 同一份脚本两边都编过）
 ;
-;  编译：  "C:\Software\Inno Setup 6\ISCC.exe" installer\dsh-manager.iss
+;  编译：  ISCC.exe installer\dsh-manager.iss
+;          （开发机上是 Inno Setup 7：C:\Software\Inno Setup 7\ISCC.exe；CI 用 choco 装的 6）
 ;  前置：  cargo build --release
 ;
 ;  ⚠ 版本号**不在这里手写**。它取自 target\release\dsh-manager.exe 的
@@ -82,4 +83,24 @@ Name: "{group}\{cm:UninstallProgram,{#AppName}}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon
 
 [Run]
+; ⚠ 两条**互斥**的条目，合起来才是"人工安装照旧、自动更新全程不用点"：
+;   · 第 1 条（postinstall skipifsilent）—— 向导完成页上那个"完成后启动"勾选框，
+;     人工安装走这条；
+;   · 第 2 条（skipifnotsilent）—— 只在**静默**安装时跑，也就是 FR-39 的自动更新：
+;     用户在更新框里已经点过〔下载并安装〕，不该再被要求点一次"完成"才能看到
+;     程序回来（本次修订要消灭的正是这一下）。
+;
+; ⚠ 第 2 条**不能**靠"把第 1 条的 skipifsilent 去掉"来实现：postinstall 的语义是
+;   "在完成页上放一个勾选框"，而静默模式根本没有完成页 —— 它到底跑不跑，Inno 的
+;   文档没有写死。`skipifnotsilent` 是文档明写的判据（帮助原文："Instructs Setup to
+;   skip this entry if Setup is not running (very) silent"），不依赖未言明的行为。
+;
+; ⚠ 重启**只能**由这里做：本程序在启动安装程序后必须退出（要替换的正是它自己的
+;   exe），所以"装完再把程序拉起来"这件事只有还活着的安装程序能完成。
+;   `runasoriginaluser`：即便这次安装走 UAC 提了权，拉起来的也是**非提权**的原用户
+;   进程 —— 否则托盘、`%APPDATA%` 下的 state.json 全会变成管理员所有。
+; ⚠ 不会因此拉起两个进程：`RestartApplications` 缺省 yes 只重启"被 Setup 关掉的"
+;   程序，而本程序是自己退出的，且没调 `RegisterApplicationRestart`（帮助原文：
+;   "the application needs to be using the Windows RegisterApplicationRestart API"）。
 Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(AppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#AppExeName}"; Flags: nowait skipifnotsilent runasoriginaluser

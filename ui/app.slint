@@ -1420,7 +1420,7 @@ export component MainWindow inherits Window {
     callback update-later-clicked();
     /// 〔忽略此版本〕：记进 state.json，该版本不再自动弹框（徽标仍在）。
     callback update-skip-clicked();
-    /// 〔下载并安装〕：下载 → 校验 → 启动安装向导 → 本程序退出（保留 dsh web）。
+    /// 〔下载并安装〕：下载 → 校验 → **静默**启动安装程序 → 本程序退出（保留 dsh web）→ 装完由安装程序自动拉起。
     callback update-download-clicked();
 
     // ═══ 派生量（纯展示推导，不引入新状态）═══
@@ -2526,7 +2526,7 @@ export component MainWindow inherits Window {
                 }
                 Rectangle { height: 8px; }
                 Text {
-                    text: "下载完成后会启动安装向导，本程序随之退出以便替换文件。由本程序启动的 dsh web 会保留运行，重启后可在界面里重新认领。";
+                    text: "下载完成后会静默安装到当前目录，装完自动重启本程序 —— 中途不需要你再点任何东西（只有一个安装进度窗）。由本程序启动的 dsh web 会保留运行，重启后可在界面里重新认领。";
                     color: Tokens.ink-2;
                     font-family: Font.text;
                     font-size: 12px;

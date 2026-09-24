@@ -127,12 +127,15 @@ struct AppState {
     /// 本会话已经**自动**弹过一次更新框了。用户关掉之后不该再被弹回来；
     /// 手动点〔检查更新〕不受它约束（那是用户明确要求看）。
     update_auto_shown: bool,
-    /// FR-39：安装向导已启动，该退出了 —— 但**不停** `dsh web`（见 `make_quit`）。
+    /// FR-39：安装程序已启动，该退出了 —— 但**不停** `dsh web`（见 `make_quit`）。
     ///
     /// ⚠ 为什么是一个标志而不是直接调退出：置真发生在 `drain`（worker 消息）里，
     /// 而退出闭包由 `main()` 持有、`drain` 拿不到；80ms 的 timer 是唯一同时够得着
     /// 两边的地方，它取走这个标志再执行。
     quit_keep_web: bool,
+    /// 退出路径是否**已经开始**。见 `make_quit` 开头那道幂等闸门：
+    /// 退出只走一次，先到的那条说了算。
+    quitting: bool,
     log: Rc<VecModel<slint::SharedString>>,
 }
 
@@ -197,6 +200,7 @@ impl AppState {
             update_prompt_visible: false,
             update_auto_shown: false,
             quit_keep_web: false,
+            quitting: false,
             log: Rc::new(VecModel::default()),
         }
     }
@@ -760,7 +764,7 @@ fn drain(rx: &Receiver<UiMsg>, state: &Rc<RefCell<AppState>>, tx: &Sender<Job>) 
                     },
 
                     UiMsg::AppUpdateLaunched { version, path } => {
-                        push_log(&s, format!("安装向导已启动（v{version}）：{}", path.display()));
+                        push_log(&s, format!("安装程序已启动（静默安装，v{version}）：{}", path.display()));
                         push_log(
                             &s,
                             "本程序即将退出以便替换文件；由本程序启动的 dsh web **保留运行**，\
@@ -948,7 +952,7 @@ fn local_version() -> Version {
 
 /// FR-39：安装包落盘的位置 —— `%TEMP%\dsh-manager-update\`。
 ///
-/// ⚠ 用**本程序自己的子目录**而不是直接丢在 `%TEMP%` 根下：安装向导要在本程序退出
+/// ⚠ 用**本程序自己的子目录**而不是直接丢在 `%TEMP%` 根下：安装程序要在本程序退出
 /// **之后**继续读这个文件，路径必须是确定的、也不能与别人的临时文件撞名；
 /// 一个专属目录还让"重试"只需覆盖同一个文件。
 fn update_dir() -> Option<std::path::PathBuf> {
@@ -1156,7 +1160,7 @@ fn execute(job: Job, tx: &Sender<UiMsg>) {
 
             match dsh::launch_setup(&path) {
                 Ok(()) => send(UiMsg::AppUpdateLaunched { version: release.version, path }),
-                Err(e) => send(UiMsg::Failed { context: "启动安装向导", message: e }),
+                Err(e) => send(UiMsg::Failed { context: "启动安装程序", message: e }),
             }
         }
 
@@ -2100,7 +2104,7 @@ fn wire_callbacks(
     }
 
     {
-        // 〔下载并安装〕：关框 → 派发下载 → worker 下完会启动安装向导并回报
+        // 〔下载并安装〕：关框 → 派发下载 → worker 下完会**静默**启动安装程序并回报
         // `AppUpdateLaunched`，由 timer 执行"退出但保留 dsh web"。
         let state = state.clone();
         let send = send.clone();
@@ -2116,6 +2120,14 @@ fn wire_callbacks(
             send(Job::DownloadAppUpdate { release: rel });
         });
     }
+}
+
+/// 退出闸门：`true` = 退出**已经**开始过，本次请求作废；`false` = 本次是第一条。
+///
+/// 抽成独立函数只为可测：`cargo test` 能直接对一个 `AppState` 连问两次，
+/// 而 `make_quit` 返回的闭包在测试里没法构造（它会真的去退出事件循环）。
+fn take_quit_turn(state: &mut AppState) -> bool {
+    std::mem::replace(&mut state.quitting, true)
 }
 
 /// 退出路径。`stop_web` 决定要不要先停掉本程序启动的 `dsh web`：
@@ -2136,6 +2148,17 @@ fn wire_callbacks(
 /// 改成 worker 往返需要一个"停完再退"的握手，与收益不成比例。
 fn make_quit(state: Rc<RefCell<AppState>>, job_tx: Sender<Job>, stop_web: bool) -> Rc<dyn Fn()> {
     Rc::new(move || {
+        // ⚠ 幂等闸门（静默安装带出）。退出只会走一次，**先到的那条说了算**。
+        //
+        // 为什么必须有：静默安装时安装程序会用 Restart Manager **关停占用文件的
+        // 程序**，那会给我们发一次 WM_CLOSE；而 FR-39 那条退出（**不停** `dsh web`）
+        // 可能已经在飞。没有这道闸门时，WM_CLOSE 会按「关闭行为 = 彻底退出」走一趟
+        // `make_quit(true)` —— 于是 taskkill 掉用户正在用的 `dsh web` 会话，
+        // FR-39 的退出语义当场失效（"装更新不许杀掉用户的会话"就此破功）。
+        // 退出本来就是不可逆的：第二条退出请求没有任何需要它做的事。
+        if take_quit_turn(&mut state.borrow_mut()) {
+            return;
+        }
         let s = state.borrow();
         let pid = s.web_pid;
         // ⚠ Ruling 93：读的是**接受启动时**记下的端口，不是此刻的 `preferred_port`。
@@ -2195,7 +2218,160 @@ fn make_quit(state: Rc<RefCell<AppState>>, job_tx: Sender<Job>, stop_web: bool) 
     })
 }
 
+// ═══════════════════════════ FR-40：单实例 ═══════════════════════════
+
+/// FR-40：单实例仲裁用的具名互斥体。`Local\` 前缀 = 按**登录会话**隔离 ——
+/// 同一台机器上另一个用户（快速用户切换）不该被这里挡住：两个会话各自管着
+/// 各自的 `state.json` 与自己的 `dsh web`，互相之间没有可争用的东西。
+const INSTANCE_MUTEX: &str = r"Local\dsh-manager-single-instance";
+
+/// FR-40：第二个实例用来"请已有实例把主窗口弹出来"的具名事件。
+const SHOW_EVENT: &str = r"Local\dsh-manager-show-window";
+
+/// FR-40：主窗口标题，`FindWindowW` 唯一的查找键。
+///
+/// ⚠ **必须与 `ui/app.slint` 里 MainWindow 的 `title:` 逐字一致** —— 这是本模块
+/// 唯一一处跨语言（Rust ↔ Slint）的字符串契约。改了 .slint 却忘了改这里，
+/// 症状是"第二次启动把旧实例叫醒了、旧实例也确实 `show()` 了，但窗口没有被拉到
+/// 最前"—— 被别的窗口盖住时看起来就像双击没反应，而人眼抓不住这种静默失效。
+/// `window_title_matches_slint` 那条测试就是钉它的。
+#[cfg(windows)]
+const WINDOW_TITLE: &str = "DSH Manager";
+
+/// `&str` → 带结尾 NUL 的宽字符串（`FindWindowW` / `CreateMutexW` 一律要 `PCWSTR`）。
+/// 与 `dsh::system_proxy` 里那个同名嵌套函数是同款——那边是函数内私有，够不着。
+#[cfg(windows)]
+fn wide(s: &str) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    std::ffi::OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+}
+
+/// FR-40：单实例仲裁。
+///
+/// - `Some(句柄)` = 本进程是**唯一**实例；句柄是"请弹窗"事件，交给 80 ms timer 轮询。
+/// - `None` = **已经有实例在跑**。本函数已经点亮事件请它把主窗口弹出来，调用方
+///   应当立刻收工：不建窗口、不建托盘、尤其不碰 `state.json`（两个实例各写各的，
+///   后写覆盖先写 —— 见 ARCHITECTURE §4.4.6 那条已知限制）。
+///
+/// ⚠ 两个对象名走的是**参数**而不是函数里写死的常量：单元测试必须能用独立的名字
+/// 隔离，否则拿生产名去测时，结果取决于用户此刻开没开程序。
+#[cfg(windows)]
+fn claim(mutex_name: &str, event_name: &str) -> Option<isize> {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError};
+    use windows_sys::Win32::System::Threading::{
+        CreateEventW, CreateMutexW, EVENT_MODIFY_STATE, OpenEventW, SetEvent,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{ASFW_ANY, AllowSetForegroundWindow};
+
+    // ⚠ 顺序**刻意**：事件先建、互斥体后建。
+    // 反过来写的话，"互斥体已存在"与"事件还没建出来"之间就有一个微秒级窗口，
+    // 落在这个窗口里的第二个实例会 `OpenEventW` 失败 —— 而它已经决定要退出了，
+    // 于是用户双击图标**什么都不会发生**（既没有新窗口，也没叫醒旧窗口）。
+    let event = unsafe {
+        CreateEventW(std::ptr::null(), 0 /* 自动重置 */, 0, wide(event_name).as_ptr())
+    };
+    let mutex = unsafe { CreateMutexW(std::ptr::null(), 0, wide(mutex_name).as_ptr()) };
+    // ⚠ `GetLastError` 必须**紧跟** `CreateMutexW`：中间插进任何一次别的 API 调用
+    // （哪怕是一次成功的）都会把它冲掉，判据就永远不成立。
+    // 句柄为 NULL（创建失败，例如资源耗尽）= "判断不出来"：此时**不认领**，
+    // 退化成修订之前的行为（允许起第二个实例）。误判成"已有实例"的代价是
+    // 谁也起不来 —— 那比多开一个窗口糟得多。
+    if mutex.is_null() || unsafe { GetLastError() } != ERROR_ALREADY_EXISTS {
+        // ⚠ 两个句柄都**刻意不关**：它们就是"我在跑"这件事本身 —— 关掉互斥体等于
+        // 放行第三个实例，关掉事件等于让后面的实例叫不醒我们。进程结束时由内核回收。
+        return Some(event as isize);
+    }
+
+    // 已经有实例：点亮它的事件，然后本进程就没事了。
+    unsafe {
+        CloseHandle(mutex);
+        CloseHandle(event);
+        // ⚠ 必须**先**放行前台、**再**点亮事件 —— 顺序不能反。
+        //
+        // 真正去 `SetForegroundWindow` 的是**第一个实例**，而 Windows 的前台锁按
+        // **调用进程**判：那一位此刻是后台进程，没有这个权利。持着这份权利的是
+        // **本进程** —— 用户这次点击把它拉起来的，属于"由当前前台进程启动的进程"。
+        // 真机实测的判别性证据：窗口从**最小化**还原时，第一个实例的
+        // `SetForegroundWindow` 被前台锁拒绝 —— 窗口确实回到了屏幕上
+        // （`IsWindowVisible` 为真、`IsIconic` 为假），却仍可能被别的窗口盖着，
+        // 用户看起来就是"双击了没反应"。（"隐藏 → 显示"那条路没事，因为那次
+        // 是 Slint 自己的显示路径顺带把窗口激活了。）
+        //
+        // `ASFW_ANY` = 把这份权利临时让给所有进程；有效期止于下一次前台变更，
+        // 不是常驻授权。这是 `AllowSetForegroundWindow` 存在的意义所在。
+        AllowSetForegroundWindow(ASFW_ANY);
+        let ev = OpenEventW(EVENT_MODIFY_STATE, 0, wide(event_name).as_ptr());
+        if !ev.is_null() {
+            SetEvent(ev);
+            CloseHandle(ev);
+        }
+    }
+    None
+}
+
+/// FR-40：非阻塞地问一次"第二个实例叫过我们吗"。
+///
+/// 事件是**自动重置**的：问一次清一次，所以窗口不会被每个 tick 反复弹起来
+/// （那会把用户正在做的事一次次打断）。`0` = `CreateEventW` 当年没成功
+/// （见 `claim`），没有可等的对象。
+#[cfg(windows)]
+fn show_requested(event: isize) -> bool {
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+    event != 0
+        && unsafe { WaitForSingleObject(event as *mut std::ffi::c_void, 0) } == WAIT_OBJECT_0
+}
+
+/// FR-40：把主窗口拉到最前。
+///
+/// ⚠ `w.show()` **只保证"显示"**：最小化的窗口仍是最小化，被别的窗口盖住时也不会
+/// 自己跑到前面。所以显示之后还要原生地 `SW_RESTORE` + `SetForegroundWindow`。
+/// 这两个调用**不**破坏 Slint 的可见性状态 —— 状态是调用方那行 `w.show()` 改的，
+/// 这里只碰原生窗口。
+#[cfg(windows)]
+fn focus_main_window() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, SW_RESTORE, SetForegroundWindow, ShowWindow,
+    };
+
+    let hwnd = unsafe { FindWindowW(std::ptr::null(), wide(WINDOW_TITLE).as_ptr()) };
+    if hwnd.is_null() {
+        // 窗口还没建出来（第一个实例还在启动途中）。事件是一次性的，但
+        // `claim` 的注释说明了顺序：那个 `show()` 那一半照旧生效。
+        return;
+    }
+    unsafe {
+        ShowWindow(hwnd, SW_RESTORE);
+        SetForegroundWindow(hwnd);
+    }
+}
+
+/// 非 Windows 的退化实现：永远当作"没有别的实例"。
+///
+/// 本程序是 Windows 专用（CON-1），这条只为让别的平台上的 `cargo check` 不因
+/// 缺 `windows-sys` 而断掉 —— 与 `theme::spawn_watcher` 的 `#[cfg(not(windows))]`
+/// 空实现同款。
+#[cfg(not(windows))]
+fn claim(_mutex_name: &str, _event_name: &str) -> Option<isize> {
+    Some(0)
+}
+#[cfg(not(windows))]
+fn show_requested(_event: isize) -> bool {
+    false
+}
+#[cfg(not(windows))]
+fn focus_main_window() {}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // FR-40：单实例。⚠ 必须是 `main` 里的**第一件事** —— 第二个实例不该建窗口、
+    // 建托盘，更不该去动 `state.json`。已有实例时它已经替我们把主窗口弹出来了
+    // （事件在 `claim` 里点亮），这里直接收工。
+    let show_event = match claim(INSTANCE_MUTEX, SHOW_EVENT) {
+        Some(ev) => ev,
+        None => return Ok(()),
+    };
+
     // §3.8 / FR-30：启动时读取持久化的偏好端口
     //
     // ⚠ FR-32/V-26 要的"记日志"**不能**用 eprintln!：本进程是
@@ -2318,7 +2494,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     project(&state.borrow(), &w, &t);
                 }
             }
-            // FR-39：安装向导已启动 —— 退出，但**保留** dsh web（见 `make_quit`）。
+            // FR-40：第二个实例叫过我们 —— 把主窗口弹回来。
+            //
+            // ⚠ 必须由**本进程**调 `w.show()`，而不是让第二个进程从外面 `ShowWindow`。
+            // Slint 1.18 的 winit 后端在 `set_visibility` 开头有一句
+            //   `if visibility == self.shown.get() { return Ok(()); }`
+            // （i-slint-backend-winit-1.18.0/winitwindowadapter.rs:1628）—— 外部改过
+            // 原生可见性之后，它仍然以为窗口是隐藏的，于是**本进程此后所有隐藏/关闭
+            // 都变成空操作**（症状：窗口关不掉）。让第一个实例自己 show，状态机才自洽。
+            //
+            // 非阻塞轮询（`WaitForSingleObject(…, 0)`）而不是另起一个等待线程：这条
+            // timer 本来就每 80 ms 跑一次，多一次微秒级的内核调用不值得多一个线程、
+            // 多一条 `UiMsg`。事件是自动重置的，收到一次就清一次，不会每个 tick 重弹。
+            if show_requested(show_event) {
+                if let Some(w) = win_w.upgrade() {
+                    let _ = w.show();
+                }
+                focus_main_window();
+            }
+            // FR-39：安装程序已启动 —— 退出，但**保留** dsh web（见 `make_quit`）。
             // 只有这里能做：置真发生在 `drain`，而退出闭包由 `main()` 持有。
             if std::mem::take(&mut state.borrow_mut().quit_keep_web) {
                 quit_keep_web();
@@ -2482,5 +2676,76 @@ mod tests {
             dispatch_into_channel("http://127.0.0.1:3080"),
             Ok(Job::OpenUrl { .. })
         ));
+    }
+
+    // ══════════════════ 退出闸门（静默安装带出）══════════════════
+
+    /// ★ 判别性：退出只放行一次，第二条退出请求必须作废。
+    ///
+    /// 它捕获的变异：把 `make_quit` 开头那道闸门删掉。删掉之后，静默安装时
+    /// Restart Manager 发来的 WM_CLOSE 会走「关闭行为 = 彻底退出」那条路，
+    /// 把用户正在用的 `dsh web` 会话 taskkill 掉 —— 而 FR-39 的全部意义就是
+    /// 装更新时**不许**停它（V-29 的判别性一步就是"dsh web 仍在监听"）。
+    #[test]
+    fn quit_turn_is_granted_only_once() {
+        let mut s = AppState::new(3080, CloseBehavior::Hide, ThemeMode::Auto, true);
+        assert!(!take_quit_turn(&mut s), "第一条退出必须放行");
+        assert!(take_quit_turn(&mut s), "第二条退出必须作废");
+        assert!(take_quit_turn(&mut s), "此后每一条都必须作废");
+    }
+
+    // ══════════════════════ FR-40：单实例 ══════════════════════
+    /// ★ 判别性：同名互斥体的第二次 claim 必须被认成"已有实例"，**且真的点亮了
+    /// 弹窗事件**。
+    ///
+    /// 它一次钉住两件事，少任何一件都会表现为"双击图标没反应"：
+    ///   ① 判据本身（第二次 `CreateMutexW` 必须看到 `ERROR_ALREADY_EXISTS`）——
+    ///      写错就是起了两个实例、两个托盘图标、两份 `state.json` 互相覆盖；
+    ///   ② 交接（第二个实例点亮事件、第一个实例 `show_requested` 能收到）——
+    ///      少这一跳，第二个实例老老实实退出了，而旧窗口一动不动。
+    ///
+    /// ⚠ 用**测试专用**对象名：拿生产名来测的话，本机正开着 DSH Manager 时
+    /// 这条测试会认领到**别人**的互斥体，结果取决于用户开没开程序。
+    /// ⚠ 也**不能**把对象名写死在函数里 —— 那两个名字必须能从外面传进来，
+    /// 否则这条测试根本没法隔离（见 `claim` 的签名）。
+    #[cfg(windows)]
+    #[test]
+    fn second_claim_sees_the_running_instance() {
+        const MUTEX: &str = r"Local\dsh-manager-single-instance-TEST-ONLY";
+        const EVENT: &str = r"Local\dsh-manager-show-window-TEST-ONLY";
+
+        let first = claim(MUTEX, EVENT).expect("第一次 claim 必须拿到所有权");
+        assert!(
+            claim(MUTEX, EVENT).is_none(),
+            "第二次 claim 必须被认成已有实例（否则就是两个实例并存）"
+        );
+        assert!(
+            show_requested(first),
+            "第二个实例必须点亮弹窗事件 —— 少这一跳就是双击图标没反应"
+        );
+        // 事件是**自动重置**的：取走之后必须回到未点亮，否则 80 ms timer 会
+        // 每个 tick 都再弹一次窗口（把用户正在做的事反复打断）。
+        assert!(!show_requested(first), "取走之后必须回到未点亮（自动重置）");
+        // 句柄刻意不关：它就是"我在跑"这件事本身，关掉等于放行第三个实例。
+        // 与生产路径同一取舍（`claim` 的注释）。
+    }
+
+    /// 跨文件契约：`WINDOW_TITLE` 必须与 `ui/app.slint` 里主窗口的 `title:` 逐字一致。
+    ///
+    /// 它钉的是 `FindWindowW` 唯一的查找键。少了这条，改标题（比如加个版本号后缀）
+    /// 之后单实例**照旧"能用"**：旧实例确实 `show()` 了，只是窗口没被拉到最前 ——
+    /// 最小化或被遮挡时看起来就是"双击了图标没反应"，而没有任何一处会报错。
+    ///
+    /// ⚠ 直接读 .slint 源文件（`include_str!`）而不是在 Rust 里再写一份副本：
+    /// 要防的正是"两份副本漂移"，用第三份副本来防它没有意义。
+    #[cfg(windows)]
+    #[test]
+    fn window_title_matches_slint() {
+        let slint = include_str!("../ui/app.slint");
+        assert!(
+            slint.contains(&format!("title: \"{WINDOW_TITLE}\";")),
+            "ui/app.slint 里找不到 title: \"{WINDOW_TITLE}\"; —— 主窗口标题改了，\
+             单实例的窗口查找键（WINDOW_TITLE）必须跟着改，否则第二次启动不会再弹窗口"
+        );
     }
 }

@@ -1094,3 +1094,152 @@ cargo run -- copy       # 四个场景 A~D，全 PASS 退出码 0
 cargo run -- copy light # 同上，亮色主题（选区在两个主题下都要看得见）
 # 「改动前」的帧怎么拿：`git stash push -- ui/app.slint` → 跑 → `git stash pop`
 ```
+
+---
+
+## 10. 单实例 + 静默安装自动重启（2026-09-24，SRS v1.8 / ARCHITECTURE v1.11）
+
+对应 **FR-40**（单实例）与 **FR-39 修订**（静默安装 + 装完自动重启）。两条都有**真机探针**，
+脚本留在 `target/`（不进版本库，与 §7.2 的一次性测试同款做法）。
+
+### 10.1 自动化证据
+
+| # | 项 | 证据 |
+|---|---|---|
+| U-1 | 单测 | `cargo test` **142/142** 通过（v1.7 基线 138 + 本轮 4：`setup_args_are_exact` / `second_claim_sees_the_running_instance` / `window_title_matches_slint` / `quit_turn_is_granted_only_once`） |
+| U-2 | 零警告 | `cargo build --release` **0 warning**；`cargo clippy --all-targets` 的警告数 **20 → 20**（与改动前逐条对比，新增代码零警告） |
+| U-3 | 判据 + 交接一次钉住 | `second_claim_sees_the_running_instance`：同名互斥体第二次 claim 必须 `None`（否则两个实例并存），且弹窗事件必须真被点亮、取走后必须回到未点亮（自动重置 —— 否则 80 ms timer 会每个 tick 重弹窗口） |
+| U-4 | 参数逐字 | `setup_args_are_exact`：`["/SILENT", "/NORESTART"]` 逐字断言 |
+| U-5 | 跨语言契约 | `window_title_matches_slint`：`include_str!("../ui/app.slint")` 里必须含 `title: "DSH Manager";` |
+| U-6 | 退出幂等 | `quit_turn_is_granted_only_once`：第一条退出放行、此后每条作废 |
+
+### 10.2 探针 A：单实例（`target/fr40-probe.ps1`，13 项断言）
+
+跑法：`pwsh -NoProfile -File target/fr40-probe.ps1`（脚本自己起/杀程序，退出码 0 = 全绿）。
+探针用 `EnumWindows` + `GetWindowThreadProcessId` **按 pid** 找窗口（不是 `MainWindowHandle`
+—— 那个对隐藏窗口返回 0，正好用来断言"确实藏起来了"）。**连跑 3 轮，13/13 全绿**：
+
+| 步骤 | 断言 | 结果 |
+|---|---|---|
+| ① 启动第一个实例 | 进程数 = 1；标题为 `DSH Manager` 的顶层窗口出现且可见 | ✅ |
+| ② 点 X（`WM_CLOSE`，`state.json` 里 `close_behavior=hide`） | 进程仍在（隐藏 ≠ 退出）；窗口 `IsWindowVisible` = 假 | ✅ |
+| ③ **再次启动**（隐藏状态） | 仍只有 1 个进程；第二个进程**自己退出**（实测耗时 **0.08–0.10 s**）；窗口重新可见；**窗口在前台**（`GetForegroundWindow` = 它） | ✅ |
+| ④ **再次启动**（最小化状态） | 仍只有 1 个进程；窗口已还原（`IsIconic` = 假）；窗口在前台；第三个进程自己退出 | ✅ |
+| ⑤ 收尾 | 杀掉程序 | ✅ |
+
+**★ 第 ④ 步是第一版实现失败的地方**（判别性的一步）：窗口**从隐藏到显示**全绿，**从最小化
+还原**却只做到了"看得见、不在最前" —— `SetForegroundWindow` 被 Windows 前台锁拒绝，因为
+真正调它的第一个实例是**后台进程**。修法是让**第二个实例**（用户这次点击拉起来的、持有
+前台权利的那一方）在 `SetEvent` **之前**调一次 `AllowSetForegroundWindow(ASFW_ANY)`。
+改完三轮全绿。这条没有别的办法能抓到 —— 单测测不到前台锁，只有真机 + 真实的双击时序能。
+
+### 10.3 探针 B：静默安装 + 自动重启 + 装进已有目录（`target/fr39-probe.ps1`，12 项断言）
+
+跑法：先 `cargo build --release`，再把安装包编译到**临时目录**（不碰 `dist/`：
+
+```text
+ISCC.exe --output-dir="C:\Mine\dsh-manager\target\fr39-dist" installer\dsh-manager.iss
+```
+
+—— ⚠ 别让这次编译覆盖 `dist/` 里那份已发布、已记过哈希的 v0.4.0 安装包）。
+
+⚠ **构建时要带 `RC`**（本轮踩到的坑）：本机没装 Windows SDK，`build.rs` 靠 PATH 上的
+`llvm-rc` 嵌图标与版本资源，而 PATH 上并没有它 —— 于是构建**静默**产出一个没有版本资源的
+exe（`build.rs` 按设计只告警、不失败），接着 ISCC 读 `GetFileVersionString` 拿到空版本，
+安装包连名字都会变成 `dsh-manager-v-windows-x64-setup.exe`。判别方法是一行命令：
+
+```powershell
+(Get-Item target\release\dsh-manager.exe).VersionInfo.FileVersion   # 必须是 0.4.0
+```
+
+本机可用的资源编译器在 Qt 的 llvm-mingw 里，用 `build.rs` 自己支持的 `RC` 变量指过去即可
+（**不要**为它改 PATH —— 那个 bin 里有 `ld.lld.exe` 之类，改 PATH 有撞上链接器的风险）：
+
+```bash
+touch build.rs && RC="C:\Software\Qt\Tools\llvm-mingw2217_64\bin\llvm-rc.exe" cargo build --release
+```
+
+（`touch build.rs` 是必需的：`build.rs` 没有声明 `rerun-if-env-changed=RC`，不碰它就不会
+重跑构建脚本。）
+
+脚本先跑 `cp target/installed-backup.exe "C:\Software\DSH Manager\dsh-manager.exe"` 把**旧二进制**
+放回去（否则"装上了"这件事不可判别），然后：
+
+| 步骤 | 断言 | 结果 |
+|---|---|---|
+| 起点 | 装的是**另一份**二进制（哈希不同）；登记表安装位置 = `C:\Software\DSH Manager\` | ✅ |
+| ① 按用户的方式把旧版跑起来 | 进程数 = 1 | ✅ |
+| ② **静默安装**（`/SILENT /NORESTART`，与 `launch_setup` 逐字相同） | 退出码 **0**，耗时 **1.3–1.6 s** | ✅ |
+| ③ **装完自己回来** | 新进程出现（pid 与旧的不同）；安装日志里有 `-- Run entry -- … Filename: C:\Software\DSH Manager\dsh-manager.exe` 与 `Run as: Original user`；主窗口已显示 | ✅ |
+| ④ **装进已有目录** | exe 哈希 = 新构建；登记表安装位置**没变**；`%LOCALAPPDATA%\Programs` / `Program Files` 下**没有**多出一份；目录里仍是 `dsh-manager.exe` + `unins000.exe` | ✅ |
+
+安装日志（`target/fr39-setup.log`）里判别性的三行：
+
+```text
+Installation process succeeded.
+-- Run entry --
+Run as: Original user
+Filename: C:\Software\DSH Manager\dsh-manager.exe
+Attempting to restart applications.
+```
+
+`-- Run entry --` 那三行就是"用户一下都没点、程序自己回来了"的证据：那条 `[Run]` 上挂的正是
+`skipifnotsilent`，在 `/SILENT` 下**本该被跳过**的条目真的执行了。
+
+### 10.4 ★ 本轮实测出来的一个真问题：Restart Manager 会把静默安装卡住 30 s
+
+第一版探针是**失败**的，而且失败得很有价值：安装包 **180 s 没返回**。日志停在
+
+```text
+Shutting down applications using our files.      ← 12:00:32.606
+Some applications could not be shut down.        ← 12:01:02.717（整整 30 s 后）
+Message box (Abort/Retry/Ignore): Setup was unable to automatically close all applications…
+```
+
+根因：`CloseApplications=yes` 会用 Restart Manager **关停**占用待替换文件的程序（静默模式下
+不给用户任何选择），而本程序**点 X 的行为是"隐藏"、不是退出** —— RM 发 `WM_CLOSE`、
+窗口藏起来、进程还在，于是 RM 等到超时。这是**既有的**交互（v0.4.0 的可见向导同样会撞上，
+只是那时用户能看到"请关闭这些程序"的页面并手动关掉），静默模式把它变成了"没人能回答"。
+
+对**真实更新路径**无影响，理由是实测出来的两个时间：
+
+| 量 | 实测 |
+|---|---|
+| Setup 从进程创建到 "Shutting down applications" | **0.40 s**（`12:00:32.208` → `12:00:32.606`） |
+| 本程序从 spawn 安装程序到自己退出 | **0.15–0.24 s**（80 ms timer 交接 + 实测 `WM_CLOSE → 进程消失` 132/133/139/140/146 ms，中位数 **139 ms**） |
+
+也就是说本程序总是**先走一步**。探针 B 也是照这个时序跑的（spawn 后 300 ms 杀掉旧实例，
+比真实的 0.2 s **更晚**，即更严格）。
+
+**顺带钉出一个真洞并修掉**：RM 关停时那个 `WM_CLOSE` 可能撞上已经在飞的 FR-39 退出。
+没有闸门时，它会按用户的「关闭行为 = 彻底退出」走一趟 `make_quit(true)` —— 于是把用户正在
+用的 `dsh web` 会话 `taskkill` 掉，正好推翻 FR-39 那句"装更新不停 `dsh web`"（V-29 的判别性
+一步）。修法是 `AppState.quitting` + `take_quit_turn`：退出只走一次，先到的那条说了算（U-6）。
+
+### 10.5 探针自身的坑（写给下一位验证者）
+
+`Stop-Process` 杀掉外层 `SetupLdr` **不会**带走它解包出来的**内层 setup**（临时目录里的
+`…setup.tmp`）。残留的内层进程一直占着 `/LOG` 那个文件，下一轮 Setup 建不出日志就会弹错误框
+等人点 —— 表现为"莫名其妙卡住"。本轮踩过一次，排查方式是列进程：
+
+```powershell
+Get-CimInstance Win32_Process | Where-Object { $_.Name -match "setup|dsh" } |
+  Select-Object ProcessId, ParentProcessId, Name
+```
+
+`fr39-probe.ps1` 的起点现在自己会清这一类残留。**这是测试环境的坑，不是产品行为**。
+
+### 10.6 待用户执行（真机端到端）
+
+| # | 对应 | 步骤 | 通过判据 | 状态 |
+|---|---|---|---|---|
+| **V-32** | FR-40 | 隐藏到托盘 / 最小化 / 正常开着，各再双击一次图标 | 始终只有一个 `dsh-manager.exe` 与一个托盘图标；窗口重新出现、还原、到前台 | 🟡 §10.2 已用探针覆盖三种状态，**待用户在真实日常使用中确认** |
+| **V-33** | FR-39 修订 | 在装着旧版的机器上点〔下载并安装〕，中途一次都不点 | 出现的是**进度窗**而不是向导；程序退出后**自己回来**；安装位置不变、没有多装一份 | 🟡 安装包那一半已由 §10.3 覆盖；**"从更新框点下去"那一半**要等一个比当前更新的 release 才能跑（同 V-28/V-29，需先发布） |
+
+### 10.7 本轮**没有**跑的一项
+
+更新框里的说明文案改长了一行（`ui/app.slint` 的那句"下载完成后会静默安装到当前目录…"）。
+卡片是自适应高度（`Bezel { width: 420px }` —— 只钉了宽、没有固定高，`Text` 是 `word-wrap`），
+所以预期只是卡片长高约一行；但**这一条是推断，不是实测**，与 §7.3 / §9 那两次离屏探针不同。
+要补的话按 §9.5 的配方跑一次 `ui-probe-*`（它 `build.rs` 编译的是**真实的** `ui/app.slint`），
+量卡片几何并与改动前对比即可。
