@@ -19,10 +19,16 @@ pub fn channel_of(v: &Version) -> Channel {
     }
 }
 
-/// FR-8 / GC-14：**只在指定通道内**求最新。
-/// 绝不使用 npm 的 `latest` tag —— 它可能比已安装版本更旧。
-pub fn latest_in<'a>(versions: &'a [Version], ch: Channel) -> Option<&'a Version> {
-    versions.iter().filter(|v| channel_of(v) == ch).max()
+/// FR-8 v1.8 修订 / GC-14：在**勾选的通道**里求最新。
+///
+/// ⚠ 绝不使用 npm 的 `latest` tag —— 它可能比已安装版本更旧（本机实测：
+/// `latest` = `0.1.5-rc.2`，而当时已装的 `0.1.6-alpha.2` 比它新）。"防降级"由调用方
+/// 那条 `已装 >= 最新` 承担：本函数只回答"在勾选范围内，目录里最大的是谁"。
+///
+/// ⚠ 比较必须是 **semver 比较**（`max()`），不是字符串、也不是发布顺序：
+/// `0.1.10-rc.1 > 0.1.9-rc.1`，而字符串比较会给出反的答案。
+pub fn newest_among<'a>(versions: &'a [Version], sel: &Channels) -> Option<&'a Version> {
+    versions.iter().filter(|v| sel.accepts(channel_of(v))).max()
 }
 
 /// 版本列表降序（最新在前）。FR-10 要求。
@@ -323,30 +329,73 @@ mod tests {
         assert_eq!(channel_of(&v("0.1.0-beta.1")), Channel::Other);
     }
 
-    /// ★ GC-14 的核心回归测试。
-    /// npm 的 latest tag 是 0.1.5-rc.2，比已装的 0.1.6-alpha.2 更旧。
-    /// 在 alpha 通道内求"最新"必须得到 0.1.6-alpha.2，绝不能是 0.1.5-rc.2。
+    /// ★ v1.8 修的那个 bug 的回归测试：同一条线的下一个阶段必须算"更新"。
+    ///
+    /// 本机真实数据（2026-09-24 实测 registry）：已装 `0.1.7-alpha.2`，目录里还有
+    /// `0.1.7-rc.1`（发布得更晚，semver 上 rc > alpha）。旧实现只在本通道里找最新
+    /// ⇒ 得到 `0.1.7-alpha.2` ⇒ 界面说"已是最新"，而版本下拉里明明躺着 `0.1.7-rc.1`。
+    /// 缺省（全勾）必须得到 `0.1.7-rc.1`。
     #[test]
-    fn latest_in_channel_never_downgrades() {
+    fn newest_among_all_channels_finds_the_next_stage() {
+        let all = vec![v("0.1.7-alpha.1"), v("0.1.7-alpha.2"), v("0.1.7-rc.1")];
+        assert_eq!(newest_among(&all, &Channels::ALL), Some(&v("0.1.7-rc.1")));
+
+        // 只勾 alpha = v0.4.0 的旧行为，现在是**用户自己选的**：
+        let only_alpha = Channels { alpha: true, rc: false, stable: false };
+        assert_eq!(newest_among(&all, &only_alpha), Some(&v("0.1.7-alpha.2")));
+
+        // 一个都不勾：勾选范围内没有候选（`Channel::Other` 除外，这里没有）
+        let none = Channels { alpha: false, rc: false, stable: false };
+        assert_eq!(newest_among(&all, &none), None);
+    }
+
+    /// ★ GC-14 的核心回归测试（判据从"按通道过滤"换成"在勾选范围内取最大"之后，
+    /// 这一条必须仍然成立）。
+    /// npm 的 latest tag 是 0.1.5-rc.2，比已装的 0.1.6-alpha.2 更旧 ——
+    /// 求"最新"绝不能落在那个更旧的版本上。
+    #[test]
+    fn newest_among_never_downgrades() {
         let all = vec![v("0.1.5-rc.2"), v("0.1.6-alpha.1"), v("0.1.6-alpha.2")];
-        assert_eq!(latest_in(&all, Channel::Alpha), Some(&v("0.1.6-alpha.2")));
-        assert_eq!(latest_in(&all, Channel::Rc), Some(&v("0.1.5-rc.2")));
-        assert_eq!(latest_in(&all, Channel::Stable), None);
+        // 全勾：最大的是 0.1.6-alpha.2（= 已装版本）⇒ 调用方那条 `>=` 判"已是最新"
+        assert_eq!(newest_among(&all, &Channels::ALL), Some(&v("0.1.6-alpha.2")));
+        assert_ne!(
+            newest_among(&all, &Channels::ALL),
+            Some(&v("0.1.5-rc.2")),
+            "落在 latest tag 上就是把用户往下带"
+        );
+        // 只勾 rc：只有 0.1.5-rc.2 可选 —— 调用方必须靠 `>=` 把它判成"已是最新"，
+        // 而不是"可更新到更旧的版本"
+        let only_rc = Channels { alpha: false, rc: true, stable: false };
+        assert_eq!(newest_among(&all, &only_rc), Some(&v("0.1.5-rc.2")));
     }
 
     #[test]
-    fn latest_in_rc_ordering_is_semver_not_string() {
+    fn newest_among_ordering_is_semver_not_string() {
         // 字符串序会把 "0.1.10-rc.1" 排在 "0.1.5-rc.2" 之前；semver 不会
         let all = vec![v("0.1.5-rc.2"), v("0.1.10-rc.1")];
-        assert_eq!(latest_in(&all, Channel::Rc), Some(&v("0.1.10-rc.1")));
+        let only_rc = Channels { alpha: false, rc: true, stable: false };
+        assert_eq!(newest_among(&all, &only_rc), Some(&v("0.1.10-rc.1")));
     }
 
+    /// 预发布版排在正式版之前（同版本号），且**勾选范围之外的一律看不见**。
     #[test]
     fn prerelease_sorts_before_release_of_same_version() {
         // 0.1.6-alpha.2 < 0.1.6 —— 语义正确性
         let all = vec![v("0.1.6-alpha.2"), v("0.1.6")];
-        assert_eq!(latest_in(&all, Channel::Stable), Some(&v("0.1.6")));
-        assert_eq!(latest_in(&all, Channel::Alpha), Some(&v("0.1.6-alpha.2")));
+        let only_stable = Channels { alpha: false, rc: false, stable: true };
+        let only_alpha = Channels { alpha: true, rc: false, stable: false };
+        assert_eq!(newest_among(&all, &only_stable), Some(&v("0.1.6")));
+        assert_eq!(newest_among(&all, &only_alpha), Some(&v("0.1.6-alpha.2")));
+        // 全勾时两者都在范围内，正式版更大
+        assert_eq!(newest_among(&all, &Channels::ALL), Some(&v("0.1.6")));
+    }
+
+    /// `Channel::Other`（beta 之类）永远参与 —— 见 `Channels::accepts` 的说明。
+    #[test]
+    fn newest_among_always_counts_other() {
+        let all = vec![v("0.1.0-beta.1"), v("0.1.0-alpha.1")];
+        let none = Channels { alpha: false, rc: false, stable: false };
+        assert_eq!(newest_among(&all, &none), Some(&v("0.1.0-beta.1")));
     }
 
     #[test]

@@ -72,6 +72,13 @@ pub struct StateFile {
     /// 解析失败（手动改坏、将来降级运行）当"没忽略过"就够 —— 为它引入一条
     /// 解析失败路径不划算。也**不**与 dsh 的版本混用（那是 registry 的事）。
     pub skipped_app_version: Option<String>,
+    /// FR-8 v1.8 修订：要检测哪些通道的更新（`["alpha","rc","stable"]` 的子集）。
+    ///
+    /// ⚠ 存**裸字符串数组**而不是 `model::Channels`：`config.rs` 的边界是"纯 I/O、
+    /// 不含业务逻辑"（SRS §9.1），名字 ↔ 通道的映射归 `model::Channels` 自己管。
+    /// ⚠ `None`（没这个 key —— 旧版 state.json）= **全勾**；空数组 = 用户明确一个都不勾。
+    /// 两者必须分得开：丢失这个区分，用户在设置里取消勾选之后重启会被悄悄改回全勾。
+    pub update_channels: Option<Vec<String>>,
 }
 
 #[derive(Debug)]
@@ -120,6 +127,14 @@ pub fn load_from(path: Option<&Path>) -> Loaded {
             .get("skipped_app_version")
             .and_then(|x| x.as_str())
             .map(str::to_string),
+        // FR-8 v1.8：不是数组 → `None` = 没记过 = 全勾（比"一个都不勾"安全：
+        // 用户会看到更新提示，而不是从此再也收不到）。数组里的非字符串项直接丢掉。
+        update_channels: v.get("update_channels").and_then(|x| x.as_array()).map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str())
+                .map(str::to_string)
+                .collect()
+        }),
     })
 }
 
@@ -205,6 +220,7 @@ pub fn save_to(path: &Path, s: &StateFile) -> Result<(), String> {
         "theme_mode": s.theme_mode.map(ThemeMode::as_str),
         "use_system_proxy": s.use_system_proxy,
         "skipped_app_version": s.skipped_app_version,
+        "update_channels": s.update_channels,
     });
     let text = serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?;
     write_atomic(path, &text)
@@ -440,6 +456,7 @@ mod tests {
                 theme_mode: None,
                 use_system_proxy: None,
                 skipped_app_version: None,
+                update_channels: None,
             },
         )
         .unwrap();
@@ -469,6 +486,7 @@ mod tests {
             theme_mode: None,
             use_system_proxy: None,
             skipped_app_version: None,
+            update_channels: None,
         };
         save_to(&p, &s).unwrap();
         match load_from(Some(&p)) {
@@ -498,6 +516,7 @@ mod tests {
             theme_mode: None,
             use_system_proxy: None,
             skipped_app_version: None,
+            update_channels: None,
         };
         save_to(&p, &s).unwrap();
         let leftover = p.with_extension("json.tmp");
@@ -515,6 +534,7 @@ mod tests {
             theme_mode: None,
             use_system_proxy: None,
             skipped_app_version: None,
+            update_channels: None,
         };
         save_to(&p, &s).unwrap();
         update_at(&p, |s| s.running_port = Some(8080)).unwrap();
@@ -567,6 +587,7 @@ mod tests {
             theme_mode: None,
             use_system_proxy: None,
             skipped_app_version: None,
+            update_channels: None,
         };
         save_to(&p, &baseline).unwrap();
 
@@ -579,6 +600,7 @@ mod tests {
             theme_mode: None,
             use_system_proxy: None,
             skipped_app_version: None,
+            update_channels: None,
         };
         assert!(save_to(&p, &different).is_err(), "写 .tmp 失败时 save_to 必须报错");
 
@@ -601,6 +623,7 @@ mod tests {
             theme_mode: Some(ThemeMode::Dark),
             use_system_proxy: None,
             skipped_app_version: None,
+            update_channels: None,
         };
         save_to(&p, &s).unwrap();
         match load_from(Some(&p)) {
@@ -654,6 +677,7 @@ mod tests {
             theme_mode: Some(ThemeMode::Light),
             use_system_proxy: None,
             skipped_app_version: None,
+            update_channels: None,
         };
         save_to(&p, &s).unwrap();
         let v: serde_json::Value =
@@ -726,6 +750,66 @@ mod tests {
         std::fs::write(&p, r#"{"skipped_app_version":300}"#).unwrap();
         match load_from(Some(&p)) {
             Loaded::Ok(s) => assert_eq!(s.skipped_app_version, None, "非字符串一律当没忽略过"),
+            other => panic!("期望 Ok，得到 {other:?}"),
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// FR-8 v1.8：通道勾选的落盘往返 —— 并且**空数组 ≠ 没记过**。
+    ///
+    /// ⚠ 这条测试钉的是"用户取消勾选之后重启会不会被改回全勾"：
+    /// `None`（旧 state.json / 手改成非数组）读成"没记过"→ 由调用方当全勾；
+    /// `[]` 读成"一个都不勾"→ 必须原样保留。
+    #[test]
+    fn update_channels_roundtrip_and_absent_is_none() {
+        let p = tmp("channels.json");
+
+        // 旧版 state.json：没有这个 key —— 读成 None（= 没记过 = 全勾），且不得判为损坏
+        std::fs::write(&p, r#"{"preferred_port":3080}"#).unwrap();
+        match load_from(Some(&p)) {
+            Loaded::Ok(s) => assert_eq!(s.update_channels, None),
+            other => panic!("缺 key 不是损坏。期望 Ok，得到 {other:?}"),
+        }
+
+        // 明确一个都不勾：必须读回空数组，不能变成 None
+        save_to(&p, &StateFile { update_channels: Some(vec![]), ..Default::default() }).unwrap();
+        match load_from(Some(&p)) {
+            Loaded::Ok(s) => assert_eq!(s.update_channels, Some(vec![]), "空数组 ≠ 没记过"),
+            other => panic!("期望 Ok，得到 {other:?}"),
+        }
+
+        save_to(
+            &p,
+            &StateFile {
+                update_channels: Some(vec!["alpha".into(), "stable".into()]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        match load_from(Some(&p)) {
+            Loaded::Ok(s) => assert_eq!(
+                s.update_channels,
+                Some(vec!["alpha".to_string(), "stable".to_string()])
+            ),
+            other => panic!("期望 Ok，得到 {other:?}"),
+        }
+
+        // 手改成字符串 / 数字 → 当"没记过"（= 全勾），不 panic、不判损坏
+        for bad in [r#"{"update_channels":"alpha"}"#, r#"{"update_channels":3}"#] {
+            std::fs::write(&p, bad).unwrap();
+            match load_from(Some(&p)) {
+                Loaded::Ok(s) => assert_eq!(s.update_channels, None, "{bad} 应读成没记过"),
+                other => panic!("期望 Ok，得到 {other:?}"),
+            }
+        }
+
+        // 数组里混进非字符串项：丢掉那一项，保留认得出的
+        std::fs::write(&p, r#"{"update_channels":["alpha",7,null,"rc"]}"#).unwrap();
+        match load_from(Some(&p)) {
+            Loaded::Ok(s) => assert_eq!(
+                s.update_channels,
+                Some(vec!["alpha".to_string(), "rc".to_string()])
+            ),
             other => panic!("期望 Ok，得到 {other:?}"),
         }
         let _ = std::fs::remove_file(&p);

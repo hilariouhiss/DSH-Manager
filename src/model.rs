@@ -102,6 +102,70 @@ pub enum Channel {
     Other,
 }
 
+/// FR-8 v1.8 修订：**检测哪些通道的更新**（用户可勾选，缺省全勾）。
+///
+/// ⚠ 为什么需要它：原先"最新"只看**已装版本所在的那个通道**，于是
+/// `0.1.7-alpha.2` 的用户在目录里已经有 `0.1.7-rc.1`（同一条线的下一个阶段、
+/// semver 上更大、而且发布得更晚）时，界面仍然说"已是最新" —— 与版本下拉
+/// （列的是**不带通道过滤**的整个目录）当场自相矛盾。
+/// 现在改成"在**勾选的**通道里找最新"，缺省全勾 = 目录里 semver 最大的那个。
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct Channels {
+    pub alpha: bool,
+    pub rc: bool,
+    pub stable: bool,
+}
+
+impl Default for Channels {
+    /// 没记过 = 全勾（与 `close_behavior` / `theme_mode` 同一条"没记过就是缺省"的规矩）。
+    fn default() -> Self {
+        Self::ALL
+    }
+}
+
+impl Channels {
+    pub const ALL: Self = Self { alpha: true, rc: true, stable: true };
+
+    /// 某个版本是否落在勾选范围内。
+    ///
+    /// ⚠ `Channel::Other`（`beta` 之类认不出的预发布版）**永远算在内**：它不属于
+    /// 任何一个可选通道，若跟着一起被过滤掉，一个装着 `x.y.z-beta.1` 的用户在任何
+    /// 勾选组合下都收不到更新提示。dsh 至今没发布过这类版本 —— 为它单开一个勾选框
+    /// 是把罕见情况做成常用界面。
+    pub fn accepts(self, ch: Channel) -> bool {
+        match ch {
+            Channel::Alpha => self.alpha,
+            Channel::Rc => self.rc,
+            Channel::Stable => self.stable,
+            Channel::Other => true,
+        }
+    }
+
+    /// 落盘用的名字。顺序固定，**只写勾上的那些** —— 空数组 = 一个都没勾。
+    pub fn names(self) -> Vec<String> {
+        [("alpha", self.alpha), ("rc", self.rc), ("stable", self.stable)]
+            .into_iter()
+            .filter(|(_, on)| *on)
+            .map(|(name, _)| name.to_string())
+            .collect()
+    }
+
+    /// 从落盘的名字解析。**认不出的名字一律忽略**（手改过 / 将来降级运行）；
+    /// 全认不出 = 一个都没勾，与空数组同义。
+    pub fn from_names(names: &[String]) -> Self {
+        let mut c = Self { alpha: false, rc: false, stable: false };
+        for name in names {
+            match name.as_str() {
+                "alpha" => c.alpha = true,
+                "rc" => c.rc = true,
+                "stable" => c.stable = true,
+                _ => {}
+            }
+        }
+        c
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PmInfo {
     pub kind: Pm,
@@ -127,7 +191,7 @@ pub struct Catalog {
     ///
     /// ⚠ **只在测试构建里存在**，这不是笔误：生产代码**刻意不读**它 ——
     /// GC-14 的全部意义就是"绝不拿 registry 的 tag 当最新版本"
-    /// （`AppState::newest_in_channel` 只从 `versions` 里取通道内最新）。
+    /// （`AppState::newest_known` 只从 `versions` 里取勾选通道内最新）。
     /// 唯一消费者是 dsh.rs 的 GC-14 回归测试：它需要**真实的** tag 数据才能
     /// 证明"标签在场也不会被采用"。因此字段与它的解析都加了 `#[cfg(test)]` ——
     /// 去掉门就是死代码，而加回 `allow(dead_code)` 会把真实死代码一起盖住。
@@ -430,6 +494,44 @@ pub enum UiMsg {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-8 v1.8 修订：通道选择集的落盘往返 + 缺省全勾 + 认不出的名字一律忽略。
+    ///
+    /// ⚠ 空数组与"没记过"必须区分：前者是用户**明确**取消勾选（一个通道都不看），
+    /// 后者是缺省全勾。这条测试钉的正是这个区分 —— 丢失它，用户在设置里取消勾选
+    /// 之后重启程序会被悄悄改回全勾。
+    #[test]
+    fn channels_round_trip_and_default_to_all() {
+        assert_eq!(Channels::default(), Channels::ALL, "没记过 = 全勾");
+        assert_eq!(Channels::ALL.names(), vec!["alpha", "rc", "stable"]);
+
+        let only_alpha = Channels { alpha: true, rc: false, stable: false };
+        assert_eq!(only_alpha.names(), vec!["alpha"]);
+        assert_eq!(Channels::from_names(&only_alpha.names()), only_alpha);
+
+        let none = Channels { alpha: false, rc: false, stable: false };
+        assert_eq!(none.names(), Vec::<String>::new());
+        assert_eq!(Channels::from_names(&[]), none, "空数组 = 一个都没勾，不是全勾");
+
+        // 手改过的、将来降级运行留下的名字：忽略，不让它把别的勾去掉
+        assert_eq!(
+            Channels::from_names(&["beta".into(), "alpha".into(), "".into()]),
+            only_alpha
+        );
+    }
+
+    /// `Channel::Other` 永远参与检测：它不属于任何可选通道，跟着被过滤掉的话，
+    /// 装着 `x.y.z-beta.1` 的用户在任何勾选组合下都收不到更新提示。
+    #[test]
+    fn channels_always_accept_other() {
+        let none = Channels { alpha: false, rc: false, stable: false };
+        for sel in [Channels::ALL, none, Channels { alpha: true, rc: false, stable: false }] {
+            assert!(sel.accepts(Channel::Other), "{sel:?} 不该把 Other 排除掉");
+        }
+        assert!(!none.accepts(Channel::Alpha));
+        assert!(!none.accepts(Channel::Rc));
+        assert!(!none.accepts(Channel::Stable));
+    }
 
     /// FR-14 / FR-2 / GC-7 的**精确**断言。
     ///

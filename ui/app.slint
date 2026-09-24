@@ -1333,6 +1333,22 @@ export component MainWindow inherits Window {
     /// 默认 true：与 `state.json` 里"没记过"时的缺省一致，理由见
     /// `config::use_system_proxy()`（机器上没配代理时这一档与直连等价，缺省选它的代价是零）。
     in property <bool> use-system-proxy: true;
+    /// FR-8 v1.8：**检测哪些通道的更新**。三项独立勾选，缺省全勾 —— 于是缺省行为
+    /// = "目录里任何通道的新版本都会提示"。三个都是 `in-out`：勾选框用 `<=>` 双向绑，
+    /// 翻转由控件自己做，落盘与再投影由 Rust 做（Rust 侧是唯一真相源，与主题同款）。
+    /// ⚠ 以前"最新"是**按已装版本所在通道**算的，于是装了 `0.1.7-alpha.2` 的用户在
+    /// 目录里已有 `0.1.7-rc.1` 时仍被判成"已是最新" —— 与版本下拉当场自相矛盾。
+    in-out property <bool> update-channel-alpha: true;
+    in-out property <bool> update-channel-rc: true;
+    in-out property <bool> update-channel-stable: true;
+    // 任意一个翻转 → 通知 Rust 落盘 + 重算"是否已是最新"。三个都挂在同一个回调上：
+    // 落盘是**整份读回三个再写**（见 Rust 侧 `on_update_channels_changed`），
+    // 所以不需要告诉它"变的是哪一个"。
+    // ⚠ `changed` 只在**值真的变了**时触发，因此 Rust 那次再投影（`project()` 把
+    // 同一个值推回来）不会再触发一次，不存在来回写。
+    changed update-channel-alpha => { root.update-channels-changed(); }
+    changed update-channel-rc => { root.update-channels-changed(); }
+    changed update-channel-stable => { root.update-channels-changed(); }
     /// 目标版本与当前已装版本**相同**时的确认框（FR-12b）。由 Rust 在
     /// `on_install_clicked` 里置真 —— 判据就是原先行尾"当前"那枚小字用的比较。
     /// 取消 = 这次点击什么也不做（不派发事务）。
@@ -1387,6 +1403,12 @@ export component MainWindow inherits Window {
     /// 才需要一个 int，两个状态本来就是布尔，多一个"下标 ↔ 枚举"的映射
     /// 只是多一处能写错的地方。
     callback proxy-toggled(bool);
+    /// FR-8 v1.8：三个通道勾选框里任意一个被翻转。
+    ///
+    /// ⚠ 无参数（不像上面几档那样带下标/bool）：勾选框是 `<=>` 双向绑的，翻转已经
+    /// 落在窗口属性上，Rust 收到通知后**把三个一起读回去**再落盘 —— 带参数就得让
+    /// Slint 侧知道"通道 → 下标"的映射，那是把 Rust 的知识抄一份到界面里。
+    callback update-channels-changed();
     /// (行为下标, 是否记住)。第二个参数来自询问框的"记住选择"：
     /// 不勾就只管这一次，state.json 不动，下次关闭还会问。
     callback close-choice(int, bool);
@@ -2267,6 +2289,43 @@ export component MainWindow inherits Window {
                     // ⚠ 这里必须诚实交代标题栏的限制，否则用户会当成 bug 报：
                     // 强制档只改窗口内部，系统标题栏跟着的是**系统**设置。
                     text: "跟随系统时窗口与标题栏会一起变。选「浅色」「深色」只改窗口内部 —— 系统标题栏由 Windows 画，它跟的是系统设置，本程序无法覆盖。";
+                    color: Tokens.ink-4;
+                    font-family: Font.text;
+                    font-size: 11.5px;
+                    wrap: word-wrap;
+                }
+
+                Rectangle { height: 16px; }
+                Divider { }
+                Rectangle { height: 16px; }
+
+                Eyebrow { text: "更新通道"; }
+                Rectangle { height: 10px; }
+                // 三项独立勾选（不是三选一）：复用询问框里那个 `CheckRow`，
+                // 它已经是本程序里唯一的勾选框外观，且带无障碍角色。
+                HorizontalLayout {
+                    spacing: 16px;
+                    CheckRow {
+                        checked <=> root.update-channel-alpha;
+                        label: "Alpha";
+                    }
+                    CheckRow {
+                        checked <=> root.update-channel-rc;
+                        label: "RC";
+                    }
+                    CheckRow {
+                        checked <=> root.update-channel-stable;
+                        label: "稳定版";
+                    }
+                }
+                Rectangle { height: 12px; }
+                Text {
+                    // ⚠ 必须说清"这管的是**检测**，不是"能不能装"：下拉里照旧列着全部
+                    // 版本，取消勾选只是不再把它算作"有更新"。不写清楚，用户会以为
+                    // 取消勾选之后那个版本就装不了了。
+                    // ⚠ 还要交代"全不勾"这一档：那时没有任何通道参与比较，
+                    // 「当前版本」旁边会一直显示"已是最新"。
+                    text: "只在勾选的通道里判断有没有更新（默认全勾）。版本下拉始终列出全部可用版本，取消勾选只是不再把它算作「有更新」；一个都不勾则永远显示「已是最新」。";
                     color: Tokens.ink-4;
                     font-family: Font.text;
                     font-size: 11.5px;

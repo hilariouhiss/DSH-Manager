@@ -2,9 +2,9 @@
 
 | 项目 | 内容 |
 |---|---|
-| 文档版本 | 1.11 |
+| 文档版本 | 1.12 |
 | 日期 | 2026-09-24 |
-| 关联文档 | [docs/SRS.md](SRS.md) v1.8（需求依据） |
+| 关联文档 | [docs/SRS.md](SRS.md) v1.9（需求依据） |
 | 技术栈 | Rust 2024 edition + Slint 1.18 |
 | 状态 | 待实现 |
 
@@ -167,9 +167,9 @@
                                     │
                                     ▼
                         UI 派生显示值（纯函数）
-                        · channel_of(installed)      → "alpha"
-                        · latest_in(versions, alpha) → "0.1.6-alpha.2"
-                        · latest == installed        → "✓ 已是最新"
+                        · channel_of(v) 各自 → "alpha"/"rc"/"stable"
+                        · newest_among(versions, 勾选集) → "0.1.7-rc.1"
+                        · installed >= newest        → "✓ 已是最新"
                                     │
 用户选中某版本 ──► Job::FetchNotes ──► parse_notes_blocks ──► [NoteBlock] ──► 逐块 StyledText
                                     │
@@ -611,13 +611,24 @@ pub fn channel_of(v: &Version) -> Channel {
     else { Channel::Other }
 }
 
-/// FR-8 的核心：只在当前通道内找最新，绝不使用 npm 的 latest tag
-pub fn latest_in<'a>(versions: &'a [Version], ch: Channel) -> Option<&'a Version> {
-    versions.iter().filter(|v| channel_of(v) == ch).max()
+/// FR-8 v1.8 修订：在**用户勾选的通道**里找最新（缺省全勾），绝不使用 npm 的 latest tag
+pub fn newest_among<'a>(versions: &'a [Version], sel: &Channels) -> Option<&'a Version> {
+    versions.iter().filter(|v| sel.accepts(channel_of(v))).max()
 }
 ```
 
 `semver` 的排序天然正确：`0.1.6-alpha.2 > 0.1.5-rc.2`（先比 patch 再比 pre），正是 SRS §2.2.5 需要的语义。
+
+⚠ **v1.8 改过一次语义，值得记下为什么**：原先是 `latest_in(versions, channel_of(installed))` ——
+只看**已装版本所在的那个通道**。在 2026-09-20 的数据上这是对的（npm 的 `latest` tag 是
+`0.1.5-rc.2`，比已装的 `0.1.6-alpha.2` 更旧，按通道过滤正好把它挡住）。但 2026-09-24 的真实
+数据把它的另一半代价暴露了出来：已装 `0.1.7-alpha.2`，**同一条线**的 `0.1.7-rc.1` 已经发布
+（semver 更大、时间更晚），通道过滤却把它一并挡住 ⇒ 界面说"已是最新"，而版本下拉
+（**不**过滤通道）里明明列着 `0.1.7-rc.1` —— 同一屏自相矛盾。
+
+现在：候选项 = 勾选通道里的全部版本（`Channel::Other` 永远在内），"防降级"由调用方那条
+`installed >= newest`（**只有严格更新才算可更新**）承担 —— 那个不变量与通道无关，本来就不
+需要靠过滤来保证。缺省全勾 = 目录里 semver 最大者；用户只勾 alpha 就得到老行为。
 
 ### 4.2 `src/txn.rs` — 事务引擎
 
@@ -1608,7 +1619,8 @@ SRS §8.4 要求对核心逻辑做单元测试。以下逻辑被刻意设计为*
 | 函数 | 覆盖需求 | 测试方式 |
 |---|---|---|
 | `channel_of(&Version)` | FR-7 | 表驱动：`0.1.6-alpha.2`→Alpha、`0.1.5-rc.2`→Rc、`0.1.0`→Stable |
-| `latest_in(&[Version], Channel)` | FR-8 | **关键用例**：`[0.1.5-rc.2, 0.1.6-alpha.2]` + Alpha → `0.1.6-alpha.2`（防误降级） |
+| `pm::newest_among(&[Version], &Channels)` | FR-8 v1.8 | **关键用例**：`[0.1.7-alpha.2, 0.1.7-rc.1]` + 全勾 → `0.1.7-rc.1`（用户报的 bug）；`[0.1.5-rc.2, 0.1.6-alpha.2]` → `0.1.6-alpha.2`（防误降级）；只勾 alpha → `0.1.7-alpha.2` |
+| `model::Channels::names/from_names` | FR-8 v1.8 | 往返 + 缺省全勾 + **空数组 ≠ 没记过** + 认不出的名字忽略 |
 | `find_dsh_on_path(dirs, exists)` | FR-3 | 传入假目录数组 + 假 `exists`，验证取第一个命中 |
 | `owner_of(shim, bins)` | FR-3 | 验证大小写不敏感、`dsh.exe` 与 `dsh.cmd` 都能命中 |
 | `parse_notes_blocks(&str)` | FR-27 | 输入真实 release notes 片段，验证 HTML 被剥离、标题成 Heading 块、列表标记被去掉、软换行合段 |
@@ -1777,3 +1789,4 @@ strip     = true
 | 1.9 | 2026-09-23 | **说明正文的站内链接不再当浏览器地址派发（SRS v1.6 的 FR-27b 补充；用户报的 bug）**：`on_link_clicked` 原先无条件把 `link-clicked` 的字符串派发成 `Job::OpenUrl`，而 DSH 的 release 正文第一行就是语言导航行 `[中文](#cn-…) \| [English](#en-…)`（实测 20 个 release 共 40 条锚点链接，另有 6 条 `SAFETY.md` 类相对路径）—— 于是每点一次就写一条 `打开网页失败: 拒绝打开非 http(s) 链接: #en-v0.1.7-alpha.2`。**①** 新增纯函数 `dsh::is_web_url`（判据只有这一份）+ `main::dispatch_notes_link`（准入：站内链接一个任务都不派发）；**②** §3.2 属性契约 `link-clicked` 那行注释同步，**§4.3 的 `open_url` 代码块同时更正**（它还画着 Ruling 65 之前的 `cmd /c start`，并误称"URL 不含外部输入"）；**③** §6.1 纯函数表加 2 行 —— 含 `main.rs` 的**第一个**测试模块（纯函数、真通道，不是 §6.3 排除的 GUI 测试），判别与接线一起覆盖；**④** 依赖表**不变**（零新增依赖：判据是前缀，不引 url crate）。**⚠ 白名单本身未动**（Ruling 65 仍是 `open_url` 的第二道），改的是"什么算可打开的目标"这层准入；面板里**不做**锚点跳转（与"不做中英切换"同一条裁决）。红-绿实测与真实正文的取值统计见 VERIFICATION §8 |
 | 1.10 | 2026-09-23 | **日志正文可选中复制（SRS v1.7 的 FR-28 修订；用户要求"输出中的文字可以选中复制"）**：`LogLine` 里那个 `Text` 换成 `read-only: true` 的 `TextInput` —— Slint 的 `Text` 没有任何选区支持，只有 `TextInput` 有，而 `read-only` 的语义正是"能选不能改"。**①** §3.2 设计要点 2 补三处必知（按下即 `GrabMouse` ⇒ 拖动改成划选、`Ctrl+A`/`Ctrl+C` 不受 read-only 影响 ⇒ 零 Rust 零依赖、`accessible-role: text` 保住读屏语义）；**②** 选区配色复用既有令牌（底色 `Tokens.accent-line`、前景色 = 本行语义色，与 `GlassField` 同款），**未新增令牌**；**③** 依赖表**不变**；**④** 离屏探针实测（VERIFICATION §9）：三行日志的行几何与墨色与改动前**逐像素一致**（y 393/413/433、x0=30、20px 行距、三种墨色），375 字长行的墨迹右边界也一致（x 30..416 —— 长行仍是"画出去被卡片裁掉"，`TextInput` 没有引入内部横向滚动）；拖选→`Ctrl+C` 得 `probe-ok-two`、`Ctrl+A`+`Ctrl+C` 得 `probe-err-three`、只拖不复制则剪贴板为空、打字不改内容。**⚠ 代价已落档**：日志区按住拖动不再滚动（滚轮/滚动条/PageUp 仍可） |
 | 1.11 | 2026-09-24 | **两条用户要求（v0.4.0 之后的第一批）**：**① 更新改为静默安装 + 装完自动重启**（SRS v1.8 的 FR-39 修订）—— 新增 **§4.9.3b**：`/SILENT /NORESTART` 三个决定的依据（保留进度窗、不压消息框、不传 `/DIR` 靠 `UsePreviousAppDir`）、`[Run]` 那条 `skipifnotsilent runasoriginaluser`、以及**更正 v1.10 的一句错话** —— "`RestartApplications` 缺省就会重启"不成立（它只重启被 Setup 关掉的程序，本程序是自己退出的）；§4.9.4 补**退出幂等闸门** `take_quit_turn`：RM 关停会发 `WM_CLOSE`，没有闸门它会按「彻底退出」taskkill 掉用户正在用的 `dsh web`，把 FR-39 的承诺当场推翻；§4.9.7 更新"为所有用户安装"那一行（`UsePreviousPrivileges` 自己走 UAC）并新增三条限制（静默没有问用户的余地、RM 时序余量、PowerShell 探针里的残留进程坑）。**② 新增单实例**（SRS v1.8 的 §3.11 / FR-40）—— 新增 **§4.10**：`Local\` 具名互斥体 + 具名事件的交接、**为什么不能让第二个进程从外部 `ShowWindow`**（Slint 1.18 的 `set_visibility` 在状态未变时早退 ⇒ 此后窗口关不掉，`winitwindowadapter.rs:1628`）、前台锁的**实测失败与修法**（`AllowSetForegroundWindow(ASFW_ANY)` 必须由第二个实例、且在 `SetEvent` 之前调）、窗口标题这条 Rust ↔ Slint 契约由 `include_str!` 测试钉住；§4.4.6 那条"假设单实例运行 / 不做单实例守护"随之改写。**③ 依赖表不变**（所需 windows-sys feature 本来就都开着）；`cargo test` 142/142、`cargo build` 0 警告；真机证据（13 项 + 12 项探针）见 [VERIFICATION.md](VERIFICATION.md) §10 |
+| 1.12 | 2026-09-24 | **修"最新版本"判据的洞（SRS v1.9 的 FR-8 修订 / V-34；用户报的 bug）**：`pm::latest_in(versions, channel_of(installed))` 只看**已装版本所在通道**，于是已装 `0.1.7-alpha.2` 而目录里已有 `0.1.7-rc.1`（同一条线的下一阶段、semver 更大、发布更晚）时仍显示"已是最新"，与不过滤通道的版本下拉当场自相矛盾。**①** 改为 `pm::newest_among(versions, &Channels)` —— 候选集 = **用户勾选的通道**（新增 `model::Channels`，缺省全勾），`latest_in` 随之删除；防降级不变量（`installed >= newest`，只认严格更新）**没动**，它本来就与通道无关；**②** `is_up_to_date` 改为"勾选范围内无候选也算已是最新"（不再需要"通道内有候选"这个前提）；`version_known` 的判据同步放宽为"目录非空"（把通道全不勾的用户仍要用下拉挑版本）；**③** 设置面板新增「更新通道」一节，复用既有的 `CheckRow` 勾选框组件（三态独立勾选，`changed` 处理器 → `update-channels-changed` → Rust 整份读回三个再落盘）；**④** §4.1 的设计说明补上"为什么改"（旧判据是"防误降级"的过度近似，68a95bd 把判据改成严格更新之后，过滤只剩"把更新的版本藏起来"这一半）；§6.1 纯函数表同步；**⑤** 依赖表不变；`cargo test` 151/151、`cargo build` 0 警告、clippy 警告 20 → 19；真机证据（复现 + 8 项探针 + 设置面板截图）见 [VERIFICATION.md](VERIFICATION.md) §11 |

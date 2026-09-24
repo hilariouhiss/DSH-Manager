@@ -1212,14 +1212,13 @@ mod tests {
         assert_eq!(c.tags.get("alpha"), Some(&v("0.1.6-alpha.2")));
     }
 
-    /// GC-14 的端到端回归：从真实形状的响应出发，
-    /// 走完 parse → channel_of → latest_in，必须得到 0.1.6-alpha.2 而非 latest tag。
+    /// GC-14 的端到端回归：从真实形状的响应出发，走完 parse → channel_of →
+    /// `newest_among`，在**全勾**（缺省）下必须得到 0.1.6-alpha.2 而非 latest tag。
     #[test]
     fn gc14_latest_tag_must_not_be_used_as_newest() {
         let c = parse_catalog(FIXTURE).unwrap();
         let installed = v("0.1.6-alpha.2");
-        let ch = pm::channel_of(&installed);
-        let newest = pm::latest_in(&c.versions, ch).unwrap();
+        let newest = pm::newest_among(&c.versions, &Channels::ALL).unwrap();
         assert_eq!(*newest, installed, "已是最新");
         assert_ne!(
             newest,

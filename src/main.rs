@@ -136,6 +136,9 @@ struct AppState {
     /// 退出路径是否**已经开始**。见 `make_quit` 开头那道幂等闸门：
     /// 退出只走一次，先到的那条说了算。
     quitting: bool,
+    /// FR-8 v1.8：要检测哪些通道的更新（用户在设置里勾，缺省全勾）。
+    /// 它决定"最新"的候选集，因此也决定徽标与下拉的默认选中项。
+    channels: Channels,
     log: Rc<VecModel<slint::SharedString>>,
 }
 
@@ -172,6 +175,7 @@ impl AppState {
         close_behavior: CloseBehavior,
         theme_mode: ThemeMode,
         use_system_proxy: bool,
+        channels: Channels,
     ) -> Self {
         Self {
             env: PmEnv::default(),
@@ -201,6 +205,7 @@ impl AppState {
             update_auto_shown: false,
             quit_keep_web: false,
             quitting: false,
+            channels,
             log: Rc::new(VecModel::default()),
         }
     }
@@ -218,28 +223,29 @@ impl AppState {
         }
     }
 
-    fn channel(&self) -> Option<Channel> {
-        self.env.installed.as_ref().map(pm::channel_of)
-    }
-
-    /// GC-14：只用通道内最新，**绝不使用 npm 的 latest tag**。
-    fn newest_in_channel(&self) -> Option<Version> {
+    /// FR-8 v1.8 修订 / GC-14：在**用户勾选的通道**里求最新（缺省全勾）。
+    ///
+    /// ⚠ 这里**不**再按"已装版本所在的通道"过滤 —— 那正是 v0.4.0 的 bug：已装
+    /// `0.1.7-alpha.2` 而目录里已有 `0.1.7-rc.1`（同一条线的下一阶段、semver 更大）
+    /// 时，仍被判成"已是最新"，与版本下拉（列整个目录）当场自相矛盾。
+    fn newest_known(&self) -> Option<Version> {
         let catalog = self.catalog.as_ref()?;
-        let ch = self.channel()?;
-        pm::latest_in(&catalog.versions, ch).cloned()
+        pm::newest_among(&catalog.versions, &self.channels).cloned()
     }
 
-    /// 是否"已是最新"。判据是**通道内最新已知，且不严格新于已安装版本**。
+    /// 是否"已是最新"。判据是**勾选范围内最大已知，且不严格新于已安装版本**。
     ///
     /// ⚠ 原先写成 `*cur == newest`：装了目录里没有的版本时（刚发布的版本、
     /// 或 `Channel::Other` 的非 alpha/rc 预发布版）`==` 为假，UI 会把**更旧**
     /// 的版本说成"↓ 可更新" —— 那正是 GC-14 存在的意义（防止把用户往下带）。
     /// 现在只有"严格更新"才提示可更新；目录缺项时宁可不提示，也不指错方向。
-    /// `newest_in_channel()` 本身不动 —— 它是对的，问题只在这个比较。
+    ///
+    /// ⚠ 勾选范围内**一个候选都没有**（用户把通道全取消勾选、或目录里一个认得出的
+    /// 版本都没有）时判"已是最新"：那是"在你要的范围内没有更新的"，不是替用户下结论。
     fn is_up_to_date(&self) -> bool {
-        match (self.env.installed.as_ref(), self.newest_in_channel()) {
-            (Some(cur), Some(newest)) => *cur >= newest,
-            _ => false,
+        match self.env.installed.as_ref() {
+            Some(cur) => self.newest_known().is_none_or(|newest| *cur >= newest),
+            None => false,
         }
     }
 
@@ -410,13 +416,23 @@ fn project(state: &AppState, win: &MainWindow, tray: &AppTray) {
                 .into()
         },
     );
+    // ⚠ "版本已知"的判据是**目录非空**，不是"勾选范围内有候选"：把通道全取消勾选的
+    // 用户仍然要能用下拉挑版本装（FR-10）；若跟着勾选一起消失，整个结论区会变空，
+    // 界面上什么线索都没有。
     win.set_version_known(
-        state.probed && state.env.installed.is_some() && state.newest_in_channel().is_some(),
+        state.probed
+            && state.env.installed.is_some()
+            && state.catalog.as_ref().is_some_and(|c| !c.versions.is_empty()),
     );
-    // FR-9 修订：版本主卡已删，"通道最新 x.y.z"不再单独投影（`latest-version` 属性随之
-    // 删除）—— 目标版本下拉的默认选中项就是通道内最新版。这里只推"是否已是最新"，
-    // 它由操作卡「当前版本」右侧的状态徽标消费。
+    // FR-9 修订：版本主卡已删，"最新 x.y.z"不再单独投影（`latest-version` 属性随之
+    // 删除）—— 目标版本下拉的默认选中项就是最新版（v1.8 起 = **勾选通道内**最新）。
+    // 这里只推"是否已是最新"，它由操作卡「当前版本」右侧的状态徽标消费。
     win.set_up_to_date(state.is_up_to_date());
+    // FR-8 v1.8：三个通道勾选框。Rust 侧是唯一真相源 —— 与 close-behavior / theme-mode
+    // 同款：Slint 的 `<=>` 只负责翻本地属性，落盘与再投影都由 Rust 做。
+    win.set_update_channel_alpha(state.channels.alpha);
+    win.set_update_channel_rc(state.channels.rc);
+    win.set_update_channel_stable(state.channels.stable);
 
     // PM 不再有选择器：只推一个只读指示（原 `pm-options` / `pm-index` /
     // `pm-is-owner` 三件套随 FR-11 的修订一起删除）。
@@ -545,8 +561,8 @@ fn drain(rx: &Receiver<UiMsg>, state: &Rc<RefCell<AppState>>, tx: &Sender<Job>) 
                         s.probed = true;
                         s.env = env;
                         s.status = "环境探测完成".into();
-                        // 首次探测后，默认选中当前通道的最新版
-                        let newest = s.newest_in_channel();
+                        // 首次探测后，默认选中"勾选范围内最新"（缺省全勾 = 目录里最新）
+                        let newest = s.newest_known();
                         if s.selected_version.is_none() {
                             s.selected_version = newest;
                         }
@@ -556,7 +572,7 @@ fn drain(rx: &Receiver<UiMsg>, state: &Rc<RefCell<AppState>>, tx: &Sender<Job>) 
                     }
                     UiMsg::Catalog(c) => {
                         s.catalog = Some(c);
-                        let newest = s.newest_in_channel();
+                        let newest = s.newest_known();
                         if s.selected_version.is_none() {
                             s.selected_version = newest;
                         }
@@ -1882,6 +1898,37 @@ fn wire_callbacks(
         });
     }
 
+    // ── 更新通道勾选（FR-8 v1.8 修订）──
+    //
+    // 与「主题」同款：只有一条投影路径（落 AppState → `project()` 推回），点击不发任何
+    // Job，所以必须置 dirty —— 稳态下没有消息可排空，不置就"点了没反应"。
+    //
+    // ⚠ 三个勾选框是 `<=>` 双向绑的，翻转发生在 Slint 侧；这里**必须把三个都读回来**
+    // 再整体落盘 —— 只读被点的那一个的话，另外两个会以 `AppState` 里的旧值为准，
+    // 而 Slint 侧已经是新值了。整份读回来就不存在"谁赢"的问题。
+    {
+        let state = state.clone();
+        let win_weak = win_weak.clone();
+        win.on_update_channels_changed(move || {
+            let Some(w) = win_weak.upgrade() else { return };
+            let sel = Channels {
+                alpha: w.get_update_channel_alpha(),
+                rc: w.get_update_channel_rc(),
+                stable: w.get_update_channel_stable(),
+            };
+            {
+                let mut s = state.borrow_mut();
+                s.channels = sel;
+                s.dirty = true;
+            }
+            // 偏好立即落盘，设置面板里没有"保存"按钮。
+            // 写失败只记日志、不回滚 —— 这次选择在本次运行里已经生效。
+            if let Err(e) = config::update(|f| f.update_channels = Some(sel.names())) {
+                push_log(&state.borrow(), format!("更新通道保存失败（本次运行仍生效）：{e}"));
+            }
+        });
+    }
+
     // ── 系统代理（Ruling 89）──
     //
     // 与「关闭行为」同款：只有一条投影路径（落 AppState → `project()` 推回），
@@ -2412,13 +2459,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ⚠ 这里**不**复用 `config::use_system_proxy()`：那个函数会**再读一遍文件**，
     // 而下面 `config::load()` 已经把这份快照拿在手里了 —— 读两遍就多一个
     // "两次读取之间文件被改了"的窗口，界面显示 A、出网用 B。两边都从这一份快照取。
-    let (preferred_port, close_behavior, theme_mode, use_system_proxy, startup_note) =
+    let (preferred_port, close_behavior, theme_mode, use_system_proxy, channels, startup_note) =
         match config::load() {
             config::Loaded::Ok(s) => (
                 s.preferred_port.unwrap_or(3080),
                 s.close_behavior.unwrap_or_default(),
                 s.theme_mode.unwrap_or_default(),
                 s.use_system_proxy.unwrap_or(true),
+                // FR-8 v1.8：`None`（旧 state.json 没这个 key）= 没记过 = **全勾**；
+                // 空数组 = 用户明确一个都不勾，必须原样保留。
+                s.update_channels
+                    .as_deref()
+                    .map(Channels::from_names)
+                    .unwrap_or(Channels::ALL),
                 None,
             ),
             config::Loaded::Missing => (
@@ -2426,6 +2479,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 CloseBehavior::default(),
                 ThemeMode::default(),
                 true,
+                Channels::ALL,
                 None,
             ),
             // FR-32：记日志但不阻止启动 —— 端口回落缺省值
@@ -2434,6 +2488,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 CloseBehavior::default(),
                 ThemeMode::default(),
                 true,
+                Channels::ALL,
                 Some(format!("state.json 损坏，使用缺省端口 3080：{e}")),
             ),
             config::Loaded::NoLocation => (
@@ -2441,6 +2496,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 CloseBehavior::default(),
                 ThemeMode::default(),
                 true,
+                Channels::ALL,
                 None,
             ),
         };
@@ -2453,6 +2509,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         close_behavior,
         theme_mode,
         use_system_proxy,
+        channels,
     )));
     push_log(&state.borrow(), "DSH Manager 启动");
     if let Some(note) = startup_note {
@@ -2710,6 +2767,78 @@ mod tests {
         ));
     }
 
+    // ══════════════ FR-8 v1.8：通道勾选与"是否已是最新" ══════════════
+
+    fn v(s: &str) -> Version {
+        s.parse().unwrap()
+    }
+
+    /// ★ 用户报的那个 bug 的回归钉子（真机复现过的原样场景）。
+    ///
+    /// 2026-09-24 实测 registry：已装 `0.1.7-alpha.2`（dsh 的 `alpha` tag），
+    /// 目录里还有 `0.1.7-rc.1`（`next` tag，发布得更晚、semver 更大）。
+    /// 旧实现"只看已装版本所在通道"，于是判成「已是最新」—— 而版本下拉里明明列着
+    /// `0.1.7-rc.1`，界面自相矛盾（用户原话："目标版本中出现了 0.1.7-rc.1 但当前版本
+    /// 显示的是 0.1.7-alpha.2 已是最新"）。
+    ///
+    /// 缺省（全勾）必须判成"可更新"，且"最新"就是那个更新的版本。
+    #[test]
+    fn next_stage_of_the_same_line_counts_as_an_update() {
+        let mut s =
+            AppState::new(3080, CloseBehavior::Hide, ThemeMode::Auto, true, Channels::ALL);
+        s.probed = true;
+        s.env.installed = Some(v("0.1.7-alpha.2"));
+        s.catalog = Some(Catalog {
+            versions: vec![v("0.1.7-alpha.1"), v("0.1.7-alpha.2"), v("0.1.7-rc.1")],
+            tags: Default::default(),
+        });
+
+        assert_eq!(s.newest_known(), Some(v("0.1.7-rc.1")), "全勾时最新 = 目录最大");
+        assert!(!s.is_up_to_date(), "有更新的版本就不能说「已是最新」（用户报的 bug）");
+    }
+
+    /// 反面 + GC-14 的防降级：目录里**只有更旧的**版本时，仍然是「已是最新」。
+    ///
+    /// 这正是 v0.4.0 那个"按通道过滤"的实现原本要防的事（npm 的 `latest` tag
+    /// `0.1.5-rc.2` 比已装的 `0.1.6-alpha.2` 更旧）。换成"勾选范围内取最大 + 只认严格
+    /// 更新"之后必须照样成立 —— 否则用户会被"更新"到一个更旧的版本。
+    #[test]
+    fn older_only_catalog_still_reads_as_up_to_date() {
+        let mut s =
+            AppState::new(3080, CloseBehavior::Hide, ThemeMode::Auto, true, Channels::ALL);
+        s.probed = true;
+        s.env.installed = Some(v("0.1.6-alpha.2"));
+        s.catalog = Some(Catalog {
+            versions: vec![v("0.1.5-rc.2"), v("0.1.6-alpha.1"), v("0.1.6-alpha.2")],
+            tags: Default::default(),
+        });
+
+        assert_eq!(s.newest_known(), Some(v("0.1.6-alpha.2")));
+        assert!(s.is_up_to_date(), "更旧的版本不得被说成「可更新」");
+    }
+
+    /// 勾选是**真的**起作用：只勾 alpha = v0.4.0 的老行为，现在是用户自己选的。
+    /// 一个都不勾时永远「已是最新」（勾选范围内没有候选），而不是空白或乱报。
+    #[test]
+    fn channel_selection_gates_the_verdict() {
+        let mut s =
+            AppState::new(3080, CloseBehavior::Hide, ThemeMode::Auto, true, Channels::ALL);
+        s.probed = true;
+        s.env.installed = Some(v("0.1.7-alpha.2"));
+        s.catalog = Some(Catalog {
+            versions: vec![v("0.1.7-alpha.2"), v("0.1.7-rc.1")],
+            tags: Default::default(),
+        });
+
+        s.channels = Channels { alpha: true, rc: false, stable: false };
+        assert_eq!(s.newest_known(), Some(v("0.1.7-alpha.2")));
+        assert!(s.is_up_to_date(), "只勾 alpha 时 rc 不算更新（老行为，现在是显式选择）");
+
+        s.channels = Channels { alpha: false, rc: false, stable: false };
+        assert_eq!(s.newest_known(), None);
+        assert!(s.is_up_to_date(), "一个都不勾 = 不检测 = 永远「已是最新」，不是空白");
+    }
+
     // ══════════════════ 退出闸门（静默安装带出）══════════════════
 
     /// ★ 判别性：退出只放行一次，第二条退出请求必须作废。
@@ -2720,7 +2849,7 @@ mod tests {
     /// 装更新时**不许**停它（V-29 的判别性一步就是"dsh web 仍在监听"）。
     #[test]
     fn quit_turn_is_granted_only_once() {
-        let mut s = AppState::new(3080, CloseBehavior::Hide, ThemeMode::Auto, true);
+        let mut s = AppState::new(3080, CloseBehavior::Hide, ThemeMode::Auto, true, Channels::ALL);
         assert!(!take_quit_turn(&mut s), "第一条退出必须放行");
         assert!(take_quit_turn(&mut s), "第二条退出必须作废");
         assert!(take_quit_turn(&mut s), "此后每一条都必须作废");
