@@ -649,6 +649,12 @@ fn request_quit(app: &AppHandle) {
 pub fn run() {
     let hidden_start = std::env::args().any(|arg| arg == "--hidden");
     tauri::Builder::default()
+        // 必须最先注册：已有实例会把新启动的进程转发到这里并退出。
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            if !argv.iter().any(|arg| arg == "--hidden") {
+                show_main_window(app);
+            }
+        }))
         .setup(move |app| {
             let log_dir = app
                 .path()
