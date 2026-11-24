@@ -12,6 +12,7 @@ dist
 dist-ssr
 *.local
 .tmp-home/
+.taste-skill/
 
 # Editor directories and files
 .vscode/*

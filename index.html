@@ -2,68 +2,84 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <link rel="stylesheet" href="/src/styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>DSH 管理器</title>
     <script type="module" src="/src/main.ts" defer></script>
+    <link rel="stylesheet" href="/src/styles.css" />
   </head>
 
   <body>
-    <header class="topbar">
-      <div class="brand">DSH 管理器</div>
-      <div id="env-line" class="env">正在读取环境…</div>
+    <header class="bar">
+      <div class="bar-left">
+        <span class="wordmark">DSH 管理器</span>
+        <span id="env-scope" class="bar-scope"></span>
+      </div>
+      <div class="bar-right">
+        <span id="fresh" class="fresh">正在检测…</span>
+        <button id="btn-primary" class="btn primary" type="button">启动</button>
+      </div>
     </header>
 
-    <div id="banner" class="banner hidden"></div>
+    <div class="sheet-wrap">
+      <main class="sheet">
+        <div class="sheet-inner">
+          <div id="banner" class="banner hidden"></div>
 
-    <main>
-      <section class="card">
-        <div class="card-head">
-          <h2>运行状态</h2>
-          <span id="status-badge" class="badge">检测中</span>
-        </div>
-        <div class="status-line">
-          <span id="status-dot" class="dot"></span>
-          <span id="status-text">正在检测…</span>
-          <span id="status-meta" class="muted"></span>
-        </div>
-        <div class="row">
-          <label class="field">端口 <input id="port" type="number" min="1" max="65535" value="3080" /></label>
-          <label class="check"><input id="open-browser" type="checkbox" checked /> 启动后打开浏览器</label>
-        </div>
-        <div class="row buttons">
-          <button id="btn-start" class="primary">启动</button>
-          <button id="btn-stop" class="danger">停止</button>
-          <button id="btn-restart" class="ghost">重启</button>
-          <button id="btn-open" class="ghost">打开界面</button>
-        </div>
-        <div id="busy" class="busy hidden"></div>
-      </section>
-
-      <section class="card">
-        <div class="card-head">
-          <h2>版本</h2>
-          <div class="head-right">
-            <span id="installed-version" class="muted">读取中…</span>
-            <button id="btn-check" class="ghost small">检查更新</button>
+          <div class="title-row">
+            <h1>本机 DSH</h1>
+            <p id="finding" class="finding">正在检测本机实例…</p>
+            <p id="env-detail" class="env-detail"></p>
           </div>
-        </div>
-        <div id="tags" class="tags"></div>
-        <label class="check"><input id="restart-after" type="checkbox" checked /> 安装完成后重新启动 DSH</label>
-        <div id="version-list" class="versions"><p class="muted">正在读取版本列表…</p></div>
-        <button id="btn-show-all" class="ghost small hidden">显示全部版本</button>
-      </section>
 
-      <section class="card">
-        <div class="card-head">
-          <h2>日志</h2>
-          <div class="tabs">
-            <button class="tab active" data-kind="web">运行</button>
-            <button class="tab" data-kind="npm">npm</button>
-          </div>
+          <section class="block">
+            <div class="block-head">
+              <h2>运行状态</h2>
+              <div class="block-actions">
+                <label class="field">端口 <input id="port" type="number" min="1" max="65535" value="3080" /></label>
+                <button id="btn-restart" class="btn" type="button" disabled>重启</button>
+                <button id="btn-open" class="btn" type="button" disabled>打开界面</button>
+              </div>
+            </div>
+            <div class="facts">
+              <div class="cell"><span class="cell-label">状态</span><span id="status-value" class="cell-value muted">—</span></div>
+              <div class="cell"><span class="cell-label">端口</span><span id="port-cell" class="cell-value mono">—</span></div>
+              <div class="cell"><span class="cell-label">进程</span><span id="pid-cell" class="cell-value mono">—</span></div>
+              <div class="cell"><span class="cell-label">实例</span><span id="manage-cell" class="cell-value muted">—</span></div>
+            </div>
+            <div class="settings">
+              <label class="check"><input id="open-browser" type="checkbox" checked /> 启动后打开浏览器</label>
+              <span id="busy" class="busy hidden"></span>
+            </div>
+          </section>
+
+          <section class="block">
+            <div class="block-head">
+              <h2>版本</h2>
+              <div class="block-actions">
+                <span id="installed-version" class="installed">读取中…</span>
+                <button id="btn-check" class="btn" type="button">检查更新</button>
+              </div>
+            </div>
+            <div id="tags" class="channels"></div>
+            <div class="settings">
+              <label class="check"><input id="restart-after" type="checkbox" checked /> 安装完成后重新启动 DSH</label>
+            </div>
+            <div id="version-list" class="versions"><p class="empty">正在读取版本列表…</p></div>
+            <button id="btn-show-all" class="btn quiet more hidden" type="button">显示全部版本</button>
+          </section>
+
+          <section class="block">
+            <div class="block-head">
+              <h2>日志</h2>
+              <div class="tabs">
+                <button class="tab active" data-kind="web" type="button">运行</button>
+                <button class="tab" data-kind="npm" type="button">npm</button>
+              </div>
+            </div>
+            <pre id="log" class="log">（暂无输出）</pre>
+          </section>
         </div>
-        <pre id="log" class="log">（暂无输出）</pre>
-      </section>
-    </main>
+      </main>
+    </div>
   </body>
 </html>

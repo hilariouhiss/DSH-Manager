@@ -1,3 +1,8 @@
+import "@fontsource/ibm-plex-sans/400.css";
+import "@fontsource/ibm-plex-sans/500.css";
+import "@fontsource/ibm-plex-sans/600.css";
+import "@fontsource/ibm-plex-mono/400.css";
+import "@fontsource/ibm-plex-mono/500.css";
 import { invoke } from "@tauri-apps/api/core";
 
 type Status = { state: string; managed: boolean; pid: number | null; url: string | null; port: number };
@@ -17,6 +22,8 @@ const el = <T extends HTMLElement>(id: string) => document.getElementById(id) as
 
 const ESCAPES: Record<string, string> = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
 const esc = (value: string) => value.replace(/[&<>"']/g, (char) => ESCAPES[char] ?? char);
+
+const VISIBLE_VERSIONS = 5;
 
 let port = Number(localStorage.getItem("port") ?? "3080") || 3080;
 let openBrowser = localStorage.getItem("openBrowser") !== "0";
@@ -39,50 +46,47 @@ function setBanner(message: string | null) {
 }
 
 function renderEnv(info: EnvInfo) {
-  const parts = [
+  const scope = [
     info.node_version ? "Node " + info.node_version : "Node 缺失",
     info.npm ? "npm 可用" : "npm 缺失",
-    info.registry ? "registry " + info.registry : "",
-    info.npm_root ? "全局目录 " + info.npm_root : "",
+    info.registry ? info.registry.replace(/^https?:\/\//, "").replace(/\/$/, "") : "",
+  ].filter((part) => part.length > 0);
+  el("env-scope").textContent = scope.join(" · ");
+  const detail = [
+    info.npm_root ? "npm root " + info.npm_root : "",
     info.dsh_home ? "DSH_HOME " + info.dsh_home : "",
   ].filter((part) => part.length > 0);
-  el("env-line").textContent = parts.join(" · ");
+  const detailNode = el("env-detail");
+  detailNode.textContent = detail.join("    ");
+  detailNode.title = detail.join("\n");
   if (!info.node || !info.npm) {
     setBanner("未找到 node 或 npm。请先安装 Node.js（DSH 0.2.3+ 需要 24.22.3+ 或 26.13.1+）。");
   }
 }
 
 function renderInstalled() {
-  el("installed-version").textContent = installed
-    ? "已安装 " + installed.version
-    : "未安装（npm 全局）";
+  el("installed-version").textContent = installed ? "已安装 " + installed.version : "未安装";
 }
 
 function renderStatus() {
   const running = status?.state === "running";
-  const badge = el("status-badge");
-  badge.textContent = running ? (status?.managed ? "运行中" : "外部实例") : "已停止";
-  badge.className = "badge " + (running ? "running" : "stopped");
-  el("status-dot").className = "dot " + (running ? "running" : "stopped");
-  el("status-text").textContent = running
-    ? status?.managed
-      ? "本应用托管运行中"
-      : "运行中（非本应用启动）"
-    : "未运行";
-  const bits: string[] = [];
-  if (status?.pid) bits.push("PID " + status.pid);
-  if (running && status?.url) bits.push(status.url);
-  el("status-meta").textContent = bits.join(" · ");
+  const statusValue = el("status-value");
+  statusValue.textContent = running ? "运行中" : "已停止";
+  statusValue.className = "cell-value lead " + (running ? "accent" : "muted");
+  el("port-cell").textContent = String(status?.port ?? port);
+  el("pid-cell").textContent = status?.pid ? String(status.pid) : "—";
+  const manageCell = el("manage-cell");
+  manageCell.textContent = running ? (status?.managed ? "托管" : "外部") : "—";
+  manageCell.className = "cell-value " + (running ? "" : "muted");
+  el("finding").textContent = running
+    ? (status?.url ?? "") + " · PID " + (status?.pid ?? "—") + " · " + (status?.managed ? "本应用托管" : "非本应用启动")
+    : "端口 " + port + " 空闲 · 已安装 " + (installed?.version ?? "—");
 
-  const startButton = el<HTMLButtonElement>("btn-start");
-  const stopButton = el<HTMLButtonElement>("btn-stop");
-  const restartButton = el<HTMLButtonElement>("btn-restart");
-  startButton.disabled = busy !== null || running;
-  stopButton.disabled = busy !== null || !running;
-  restartButton.disabled = busy !== null || !running;
-  startButton.textContent = running ? "已在运行" : "启动";
-  const openButton = el<HTMLButtonElement>("btn-open");
-  openButton.disabled = busy !== null || !running;
+  const primary = el<HTMLButtonElement>("btn-primary");
+  primary.textContent = running ? "停止" : "启动";
+  primary.disabled = busy !== null;
+  el<HTMLButtonElement>("btn-restart").disabled = busy !== null || !running;
+  el<HTMLButtonElement>("btn-open").disabled = busy !== null || !running;
 
   const busyNode = el("busy");
   busyNode.textContent = busy ?? "";
@@ -105,25 +109,30 @@ function renderTags() {
   }
   const entries = Object.entries(versions.tags);
   if (entries.length === 0) {
-    host.innerHTML = '<span class="muted">registry 未返回通道标签</span>';
+    host.innerHTML = '<span class="empty">registry 未返回通道标签</span>';
     return;
   }
   host.innerHTML = entries
-    .map(
-      ([name, version]) =>
-        '<button class="tag" data-install="' + esc(version) + '"><b>' + esc(name) + "</b> " + esc(version) + "</button>",
-    )
+    .map(([name, version]) => {
+      const active = installed?.version === version;
+      return (
+        '<button type="button" class="channel' + (active ? " active" : "") + '" data-install="' + esc(version) + '">' +
+        esc(name) +
+        '<span class="ch-version">' + esc(version) + "</span>" +
+        "</button>"
+      );
+    })
     .join("");
 }
 
 function renderVersions() {
   const host = el("version-list");
   if (!versions) {
-    host.innerHTML = '<p class="muted">正在读取版本列表…</p>';
+    host.innerHTML = '<p class="empty">正在读取版本列表…</p>';
     return;
   }
   const list = versions.versions.slice().reverse();
-  const shown = showAll ? list : list.slice(0, 12);
+  const shown = showAll ? list : list.slice(0, VISIBLE_VERSIONS);
   const current = installed?.version ?? null;
   host.innerHTML = shown
     .map((version) => {
@@ -132,17 +141,23 @@ function renderVersions() {
       return (
         '<div class="ver' + (isCurrent ? " current" : "") + '">' +
         '<span class="ver-name">' + esc(version) +
-        (tag ? ' <span class="tag-label">' + esc(tag) + "</span>" : "") +
+        (tag ? ' <span class="ver-tag">' + esc(tag) + "</span>" : "") +
         "</span>" +
-        '<button class="ghost small" data-install="' + esc(version) + '"' + (isCurrent ? " disabled" : "") + ">" +
-        (isCurrent ? "已安装" : "安装") +
-        "</button></div>"
+        (isCurrent
+          ? '<span class="ver-state">已安装</span>'
+          : '<button type="button" class="btn small" data-install="' + esc(version) + '">安装</button>') +
+        "</div>"
       );
     })
     .join("");
   const showAllButton = el<HTMLButtonElement>("btn-show-all");
-  showAllButton.classList.toggle("hidden", versions.versions.length <= 12);
+  showAllButton.classList.toggle("hidden", versions.versions.length <= VISIBLE_VERSIONS);
   showAllButton.textContent = showAll ? "收起版本列表" : "显示全部版本（" + versions.versions.length + "）";
+}
+
+function renderFresh() {
+  const time = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+  el("fresh").textContent = "检测于 " + time;
 }
 
 async function loadEnv() {
@@ -157,6 +172,8 @@ async function loadInstalled() {
   try {
     installed = await invoke<Installed | null>("installed");
     renderInstalled();
+    renderTags();
+    renderVersions();
   } catch (error) {
     setBanner(String(error));
   }
@@ -167,6 +184,7 @@ async function loadVersions(force = false) {
     versions = await invoke<Versions>("versions", { force });
     renderTags();
     renderVersions();
+    renderStatus();
   } catch (error) {
     setBanner("版本查询失败：" + String(error));
   }
@@ -176,6 +194,7 @@ async function refreshStatus() {
   try {
     status = await invoke<Status>("status", { port });
     renderStatus();
+    renderFresh();
   } catch {
     // 轮询失败不打扰用户，下一次再看
   }
@@ -290,8 +309,10 @@ function wire() {
     localStorage.setItem("restartAfter", checked ? "1" : "0");
   });
 
-  el("btn-start").addEventListener("click", () => void startDsh());
-  el("btn-stop").addEventListener("click", () => void stopDsh());
+  el("btn-primary").addEventListener("click", () => {
+    if (status?.state === "running") void stopDsh();
+    else void startDsh();
+  });
   el("btn-restart").addEventListener("click", () => void restartDsh());
   el("btn-open").addEventListener("click", () => {
     const url = status?.url;
