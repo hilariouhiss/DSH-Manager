@@ -4,6 +4,7 @@ import "@fontsource/ibm-plex-sans/600.css";
 import "@fontsource/ibm-plex-mono/400.css";
 import "@fontsource/ibm-plex-mono/500.css";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 type Status = { state: string; managed: boolean; pid: number | null; url: string | null; port: number };
 type Versions = { tags: Record<string, string>; versions: string[] };
@@ -17,6 +18,7 @@ type EnvInfo = {
 };
 type Installed = { version: string; path: string };
 type LogTail = { text: string; active: boolean };
+type StartupState = { hidden: boolean };
 
 const el = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 
@@ -33,6 +35,8 @@ let versions: Versions | null = null;
 let busy: string | null = null;
 let showAll = false;
 let logKind: "web" | "npm" = "web";
+let background = localStorage.getItem("background") === "1";
+let autostart = false;
 
 function setBanner(message: string | null) {
   const node = el<HTMLDivElement>("banner");
@@ -281,6 +285,107 @@ async function installVersion(version: string) {
   });
 }
 
+async function syncRuntime() {
+  try {
+    await invoke("set_runtime", { port, openBrowser, background });
+  } catch (error) {
+    setBanner(String(error));
+  }
+}
+
+function openQuitModal() {
+  const running = status?.state === "running";
+  let text: string;
+  if (running && status?.managed) {
+    text =
+      "将先停止本应用启动的 DSH（PID " +
+      (status?.pid ?? "—") +
+      "，端口 " +
+      (status?.port ?? port) +
+      "），然后退出。";
+  } else if (running) {
+    text =
+      "正在运行的是外部启动的 DSH 实例（PID " +
+      (status?.pid ?? "—") +
+      "），退出不会关闭它。";
+  } else {
+    text = "DSH 当前未运行，退出后窗口与托盘图标都会消失。";
+  }
+  el("quit-text").textContent = text;
+  el("quit-hide").classList.toggle("hidden", !background);
+  el("quit-modal").classList.remove("hidden");
+}
+
+function closeQuitModal() {
+  el("quit-modal").classList.add("hidden");
+}
+
+async function exitApp() {
+  const stopDsh = status?.state === "running" && Boolean(status?.managed);
+  try {
+    await invoke("quit_app", { stopDsh, port });
+  } catch (error) {
+    setBanner(String(error));
+    closeQuitModal();
+  }
+}
+
+async function hideToTray() {
+  closeQuitModal();
+  try {
+    await invoke("hide_main_window");
+  } catch (error) {
+    setBanner(String(error));
+  }
+}
+
+async function setBackgroundPreference(enabled: boolean) {
+  background = enabled;
+  localStorage.setItem("background", enabled ? "1" : "0");
+  await syncRuntime();
+}
+
+async function applyAutostart(wanted: boolean, input: HTMLInputElement) {
+  input.disabled = true;
+  try {
+    const actual = await invoke<boolean>("set_autostart", { enabled: wanted });
+    input.checked = actual;
+    autostart = actual;
+    if (actual !== wanted) {
+      setBanner("开机自启没有生效：登录项写入被拦截或需要权限。");
+    }
+  } catch (error) {
+    input.checked = !wanted;
+    setBanner(String(error));
+  } finally {
+    input.disabled = false;
+  }
+}
+
+async function bootstrap() {
+  try {
+    const startup = await invoke<StartupState>("startup_state");
+    if (startup.hidden) {
+      background = true;
+      localStorage.setItem("background", "1");
+      el<HTMLInputElement>("background").checked = true;
+    }
+    autostart = await invoke<boolean>("autostart_enabled");
+    el<HTMLInputElement>("autostart").checked = autostart;
+  } catch (error) {
+    setBanner(String(error));
+  }
+  await syncRuntime();
+  try {
+    await listen("request-quit", () => openQuitModal());
+  } catch (error) {
+    setBanner(String(error));
+  }
+  void refreshStatus();
+  void refreshLog();
+  void loadEnv();
+  void loadInstalled().then(() => loadVersions());
+}
 function wire() {
   const portInput = el<HTMLInputElement>("port");
   portInput.value = String(port);
@@ -296,12 +401,14 @@ function wire() {
     } else {
       portInput.value = String(port);
     }
+    void syncRuntime();
     void refreshStatus();
   });
 
   el("open-browser").addEventListener("change", () => {
     openBrowser = el<HTMLInputElement>("open-browser").checked;
     localStorage.setItem("openBrowser", openBrowser ? "1" : "0");
+    void syncRuntime();
   });
 
   el("restart-after").addEventListener("change", () => {
@@ -328,6 +435,18 @@ function wire() {
     showAll = !showAll;
     renderVersions();
   });
+  el<HTMLInputElement>("background").checked = background;
+  el<HTMLInputElement>("background").addEventListener("change", () => {
+    void setBackgroundPreference(el<HTMLInputElement>("background").checked);
+  });
+  el<HTMLInputElement>("autostart").addEventListener("change", () => {
+    const input = el<HTMLInputElement>("autostart");
+    void applyAutostart(input.checked, input);
+  });
+  el("btn-quit").addEventListener("click", () => openQuitModal());
+  el("quit-cancel").addEventListener("click", () => closeQuitModal());
+  el("quit-hide").addEventListener("click", () => void hideToTray());
+  el("quit-exit").addEventListener("click", () => void exitApp());
 
   document.body.addEventListener("click", (event) => {
     const target = event.target as HTMLElement | null;
@@ -353,10 +472,7 @@ window.addEventListener("DOMContentLoaded", () => {
   wire();
   renderInstalled();
   renderStatus();
-  void refreshStatus();
-  void refreshLog();
-  void loadEnv();
-  void loadInstalled().then(() => loadVersions());
+  void bootstrap();
   window.setInterval(() => void refreshStatus(), 2000);
   window.setInterval(() => void refreshLog(), 1500);
 });

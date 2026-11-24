@@ -78,8 +78,34 @@
             </div>
             <pre id="log" class="log">（暂无输出）</pre>
           </section>
+
+          <section class="block">
+            <div class="block-head">
+              <h2>设置</h2>
+              <div class="block-actions">
+                <button id="btn-quit" class="btn" type="button">退出应用</button>
+              </div>
+            </div>
+            <div class="settings settings-column">
+              <label class="check"><input id="autostart" type="checkbox" /> 开机自启（登录 Windows 后自动启动，静默进入托盘）</label>
+              <label class="check"><input id="background" type="checkbox" /> 关闭窗口后保持后台运行（托盘常驻）</label>
+              <p class="hint">退出应用时会先停止本应用启动的 DSH；外部启动的实例不受影响。</p>
+            </div>
+          </section>
         </div>
       </main>
+    </div>
+
+    <div id="quit-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="quit-title">
+      <div class="modal-card">
+        <h2 id="quit-title">退出 DSH 管理器</h2>
+        <p id="quit-text" class="modal-text"></p>
+        <div class="modal-actions">
+          <button id="quit-cancel" class="btn" type="button">取消</button>
+          <button id="quit-hide" class="btn" type="button">最小化到托盘</button>
+          <button id="quit-exit" class="btn primary" type="button">退出应用</button>
+        </div>
+      </div>
     </div>
   </body>
 </html>

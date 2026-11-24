@@ -8,7 +8,9 @@ use std::path::PathBuf;
 use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tauri::Manager;
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{AppHandle, Emitter, Manager};
 
 pub struct AppState {
     child: Mutex<Option<Child>>,
@@ -18,6 +20,13 @@ pub struct AppState {
     npm_root: Mutex<Option<PathBuf>>,
     versions: Mutex<Option<(Instant, Versions)>>,
     npm_job: Mutex<bool>,
+    /// 托盘动作需要知道当前端口与「启动后打开浏览器」。
+    port: Mutex<u16>,
+    open_browser: Mutex<bool>,
+    /// 关闭窗口是否只隐藏到托盘。
+    background: Mutex<bool>,
+    /// 由 `--hidden` 启动（开机自启），必须常驻托盘。
+    hidden_start: Mutex<bool>,
     log_dir: PathBuf,
 }
 
@@ -30,6 +39,10 @@ impl AppState {
             npm_root: Mutex::new(None),
             versions: Mutex::new(None),
             npm_job: Mutex::new(false),
+            port: Mutex::new(3080),
+            open_browser: Mutex::new(true),
+            background: Mutex::new(false),
+            hidden_start: Mutex::new(false),
             log_dir,
         }
     }
@@ -512,18 +525,219 @@ fn open_url(url: String) -> Result<(), String> {
     open_in_browser(&url)
 }
 
+const TRAY_ID: &str = "dsh-manager-tray";
+const AUTOSTART_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+const AUTOSTART_VALUE: &str = "DSHManager";
+
+/// 开机自启写入的登录项命令：带 --hidden，启动后静默进托盘。
+fn autostart_command(exe: &std::path::Path) -> String {
+    format!("\"{}\" --hidden", exe.display())
+}
+
+fn run_reg(args: &[&str]) -> std::io::Result<std::process::Output> {
+    let mut command = std::process::Command::new("reg");
+    command.args(args);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(dsh::CREATE_NO_WINDOW);
+    }
+    command.output()
+}
+
+#[tauri::command]
+fn autostart_enabled() -> bool {
+    run_reg(&["query", AUTOSTART_KEY, "/v", AUTOSTART_VALUE])
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+#[tauri::command]
+fn set_autostart(enabled: bool) -> Result<bool, String> {
+    if enabled {
+        let exe = std::env::current_exe().map_err(|error| format!("无法定位当前程序：{error}"))?;
+        let data = autostart_command(&exe);
+        let output = run_reg(&[
+            "add",
+            AUTOSTART_KEY,
+            "/v",
+            AUTOSTART_VALUE,
+            "/t",
+            "REG_SZ",
+            "/d",
+            &data,
+            "/f",
+        ])
+        .map_err(|error| format!("写入登录项失败：{error}"))?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
+    } else {
+        let _ = run_reg(&["delete", AUTOSTART_KEY, "/v", AUTOSTART_VALUE, "/f"]);
+    }
+    Ok(autostart_enabled())
+}
+
+#[derive(Serialize)]
+pub struct StartupState {
+    hidden: bool,
+}
+
+#[tauri::command]
+fn startup_state(state: tauri::State<'_, Arc<AppState>>) -> StartupState {
+    StartupState {
+        hidden: *state.hidden_start.lock().unwrap(),
+    }
+}
+
+/// 前端把端口、是否开浏览器、后台开关同步给托盘动作使用。
+#[tauri::command]
+async fn set_runtime(
+    app: AppHandle,
+    state: tauri::State<'_, Arc<AppState>>,
+    port: u16,
+    open_browser: bool,
+    background: bool,
+) -> Result<(), String> {
+    *state.port.lock().unwrap() = port;
+    *state.open_browser.lock().unwrap() = open_browser;
+    *state.background.lock().unwrap() = background;
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        let visible = background || *state.hidden_start.lock().unwrap();
+        tray.set_visible(visible).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn hide_main_window(app: AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.hide();
+    }
+}
+
+/// 退出前按需停止本应用托管的 DSH，然后结束进程。
+#[tauri::command]
+async fn quit_app(
+    app: AppHandle,
+    state: tauri::State<'_, Arc<AppState>>,
+    stop_dsh: bool,
+    port: u16,
+) -> Result<(), String> {
+    if stop_dsh {
+        let _ = stop_impl(state.inner().clone(), port);
+    }
+    app.exit(0);
+    Ok(())
+}
+
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+fn request_quit(app: &AppHandle) {
+    show_main_window(app);
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.emit("request-quit", ());
+    }
+}
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let hidden_start = std::env::args().any(|arg| arg == "--hidden");
     tauri::Builder::default()
-        .setup(|app| {
+        .setup(move |app| {
             let log_dir = app
                 .path()
                 .app_local_data_dir()
                 .unwrap_or_else(|_| std::env::temp_dir())
                 .join("logs");
             std::fs::create_dir_all(&log_dir).ok();
-            app.manage(Arc::new(AppState::new(log_dir)));
+            let state = Arc::new(AppState::new(log_dir));
+            *state.hidden_start.lock().unwrap() = hidden_start;
+            if hidden_start {
+                *state.background.lock().unwrap() = true;
+            }
+            app.manage(state);
+
+            let show_item = MenuItem::with_id(app, "show", "显示主界面", true, None::<&str>)?;
+            let start_item = MenuItem::with_id(app, "start", "启动 DSH", true, None::<&str>)?;
+            let stop_item = MenuItem::with_id(app, "stop", "停止 DSH", true, None::<&str>)?;
+            let quit_item =
+                MenuItem::with_id(app, "quit", "退出 DSH 管理器", true, None::<&str>)?;
+            let separator = PredefinedMenuItem::separator(app)?;
+            let menu = Menu::with_items(
+                app,
+                &[&show_item, &start_item, &stop_item, &separator, &quit_item],
+            )?;
+            let icon = app
+                .default_window_icon()
+                .cloned()
+                .ok_or("缺少应用图标，无法创建托盘")?;
+            let tray = TrayIconBuilder::with_id(TRAY_ID)
+                .icon(icon)
+                .tooltip("DSH 管理器")
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    "show" => show_main_window(app),
+                    "start" => {
+                        let app = app.clone();
+                        std::thread::spawn(move || {
+                            let state = app.state::<Arc<AppState>>().inner().clone();
+                            let port = *state.port.lock().unwrap();
+                            let open_browser = *state.open_browser.lock().unwrap();
+                            let _ = start_impl(state, port, open_browser);
+                        });
+                    }
+                    "stop" => {
+                        let app = app.clone();
+                        std::thread::spawn(move || {
+                            let state = app.state::<Arc<AppState>>().inner().clone();
+                            let port = *state.port.lock().unwrap();
+                            if status_now(&state, port).managed {
+                                let _ = stop_impl(state, port);
+                            } else {
+                                show_main_window(&app);
+                            }
+                        });
+                    }
+                    "quit" => request_quit(app),
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        show_main_window(tray.app_handle());
+                    }
+                })
+                .build(app)?;
+            tray.set_visible(hidden_start)?;
+
+            if hidden_start {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.hide();
+                }
+            }
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let background = *window.state::<Arc<AppState>>().background.lock().unwrap();
+                if background {
+                    let _ = window.hide();
+                } else {
+                    let _ = window.emit("request-quit", ());
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             env_info,
@@ -534,11 +748,18 @@ pub fn run() {
             stop,
             install,
             read_log,
-            open_url
+            open_url,
+            autostart_enabled,
+            set_autostart,
+            startup_state,
+            set_runtime,
+            hide_main_window,
+            quit_app
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
 
 #[cfg(test)]
 mod smoke {
@@ -577,6 +798,12 @@ mod smoke {
         state
     }
 
+
+    #[test]
+    fn autostart_command_quotes_exe_and_passes_hidden() {
+        let command = autostart_command(std::path::Path::new(r"C:\Program Files\DSH Manager\dsh-manager.exe"));
+        assert_eq!(command, "\"C:\\Program Files\\DSH Manager\\dsh-manager.exe\" --hidden");
+    }
     #[test]
     fn starts_and_stops_managed_instance() {
         let port = free_port();
