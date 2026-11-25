@@ -17,6 +17,8 @@ pnpm install
 pnpm tauri dev
 ```
 
+> 换图标后要 `pnpm tauri icon src-tauri/app-icon.svg` 重新生成，再 `touch src-tauri/build.rs` 才重新嵌入 exe（cargo 不会因为 png/ico 变动就重跑 build script）。
+
 ## 打包
 
 ```bash
