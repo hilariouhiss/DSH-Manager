@@ -15,8 +15,10 @@
   --radius-sheet: 16px;
   --radius-card: 8px;
   --radius-control: 6px;
-  --gap: 48px;
-  --pad: 24px;
+  /* one gap and one padding pair for the whole window: the grid closes on both columns */
+  --gap: 14px;
+  --pad-y: 18px;
+  --pad-x: 20px;
   --font-sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
   --font-mono: "IBM Plex Mono", Consolas, "Cascadia Mono", monospace;
   color-scheme: light;
@@ -38,11 +40,11 @@ body {
   overflow: hidden;
   background: var(--ground);
   color: var(--text);
-  font: 14px/1.5 var(--font-sans);
+  font: 13px/1.5 var(--font-sans);
   font-variant-numeric: tabular-nums;
 }
 
-/* ---------- the frame: one 48px bar, then the white sheet inset 8px ---------- */
+/* ---------- frame: a 44px bar, then the white sheet inset 8px ---------- */
 
 .bar {
   flex: none;
@@ -50,17 +52,23 @@ body {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  height: 48px;
+  height: 44px;
   padding: 0 16px;
   background: var(--ground);
 }
 
-.bar-left,
-.bar-right {
+.bar-left {
   display: flex;
   align-items: center;
   gap: 12px;
   min-width: 0;
+}
+
+.mark {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  border-radius: 5px;
 }
 
 .wordmark {
@@ -78,12 +86,6 @@ body {
   white-space: nowrap;
 }
 
-.fresh {
-  color: var(--muted);
-  font-size: 12px;
-  white-space: nowrap;
-}
-
 .sheet-wrap {
   flex: 1;
   display: flex;
@@ -93,99 +95,153 @@ body {
 
 .sheet {
   flex: 1;
+  display: flex;
+  flex-direction: column;
   min-height: 0;
-  overflow-y: auto;
+  overflow: hidden;
   border: 1px solid var(--border);
   border-radius: var(--radius-sheet);
   background: var(--surface);
 }
 
+/* 960x800 window: 960 - 16 inset - 2 border - 40 padding = 902 = 536 main + 14 gap + 352 side.
+   800 - 44 bar - 8 inset - 2 border - 36 padding = 710 = 51 title + 14 + 615 grid + 12 + 18 env. */
 .sheet-inner {
+  flex: 1;
   display: flex;
   flex-direction: column;
   gap: var(--gap);
-  max-width: 1080px;
+  width: 100%;
+  max-width: 1320px;
+  min-height: 0;
   margin: 0 auto;
-  padding: var(--pad);
+  padding: var(--pad-y) var(--pad-x);
 }
 
 /* ---------- title row ---------- */
 
-@media (min-width: 900px) {
-  .title-row {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
-    column-gap: 32px;
-    align-items: start;
-  }
+.title-row {
+  flex: none;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
 
-  .title-row #env-detail {
-    grid-column: 1 / -1;
-  }
+.title-text {
+  min-width: 0;
 }
 
 h1 {
   margin: 0;
-  font-size: 22px;
+  font-size: 24px;
   font-weight: 600;
   letter-spacing: -0.02em;
-  line-height: 1.25;
+  line-height: 1.2;
 }
 
 .finding {
-  margin: 8px 0 0;
+  margin: 3px 0 0;
+  overflow: hidden;
   color: var(--muted);
-  font-size: 14px;
-}
-
-.env-detail {
-  margin: 10px 0 0;
-  color: var(--muted);
-  font: 13px/1.55 var(--font-mono);
-  word-break: break-all;
-}
-
-/* ---------- banner ---------- */
-
-.banner {
-  padding: 10px 12px;
-  border-radius: var(--radius-card);
-  background: #ffedea;
-  color: #831c1e;
   font-size: 13px;
-  white-space: pre-wrap;
-  word-break: break-word;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-/* ---------- blocks ---------- */
+.fresh {
+  flex: none;
+  padding-top: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
 
-.block-head {
+/* ---------- the grid: status, log and settings down the left, the versions panel down the right ---------- */
+
+.grid {
+  flex: 1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) clamp(300px, 39%, 380px);
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  grid-template-areas:
+    "status versions"
+    "log versions"
+    "settings versions";
+  gap: var(--gap);
+  min-height: 0;
+}
+
+.panel-status {
+  grid-area: status;
+}
+
+.panel-log {
+  grid-area: log;
+  min-height: 0;
+}
+
+.panel-versions {
+  grid-area: versions;
+  min-height: 0;
+}
+
+.panel-settings {
+  grid-area: settings;
+}
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  padding: 12px 16px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  background: var(--surface);
+}
+
+.panel-head {
+  flex: none;
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
-  gap: 12px 16px;
-  margin-bottom: 16px;
+  gap: 8px 12px;
+  min-height: 28px;
+  margin-bottom: 10px;
 }
 
-.block-head h2 {
+.panel-head h2 {
   margin: 0;
-  font-size: 16px;
-  font-weight: 500;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 20px;
 }
 
-.block-actions {
+.controls {
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
+  min-width: 0;
 }
 
-.more {
-  margin-top: 8px;
+.panel-foot {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 10px;
 }
 
-/* ---------- the instance strip ---------- */
+/* the versions list is closed by the foot's rule; the status strip already closes itself */
+.panel-versions .panel-foot {
+  padding-top: 10px;
+  border-top: 1px solid var(--rule);
+}
+
+/* ---------- the instance strip: one container split by dividers ---------- */
 
 .facts {
   display: grid;
@@ -195,8 +251,9 @@ h1 {
 }
 
 .cell {
-  padding: 12px 16px 14px;
-  border-left: 1px solid var(--border);
+  min-width: 0;
+  padding: 7px 12px 9px;
+  border-left: 1px solid var(--rule);
 }
 
 .cell:first-child {
@@ -207,67 +264,39 @@ h1 {
 .cell-label {
   display: block;
   color: var(--muted);
-  font-size: 14px;
-  font-weight: 500;
+  font-size: 12px;
+  line-height: 18px;
 }
 
 .cell-value {
   display: block;
-  margin-top: 6px;
-  font-size: 22px;
+  margin-top: 1px;
+  overflow: hidden;
+  font-size: 17px;
   font-weight: 400;
-  line-height: 1.25;
-  overflow-wrap: anywhere;
+  line-height: 24px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .cell-value.mono {
   font-family: var(--font-mono);
 }
 
-/* 状态是这屏的答案：比同排的数大 1.36 倍（app-screens §5）*/
+/* the state is this screen's answer: 1.6x its siblings (app-screens §5) */
 .cell-value.lead {
-  font-size: 30px;
+  font-size: 28px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  line-height: 30px;
 }
 
 .cell-value.positive {
   color: var(--positive);
 }
 
-.cell-value.accent {
-  color: var(--accent);
-}
-
 .cell-value.muted {
   color: var(--muted);
-}
-
-.settings {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 12px 20px;
-  margin-top: 14px;
-}
-
-.check {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  color: var(--muted);
-  font-size: 13px;
-  cursor: pointer;
-}
-
-input[type="checkbox"] {
-  width: 15px;
-  height: 15px;
-  margin: 0;
-  accent-color: var(--accent);
-}
-
-.busy {
-  color: var(--accent);
-  font-size: 13px;
 }
 
 /* ---------- controls ---------- */
@@ -275,20 +304,20 @@ input[type="checkbox"] {
 .field {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   color: var(--muted);
-  font-size: 13px;
+  font-size: 12px;
 }
 
 input[type="number"] {
-  width: 84px;
-  height: 32px;
-  padding: 0 10px;
+  width: 76px;
+  height: 30px;
+  padding: 0 8px;
   border: 1px solid var(--control);
   border-radius: var(--radius-control);
   background: var(--surface);
   color: var(--text);
-  font: 14px var(--font-mono);
+  font: 13px var(--font-mono);
   font-variant-numeric: tabular-nums;
 }
 
@@ -298,13 +327,14 @@ input[type="number"]:focus-visible {
 }
 
 .btn {
-  height: 32px;
+  flex: none;
+  height: 30px;
   padding: 0 12px;
   border: 1px solid var(--border);
   border-radius: var(--radius-control);
   background: var(--surface);
   color: var(--text);
-  font: 500 14px var(--font-sans);
+  font: 500 13px var(--font-sans);
   cursor: pointer;
 }
 
@@ -341,17 +371,18 @@ input[type="number"]:focus-visible {
 }
 
 .btn.small {
-  height: 28px;
+  height: 26px;
   padding: 0 10px;
-  font-size: 13px;
+  font-size: 12px;
 }
 
 .btn.quiet {
-  height: 28px;
-  padding: 0 4px;
+  height: auto;
+  padding: 0;
   border-color: transparent;
   background: transparent;
   color: var(--muted);
+  font-size: 12px;
 }
 
 .btn.quiet:hover:not(:disabled) {
@@ -359,118 +390,44 @@ input[type="number"]:focus-visible {
   color: var(--text);
 }
 
-/* ---------- version channels ---------- */
-
-.channels {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: flex-end;
-  gap: 24px;
-  margin-bottom: 4px;
-}
-
-.channel {
+.check {
   display: inline-flex;
-  align-items: baseline;
-  gap: 8px;
-  padding: 8px 0 9px;
-  border: none;
-  border-bottom: 2px solid transparent;
-  background: none;
-  color: var(--muted);
-  font: 500 14px var(--font-sans);
+  align-items: center;
+  gap: 7px;
+  color: var(--text);
+  font-size: 13px;
   cursor: pointer;
 }
 
-.channel:hover {
-  color: var(--text);
+input[type="checkbox"] {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--accent);
 }
 
-.channel:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-
-.channel.active {
-  border-bottom-color: var(--accent);
-  color: var(--text);
-}
-
-.ch-version {
-  color: var(--muted);
-  font: 400 12px var(--font-mono);
-}
-
-.installed {
-  color: var(--muted);
-  font-size: 13px;
-}
-
-/* ---------- version rows ---------- */
-
-.versions {
-  display: flex;
-  flex-direction: column;
-}
-
-.ver {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto 96px;
-  align-items: center;
-  gap: 12px;
-  height: 44px;
-  border-bottom: 1px solid var(--rule);
-}
-
-.ver:last-child {
-  border-bottom: none;
-}
-
-.ver-name {
-  font: 400 13px var(--font-mono);
-}
-
-.ver-tag {
-  color: var(--muted);
-  font: 400 12px var(--font-sans);
-}
-
-.ver.current .ver-name {
+.busy {
   color: var(--accent);
+  font-size: 12px;
 }
 
-.ver-state,
-.ver .btn {
-  justify-self: end;
-}
-
-.ver-state {
-  color: var(--muted);
-  font-size: 13px;
-}
-
-.empty {
-  margin: 4px 0;
-  color: var(--muted);
-  font-size: 13px;
-}
-
-/* ---------- log ---------- */
+/* ---------- tabs ---------- */
 
 .tabs {
   display: flex;
-  align-items: flex-end;
-  gap: 20px;
+  align-items: center;
+  gap: 16px;
 }
 
 .tab {
   margin: 0;
-  padding: 8px 0 9px;
+  padding: 5px 0 4px;
   border: none;
   border-bottom: 2px solid transparent;
   background: none;
   color: var(--muted);
-  font: 400 14px var(--font-sans);
+  font: 400 13px var(--font-sans);
   cursor: pointer;
 }
 
@@ -488,11 +445,13 @@ input[type="number"]:focus-visible {
   color: var(--text);
 }
 
+/* ---------- log ---------- */
+
 .log {
+  flex: 1 1 0;
+  min-height: 0;
   margin: 0;
-  padding: 14px 16px;
-  min-height: 96px;
-  max-height: 240px;
+  padding: 10px 12px;
   overflow: auto;
   border-radius: var(--radius-card);
   background: var(--raised);
@@ -502,18 +461,187 @@ input[type="number"]:focus-visible {
   word-break: break-word;
 }
 
+/* ---------- version panel: the channel ladder, then the history ---------- */
 
-.settings-column {
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 10px;
+.list-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 22px;
+  margin-top: 10px;
+  color: var(--muted);
+  font-size: 12px;
 }
 
-.hint {
+.channels {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+}
+
+.ch-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 30px;
+  border-bottom: 1px solid var(--rule);
+}
+
+.ch-row:last-child {
+  border-bottom: none;
+}
+
+.ch-name {
+  flex: none;
+  width: 62px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.ch-row.active .ch-name {
+  color: var(--text);
+}
+
+.ch-version {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font: 400 13px var(--font-mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ch-state {
+  flex: none;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.installed {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.versions {
+  flex: 1 1 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.ver {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 28px;
+  border-bottom: 1px solid var(--rule);
+}
+
+.ver:last-child {
+  border-bottom: none;
+}
+
+.ver-name {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  overflow: hidden;
+  font: 400 13px var(--font-mono);
+  white-space: nowrap;
+}
+
+.ver-tag {
+  overflow: hidden;
+  color: var(--muted);
+  font: 400 12px var(--font-sans);
+  text-overflow: ellipsis;
+}
+
+.ver.current .ver-name {
+  color: var(--accent);
+}
+
+.ver-state {
+  flex: none;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.ver .btn {
+  flex: none;
+}
+
+.empty {
+  display: block;
   margin: 0;
   color: var(--muted);
   font-size: 13px;
+}
+
+/* an empty history keeps the panel's frame: one sentence in a quiet slot, not a line lost in the space */
+.versions .empty {
+  margin-top: 2px;
+  padding: 9px 12px;
+  border: 1px dashed var(--control);
+  border-radius: var(--radius-card);
+  font-size: 12px;
+}
+
+/* ---------- settings ---------- */
+
+/* the two switches sit side by side when the panel is wide (the maximised window) and stack when it is not */
+.settings {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(270px, 1fr));
+  gap: 8px 24px;
+  margin-top: 2px;
+}
+
+.hint {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 12px;
   line-height: 1.55;
+}
+
+.env-detail {
+  flex: none;
+  margin: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font: 12px/1.5 var(--font-mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---------- banner ---------- */
+
+.banner {
+  flex: none;
+  padding: 8px 12px;
+  border-radius: var(--radius-card);
+  background: #ffedea;
+  color: #831c1e;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.hidden {
+  display: none !important;
 }
 
 /* ---------- quit dialog: the one thing allowed to cast a shadow ---------- */
@@ -539,12 +667,12 @@ input[type="number"]:focus-visible {
 
 .modal-card h2 {
   margin: 0;
-  font-size: 16px;
+  font-size: 15px;
   font-weight: 600;
 }
 
 .modal-text {
-  margin: 10px 0 18px;
+  margin: 8px 0 16px;
   color: var(--muted);
   font-size: 13px;
   line-height: 1.55;
@@ -556,19 +684,68 @@ input[type="number"]:focus-visible {
   justify-content: flex-end;
   gap: 8px;
 }
-.hidden {
-  display: none !important;
+
+/* ---------- below the app's own minimum width (820px): one column, and the page scrolls ---------- */
+
+@media (max-width: 860px), (max-height: 699px) {
+  body {
+    overflow-y: auto;
+  }
+
+  .sheet {
+    overflow: visible;
+  }
+
+  .sheet-inner {
+    flex: none;
+    height: auto;
+  }
+
+  .grid {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .versions {
+    flex: none;
+    overflow: visible;
+  }
+
+  .ver {
+    flex: none;
+    min-height: 34px;
+  }
+
+  .log {
+    flex: none;
+    height: 168px;
+  }
+
+  .facts {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .cell:nth-child(odd) {
+    padding-left: 0;
+    border-left: none;
+  }
+
+  .cell:nth-child(n + 3) {
+    border-top: 1px solid var(--rule);
+  }
+
+  .env-detail {
+    white-space: normal;
+    word-break: break-all;
+  }
 }
 
-/* ---------- phone ---------- */
-
-@media (max-width: 720px) {
+@media (max-width: 600px) {
   .bar {
     padding: 0 16px;
   }
 
-  .bar-scope,
-  .fresh {
+  .bar-scope {
     display: none;
   }
 
@@ -577,43 +754,30 @@ input[type="number"]:focus-visible {
   }
 
   .sheet {
-    border-right: none;
-    border-bottom: none;
-    border-left: none;
+    border: none;
     border-radius: 0;
   }
 
   .sheet-inner {
-    gap: 32px;
-    padding: 16px;
+    padding: 14px 16px;
   }
 
-  .facts {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+  .title-row {
+    flex-direction: column;
+    gap: 4px;
   }
 
-  .cell {
-    padding: 10px 12px 12px;
+  .fresh {
+    padding-top: 0;
   }
 
-  .cell:nth-child(3) {
-    padding-left: 0;
-    border-left: none;
-    border-top: 1px solid var(--border);
+  .finding {
+    white-space: normal;
   }
 
-  .cell:nth-child(4) {
-    border-top: 1px solid var(--border);
-  }
-
-  .ver {
-    grid-template-columns: minmax(0, 1fr) auto;
-    height: auto;
-    padding: 10px 0;
-  }
-
-  .ver-tag {
-    display: none;
+  .cell-value.lead {
+    font-size: 24px;
+    line-height: 28px;
   }
 }
 

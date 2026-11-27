@@ -12,13 +12,11 @@
   <body>
     <header class="bar">
       <div class="bar-left">
+        <img class="mark" src="/icon.png" alt="" width="20" height="20" />
         <span class="wordmark">DSH 管理器</span>
         <span id="env-scope" class="bar-scope"></span>
       </div>
-      <div class="bar-right">
-        <span id="fresh" class="fresh">正在检测…</span>
-        <button id="btn-primary" class="btn primary" type="button">启动</button>
-      </div>
+      <button id="btn-primary" class="btn primary" type="button">启动</button>
     </header>
 
     <div class="sheet-wrap">
@@ -27,72 +25,80 @@
           <div id="banner" class="banner hidden"></div>
 
           <div class="title-row">
-            <h1>本机 DSH</h1>
-            <p id="finding" class="finding">正在检测本机实例…</p>
-            <p id="env-detail" class="env-detail"></p>
+            <div class="title-text">
+              <h1>本机 DSH</h1>
+              <p id="finding" class="finding">正在检测本机实例…</p>
+            </div>
+            <span id="fresh" class="fresh">正在检测…</span>
           </div>
 
-          <section class="block">
-            <div class="block-head">
-              <h2>运行状态</h2>
-              <div class="block-actions">
-                <label class="field">端口 <input id="port" type="number" min="1" max="65535" value="3080" /></label>
-                <button id="btn-restart" class="btn" type="button" disabled>重启</button>
-                <button id="btn-open" class="btn" type="button" disabled>打开界面</button>
+          <div class="grid">
+            <section class="panel panel-status">
+              <div class="panel-head">
+                <h2>运行状态</h2>
+                <div class="controls">
+                  <label class="field">端口 <input id="port" type="number" min="1" max="65535" value="3080" /></label>
+                  <button id="btn-restart" class="btn" type="button" disabled>重启</button>
+                  <button id="btn-open" class="btn" type="button" disabled>打开界面</button>
+                </div>
               </div>
-            </div>
-            <div class="facts">
-              <div class="cell"><span class="cell-label">状态</span><span id="status-value" class="cell-value muted">—</span></div>
-              <div class="cell"><span class="cell-label">端口</span><span id="port-cell" class="cell-value mono">—</span></div>
-              <div class="cell"><span class="cell-label">进程</span><span id="pid-cell" class="cell-value mono">—</span></div>
-              <div class="cell"><span class="cell-label">实例</span><span id="manage-cell" class="cell-value muted">—</span></div>
-            </div>
-            <div class="settings">
-              <label class="check"><input id="open-browser" type="checkbox" checked /> 启动后打开浏览器</label>
-              <span id="busy" class="busy hidden"></span>
-            </div>
-          </section>
-
-          <section class="block">
-            <div class="block-head">
-              <h2>版本</h2>
-              <div class="block-actions">
-                <span id="installed-version" class="installed">读取中…</span>
-                <button id="btn-check" class="btn" type="button">检查更新</button>
+              <div class="facts">
+                <div class="cell"><span class="cell-label">状态</span><span id="status-value" class="cell-value lead muted">—</span></div>
+                <div class="cell"><span class="cell-label">端口</span><span id="port-cell" class="cell-value mono">—</span></div>
+                <div class="cell"><span class="cell-label">进程</span><span id="pid-cell" class="cell-value mono">—</span></div>
+                <div class="cell"><span class="cell-label">实例</span><span id="manage-cell" class="cell-value muted">—</span></div>
               </div>
-            </div>
-            <div id="tags" class="channels"></div>
-            <div class="settings">
-              <label class="check"><input id="restart-after" type="checkbox" checked /> 安装完成后重新启动 DSH</label>
-            </div>
-            <div id="version-list" class="versions"><p class="empty">正在读取版本列表…</p></div>
-            <button id="btn-show-all" class="btn quiet more hidden" type="button">显示全部版本</button>
-          </section>
-
-          <section class="block">
-            <div class="block-head">
-              <h2>日志</h2>
-              <div class="tabs">
-                <button class="tab active" data-kind="web" type="button">运行</button>
-                <button class="tab" data-kind="npm" type="button">npm</button>
+              <div class="panel-foot">
+                <label class="check"><input id="open-browser" type="checkbox" checked /> 启动后打开浏览器</label>
+                <span id="busy" class="busy hidden"></span>
               </div>
-            </div>
-            <pre id="log" class="log">（暂无输出）</pre>
-          </section>
+            </section>
 
-          <section class="block">
-            <div class="block-head">
-              <h2>设置</h2>
-              <div class="block-actions">
+            <section class="panel panel-versions">
+              <div class="panel-head">
+                <h2>版本</h2>
+                <div class="controls">
+                  <span id="installed-version" class="installed">读取中…</span>
+                  <button id="btn-check" class="btn" type="button">检查更新</button>
+                </div>
+              </div>
+              <div class="list-head"><span>通道</span></div>
+              <div id="tags" class="channels"></div>
+              <div class="list-head">
+                <span>历史版本</span>
+                <button id="btn-show-all" class="btn quiet more hidden" type="button">显示全部版本</button>
+              </div>
+              <div id="version-list" class="versions"><p class="empty">正在读取版本列表…</p></div>
+              <div class="panel-foot">
+                <label class="check"><input id="restart-after" type="checkbox" checked /> 安装后重新启动 DSH</label>
+              </div>
+            </section>
+
+            <section class="panel panel-log">
+              <div class="panel-head">
+                <h2>日志</h2>
+                <div class="tabs">
+                  <button class="tab active" data-kind="web" type="button">运行</button>
+                  <button class="tab" data-kind="npm" type="button">npm</button>
+                </div>
+              </div>
+              <pre id="log" class="log">（暂无输出）</pre>
+            </section>
+
+            <section class="panel panel-settings">
+              <div class="panel-head">
+                <h2>设置</h2>
                 <button id="btn-quit" class="btn" type="button">退出应用</button>
               </div>
-            </div>
-            <div class="settings settings-column">
-              <label class="check"><input id="autostart" type="checkbox" /> 开机自启（登录 Windows 后自动启动，静默进入托盘）</label>
-              <label class="check"><input id="background" type="checkbox" /> 关闭窗口后保持后台运行（托盘常驻）</label>
+              <div class="settings">
+                <label class="check"><input id="autostart" type="checkbox" /> 开机自启（登录 Windows 后静默进托盘）</label>
+                <label class="check"><input id="background" type="checkbox" /> 关闭窗口后保持后台运行（托盘常驻）</label>
+              </div>
               <p class="hint">退出应用时会先停止本应用启动的 DSH；外部启动的实例不受影响。</p>
-            </div>
-          </section>
+            </section>
+          </div>
+
+          <p id="env-detail" class="env-detail"></p>
         </div>
       </main>
     </div>

@@ -25,7 +25,7 @@ const el = <T extends HTMLElement>(id: string) => document.getElementById(id) as
 const ESCAPES: Record<string, string> = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
 const esc = (value: string) => value.replace(/[&<>"']/g, (char) => ESCAPES[char] ?? char);
 
-const VISIBLE_VERSIONS = 5;
+const VISIBLE_VERSIONS = 11;
 
 let port = Number(localStorage.getItem("port") ?? "3080") || 3080;
 let openBrowser = localStorage.getItem("openBrowser") !== "0";
@@ -69,22 +69,27 @@ function renderEnv(info: EnvInfo) {
 }
 
 function renderInstalled() {
-  el("installed-version").textContent = installed ? "已安装 " + installed.version : "未安装";
+  const node = el("installed-version");
+  node.textContent = installed ? "已安装 " + installed.version : "未安装";
+  node.title = installed ? "已安装 " + installed.version + "\n" + installed.path : "未安装 @deepseek-ai/dsh";
 }
 
 function renderStatus() {
+  const known = status !== null;
   const running = status?.state === "running";
   const statusValue = el("status-value");
-  statusValue.textContent = running ? "运行中" : "已停止";
-  statusValue.className = "cell-value lead " + (running ? "accent" : "muted");
+  statusValue.textContent = known ? (running ? "运行中" : "已停止") : "检测中";
+  statusValue.className = "cell-value lead " + (running ? "positive" : "muted");
   el("port-cell").textContent = String(status?.port ?? port);
   el("pid-cell").textContent = status?.pid ? String(status.pid) : "—";
   const manageCell = el("manage-cell");
   manageCell.textContent = running ? (status?.managed ? "托管" : "外部") : "—";
   manageCell.className = "cell-value " + (running ? "" : "muted");
-  el("finding").textContent = running
-    ? (status?.url ?? "") + " · PID " + (status?.pid ?? "—") + " · " + (status?.managed ? "本应用托管" : "非本应用启动")
-    : "端口 " + port + " 空闲 · 已安装 " + (installed?.version ?? "—");
+  el("finding").textContent = !known
+    ? "正在检测本机实例…"
+    : running
+      ? (status?.url ?? "") + " · PID " + (status?.pid ?? "—") + " · " + (status?.managed ? "本应用托管" : "非本应用启动")
+      : "端口 " + port + " 空闲 · 尚未启动";
 
   const primary = el<HTMLButtonElement>("btn-primary");
   primary.textContent = running ? "停止" : "启动";
@@ -120,10 +125,13 @@ function renderTags() {
     .map(([name, version]) => {
       const active = installed?.version === version;
       return (
-        '<button type="button" class="channel' + (active ? " active" : "") + '" data-install="' + esc(version) + '">' +
-        esc(name) +
+        '<div class="ch-row' + (active ? " active" : "") + '">' +
+        '<span class="ch-name">' + esc(name) + "</span>" +
         '<span class="ch-version">' + esc(version) + "</span>" +
-        "</button>"
+        (active
+          ? '<span class="ch-state">当前</span>'
+          : '<button type="button" class="btn small" data-install="' + esc(version) + '">安装</button>') +
+        "</div>"
       );
     })
     .join("");
@@ -136,6 +144,11 @@ function renderVersions() {
     return;
   }
   const list = versions.versions.slice().reverse();
+  if (list.length === 0) {
+    host.innerHTML = '<p class="empty">registry 未返回版本列表</p>';
+    el("btn-show-all").classList.add("hidden");
+    return;
+  }
   const shown = showAll ? list : list.slice(0, VISIBLE_VERSIONS);
   const current = installed?.version ?? null;
   host.innerHTML = shown
@@ -145,10 +158,10 @@ function renderVersions() {
       return (
         '<div class="ver' + (isCurrent ? " current" : "") + '">' +
         '<span class="ver-name">' + esc(version) +
-        (tag ? ' <span class="ver-tag">' + esc(tag) + "</span>" : "") +
+        (tag ? ' <span class="ver-tag" title="' + esc(tag) + '">' + esc(tag) + "</span>" : "") +
         "</span>" +
         (isCurrent
-          ? '<span class="ver-state">已安装</span>'
+          ? '<span class="ver-state">当前</span>'
           : '<button type="button" class="btn small" data-install="' + esc(version) + '">安装</button>') +
         "</div>"
       );
